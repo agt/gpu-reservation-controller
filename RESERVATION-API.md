@@ -2,8 +2,8 @@
 
 This document covers every endpoint needed to build two external daemons:
 
-- **Kubernetes controller** — reads active reservations and manages
-  `ResourceQuota` / `PriorityClass` objects in user namespaces.
+- **Kubernetes controller** — reads active reservations and within
+   reservation windows, injects Tolerations into pods scheduled in user namespaces.
 - **Roster sync daemon** — provisions user accounts and manages usage-group
   membership from an institutional directory.
 
