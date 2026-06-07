@@ -131,8 +131,9 @@ All settings are supplied via environment variables.
 | `HEALTH_PORT` | no | `8000` | Port for the `GET /health` liveness endpoint |
 | `TZ` | no | system default | IANA timezone for reservation window arithmetic, e.g. `America/Los_Angeles` |
 
-> **Security note:** `RESERVATION_API_KEY` grants full read/write access to the
-> reservation system.  Always inject it from a Kubernetes Secret rather than
+> **Security note:** The controller requires a **`read_only`**-scoped service
+> key — it only calls `GET` endpoints.  Do not provision a `read_write` key for
+> this daemon.  Always inject the key from a Kubernetes Secret rather than
 > baking it into an image or ConfigMap.
 
 ---

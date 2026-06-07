@@ -14,7 +14,6 @@ from pydantic import BaseModel
 class UserBrief(BaseModel):
     id: int
     username: str
-    full_name: Optional[str] = None
 
 
 class GroupBrief(BaseModel):
