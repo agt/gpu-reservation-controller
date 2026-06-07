@@ -2,8 +2,8 @@
 
 This document covers every endpoint needed to build two external daemons:
 
-- **Kubernetes controller** — reads active reservations and within
-   reservation windows, injects Tolerations into pods scheduled in user namespaces.
+- **Kubernetes controller** — reads active reservations and manages
+  `ResourceQuota` / `PriorityClass` objects in user namespaces.
 - **Roster sync daemon** — provisions user accounts and manages usage-group
   membership from an institutional directory.
 
@@ -32,9 +32,19 @@ All daemon-accessible endpoints require a service key sent in the
 X-API-Key: gpures_<64 hex characters>
 ```
 
-Service keys are admin-equivalent: they see all data and may perform all
-write operations the daemons need. They are separate from user accounts and
-do not expire, but can be revoked instantly (§3).
+Service keys are **scoped** (never admin-equivalent). Each key has a `scope` of
+`read_only` or `read_write`:
+
+- **`read_only`** keys may call the read (GET) endpoints listed in §4 and §5.
+- **`read_write`** keys may additionally call the write endpoints (create user,
+  manage group membership).
+
+Neither scope grants administrator privileges. Admin-only surfaces (GPU classes,
+timeslot plans, site settings, email settings, key management) are unreachable
+by any service key.
+
+Keys are separate from user accounts, do not expire, but can be revoked
+instantly (§3).
 
 **Generating a key** — run the CLI on the server (requires database access):
 
@@ -125,6 +135,7 @@ response** and is never retrievable again.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string (1–128 chars) | yes | Human label, e.g. `k8s-controller-prod` |
+| `scope` | `"read_only"` \| `"read_write"` | no | Default `"read_only"`. `"read_write"` enables user-creation and group-membership endpoints. |
 
 **Response** `201` — [ServiceKeyCreateResponse](#servicekeycreateresponse)
 
@@ -133,6 +144,7 @@ response** and is never retrievable again.
   "id": 3,
   "name": "k8s-controller-prod",
   "key_prefix": "gpures_a3f9c012",
+  "scope": "read_only",
   "is_active": true,
   "created_at": "2026-06-07T14:22:00",
   "last_used_at": null,
@@ -218,7 +230,7 @@ X-API-Key: gpures_...
   {
     "id": 42,
     "user_id": 7,
-    "user": { "id": 7, "username": "jsmith", "full_name": "Jane Smith" },
+    "user": { "id": 7, "username": "jsmith" },
     "group_id": 2,
     "group": { "id": 2, "name": "CS151B-FA26" },
     "gpu_class_id": 1,
@@ -302,7 +314,6 @@ Create a new user account.
 |-------|------|----------|-------------|-------------|
 | `username` | string | yes | 3–64 chars, unique | Login name |
 | `email` | string | yes | unique | Email address |
-| `full_name` | string | no | — | Display name |
 | `password` | string | yes | min 8 chars | Initial password (Argon2id-hashed) |
 | `is_admin` | boolean | no | default `false` | Administrator flag |
 
@@ -332,7 +343,6 @@ fields are left unchanged.
 | Field | Type | Description |
 |-------|------|-------------|
 | `email` | string | New email address (must be unique) |
-| `full_name` | string | New display name |
 | `password` | string (min 8 chars) | New password |
 | `is_admin` | boolean | Grant or revoke admin flag |
 | `is_active` | boolean | Reactivate (`true`) or deactivate (`false`) a user |
@@ -392,12 +402,12 @@ List all members of a group, ordered by username.
 
 ```json
 [
-  { "id": 7,  "username": "jsmith",  "full_name": "Jane Smith" },
-  { "id": 12, "username": "mlee",    "full_name": "Michael Lee" }
+  { "id": 7,  "username": "jsmith" },
+  { "id": 12, "username": "mlee" }
 ]
 ```
 
-**Note:** this endpoint returns `UserBrief` (id, username, full_name) without
+**Note:** this endpoint returns `UserBrief` (id, username) without
 the role. To see roles, use the `members` array inside `GET /api/groups/{id}`
 which returns [GroupMemberBrief](#groupmemberbrief) objects that include `role`.
 
@@ -520,7 +530,6 @@ both new additions and role corrections without a separate `PATCH` call.
   "id":         7,
   "username":   "jsmith",
   "email":      "jsmith@example.edu",
-  "full_name":  "Jane Smith",
   "is_admin":   false,
   "is_active":  true,
   "created_at": "2026-01-15T09:00:00"
@@ -532,7 +541,6 @@ both new additions and role corrections without a separate `PATCH` call.
 | `id` | integer | Stable primary key; use this in membership calls |
 | `username` | string | 3–64 chars, unique, immutable after creation |
 | `email` | string | Unique |
-| `full_name` | string \| null | Optional display name |
 | `is_admin` | boolean | |
 | `is_active` | boolean | `false` = soft-deleted |
 | `created_at` | datetime | UTC |
@@ -555,8 +563,8 @@ both new additions and role corrections without a separate `PATCH` call.
   "is_active": true,
   "created_at": "2026-06-01T10:00:00",
   "members": [
-    { "id": 7, "username": "jsmith", "full_name": "Jane Smith", "role": "manager" },
-    { "id": 9, "username": "bwang",  "full_name": "Bo Wang",    "role": "member"  }
+    { "id": 7, "username": "jsmith", "role": "manager" },
+    { "id": 9, "username": "bwang",  "role": "member"  }
   ],
   "policies": [ ... ]
 }
@@ -588,7 +596,6 @@ Appears in the `members` array of `GroupResponse`.
 |-------|------|-------|
 | `id` | integer | User's database ID |
 | `username` | string | |
-| `full_name` | string \| null | |
 | `role` | `"member"` \| `"manager"` | Per-group role |
 
 ---
@@ -601,7 +608,6 @@ Returned by `GET /api/groups/{group_id}/members`.
 |-------|------|
 | `id` | integer |
 | `username` | string |
-| `full_name` | string \| null |
 
 ---
 
@@ -611,7 +617,7 @@ Returned by `GET /api/groups/{group_id}/members`.
 {
   "id": 42,
   "user_id": 7,
-  "user": { "id": 7, "username": "jsmith", "full_name": "Jane Smith" },
+  "user": { "id": 7, "username": "jsmith" },
   "group_id": 2,
   "group": { "id": 2, "name": "CS151B-FA26" },
   "gpu_class_id": 1,
@@ -666,6 +672,7 @@ Returned by `GET /api/groups/{group_id}/members`.
   "id": 3,
   "name": "k8s-controller-prod",
   "key_prefix": "gpures_a3f9c012",
+  "scope": "read_only",
   "is_active": true,
   "created_at": "2026-06-07T14:22:00",
   "last_used_at": "2026-06-07T18:05:00"
@@ -677,6 +684,7 @@ Returned by `GET /api/groups/{group_id}/members`.
 | `id` | integer | Use this ID for revocation |
 | `name` | string | Human label |
 | `key_prefix` | string | First 15 chars of raw key — safe to log for audit |
+| `scope` | `"read_only"` \| `"read_write"` | Key's permission level |
 | `is_active` | boolean | `false` = revoked |
 | `created_at` | datetime | UTC |
 | `last_used_at` | datetime \| null | UTC; updated on every authenticated request |
