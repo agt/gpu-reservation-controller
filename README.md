@@ -51,6 +51,8 @@ subject to the GPU budget for that reservation.
 │         sibling pods that have the toleration        │
 │      b. If pod_gpus + sibling_gpus ≤ reserved_gpus:  │
 │           PATCH pod → add toleration                 │
+│           PATCH pod → set activeDeadlineSeconds      │
+│           Create RuntimeCapped Event on pod          │
 │      c. Otherwise: retry in 2–5 min                  │
 └──────────────────────────────────────────────────────┘
 ```
@@ -63,6 +65,23 @@ operator: Equal
 value:    <pod's gpu-class label value>   # e.g. "h100"
 effect:   NoSchedule
 ```
+
+### Runtime capping
+
+When a pod is admitted, the controller also enforces a maximum runtime by
+setting `spec.activeDeadlineSeconds` on the pod.  The value is calculated as:
+
+- **Remaining time** in the pod's current reservation window, plus
+- **Full duration** of any directly back-to-back future reservations with the
+  same owner, GPU class, and GPU count (no gap between consecutive windows).
+
+If the pod's existing `activeDeadlineSeconds` is unset or exceeds this
+maximum, it is updated.  A Kubernetes **Event** with reason `RuntimeCapped` is
+then created on the pod explaining the change.  If the pod already has an
+`activeDeadlineSeconds` within the allowed maximum it is left unchanged.
+
+Deadline enforcement is best-effort: if the PATCH or Event creation fails, a
+warning is logged but the toleration that was already applied is not revoked.
 
 ---
 
@@ -162,6 +181,9 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

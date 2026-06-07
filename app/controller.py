@@ -187,6 +187,60 @@ class ControllerState:
                 pod_uid,
             )
 
+    def compute_max_deadline_seconds(
+        self,
+        now: datetime,
+        current_reservation: ReservationResponse,
+    ) -> int:
+        """Return the maximum permitted pod lifetime in seconds, anchored to *now*.
+
+        Sums the remaining time in *current_reservation* plus the full duration of
+        any back-to-back future reservations that share the same namespace, GPU class,
+        and gpu_count — with no gap between consecutive windows.
+
+        "Back-to-back" means slot_start(next) == slot_end(previous) exactly.
+        """
+        namespace = current_reservation.user.username
+        gpu_class_label = self.gpu_class_labels.get(current_reservation.gpu_class_id)
+        gpu_count = current_reservation.gpu_count
+
+        prev_end = slot_end(current_reservation)
+        remaining = max(0.0, (prev_end - now).total_seconds())
+
+        # Collect future reservations that could extend the chain.
+        candidates = sorted(
+            [
+                r
+                for r in self.reservations
+                if r.id != current_reservation.id
+                and r.user.username == namespace
+                and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
+                and r.gpu_count == gpu_count
+                and slot_end(r) > now
+            ],
+            key=slot_start,
+        )
+
+        total = remaining
+        visited: set[int] = set()
+
+        while True:
+            next_res = next(
+                (
+                    r
+                    for r in candidates
+                    if r.id not in visited and slot_start(r) == prev_end
+                ),
+                None,
+            )
+            if next_res is None:
+                break
+            total += next_res.policy.duration_minutes * 60.0
+            prev_end = slot_end(next_res)
+            visited.add(next_res.id)
+
+        return int(total)
+
     def reconcile_queue(self) -> None:
         """Re-validate queue entries against the current reservation list.
 

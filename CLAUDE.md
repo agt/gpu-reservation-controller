@@ -39,7 +39,7 @@ app/
 ├── config.py             Config dataclass populated from environment variables
 ├── schemas.py            Pydantic models mirroring RESERVATION-API.md §6
 ├── reservation_client.py httpx async client — fetches reservations + GPU class details
-├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, count usage
+├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, set_active_deadline, emit_runtime_capped_event, count usage
 └── controller.py         ControllerState, QueueEntry, matching, window arithmetic
 ```
 
@@ -80,6 +80,36 @@ effect:   NoSchedule
 When patching, all existing tolerations are preserved (Kubernetes rejects
 patches that remove tolerations from running pods).  The pod is re-fetched
 immediately before patching to avoid working with a stale toleration list.
+
+### Runtime capping
+
+When a pod is admitted (toleration successfully applied), the controller
+immediately enforces a maximum lifetime via `spec.activeDeadlineSeconds`.
+
+**Calculation** — the maximum is:
+
+1. Remaining seconds in the current reservation window (from *now* to
+   `slot_end(current)`), **plus**
+2. The full duration of any directly **back-to-back** future reservations
+   sharing the same `user.username`, GPU class, and `gpu_count`, where
+   `slot_start(next) == slot_end(previous)` with no gap.
+
+The logic lives in `ControllerState.compute_max_deadline_seconds` in
+`controller.py`.  Users may schedule consecutive identical reservations to
+extend their session; the controller chains those windows into one deadline.
+
+**Enforcement** — after calling `apply_toleration`:
+
+- If the pod's current `activeDeadlineSeconds` is unset or exceeds the
+  computed maximum, `set_active_deadline` patches the pod spec.
+- `emit_runtime_capped_event` creates a `Normal` Kubernetes Event on the pod
+  with `reason: RuntimeCapped`, `action: CapRuntime`, and a human-readable
+  message explaining the cap.
+- Both steps are best-effort inside `_enforce_deadline` in `main.py`.  A
+  failure logs a warning and does **not** revoke the toleration.
+
+**RBAC**: the controller's ServiceAccount must have `create` on `events` in
+addition to the existing pod permissions.
 
 ### Timezone
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
 from kubernetes import client as k8s_client, config as k8s_config, watch
@@ -166,6 +167,74 @@ async def apply_toleration(
         tol_value,
         namespace,
         pod_name,
+    )
+
+
+async def set_active_deadline(pod_name: str, namespace: str, seconds: int) -> None:
+    """Patch pod's spec.activeDeadlineSeconds to *seconds*."""
+    loop = asyncio.get_running_loop()
+    patch = {"spec": {"activeDeadlineSeconds": seconds}}
+    await loop.run_in_executor(
+        None,
+        lambda: _core_v1.patch_namespaced_pod(pod_name, namespace, patch),
+    )
+    log.info(
+        "Set activeDeadlineSeconds=%d on pod %s/%s",
+        seconds,
+        namespace,
+        pod_name,
+    )
+
+
+async def emit_runtime_capped_event(
+    pod,
+    pod_name: str,
+    namespace: str,
+    deadline_seconds: int,
+) -> None:
+    """Create a Kubernetes Event linked to *pod* with reason='RuntimeCapped'."""
+    now = datetime.now(timezone.utc)
+    minutes, secs = divmod(deadline_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    human = (
+        f"{hours}h{minutes:02d}m{secs:02d}s"
+        if hours
+        else f"{minutes}m{secs:02d}s"
+    )
+    event = k8s_client.V1Event(
+        metadata=k8s_client.V1ObjectMeta(
+            name=f"gpu-runcap-{pod.metadata.uid}",
+            namespace=namespace,
+        ),
+        involved_object=k8s_client.V1ObjectReference(
+            api_version="v1",
+            kind="Pod",
+            name=pod_name,
+            namespace=namespace,
+            uid=pod.metadata.uid,
+        ),
+        reason="RuntimeCapped",
+        message=(
+            f"activeDeadlineSeconds set to {deadline_seconds} ({human}) "
+            f"to ensure the pod terminates within its GPU reservation window(s)."
+        ),
+        type="Normal",
+        first_timestamp=now,
+        last_timestamp=now,
+        count=1,
+        reporting_component="gpu-reservation-controller",
+        action="CapRuntime",
+    )
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: _core_v1.create_namespaced_event(namespace, event),
+    )
+    log.info(
+        "Emitted RuntimeCapped event for pod %s/%s (deadline=%ds)",
+        namespace,
+        pod_name,
+        deadline_seconds,
     )
 
 

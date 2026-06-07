@@ -38,10 +38,12 @@ from .k8s_client import (
     PodWatcher,
     apply_toleration,
     count_tolerated_gpu_usage,
+    emit_runtime_capped_event,
     get_pod_gpu_count,
     init_k8s,
     pod_has_toleration,
     read_pod,
+    set_active_deadline,
 )
 from .reservation_client import ReservationClient
 
@@ -101,6 +103,32 @@ async def _refresh_reservations(
 # ---------------------------------------------------------------------------
 
 
+async def _enforce_deadline(
+    state: ControllerState, fresh_pod, entry: QueueEntry
+) -> None:
+    """Cap the pod's activeDeadlineSeconds to its reservation window(s).
+
+    Best-effort: logs a warning on failure but does not raise, so a deadline
+    enforcement failure never rolls back an already-applied toleration.
+    """
+    try:
+        now = datetime.now()
+        max_secs = state.compute_max_deadline_seconds(now, entry.reservation)
+        current = fresh_pod.spec.active_deadline_seconds
+        if current is None or current > max_secs:
+            await set_active_deadline(entry.pod_name, entry.pod_namespace, max_secs)
+            await emit_runtime_capped_event(
+                fresh_pod, entry.pod_name, entry.pod_namespace, max_secs
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Failed to enforce activeDeadlineSeconds on pod %s/%s: %s",
+            entry.pod_namespace,
+            entry.pod_name,
+            exc,
+        )
+
+
 async def _try_apply_toleration(
     state: ControllerState, uid: str, entry: QueueEntry
 ) -> bool:
@@ -145,6 +173,7 @@ async def _try_apply_toleration(
                     TOLERATION_KEY,
                     entry.gpu_class_label,
                 )
+                await _enforce_deadline(state, fresh_pod, entry)
             return True
 
         else:
