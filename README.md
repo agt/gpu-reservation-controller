@@ -1,9 +1,10 @@
 # GPU Reservation Controller
 
 A Kubernetes controller daemon that enforces time-bound GPU reservations by
-patching pods with Kubernetes tolerations.  Only pods that belong to an active
-reservation — and fit within its GPU budget — are permitted to schedule on
-GPU nodes during the reservation window.
+patching pods with Kubernetes tolerations.  
+
+Pods that belong to an active reservation — and fit within its GPU budget — 
+are permitted to schedule on the additional nodes during the reservation window.
 
 ---
 
