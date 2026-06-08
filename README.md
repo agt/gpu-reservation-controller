@@ -10,15 +10,18 @@ are permitted to schedule on the additional nodes during the reservation window.
 
 ## How it works
 
-GPU nodes carry a taint:
+A configurable fraction of our GPU nodes will carry a taint:
 
 ```
 gpu-class-reservation=<gpu-class-label>:NoSchedule
 ```
 
-This blocks all ordinary pods from scheduling there.  The controller's job is
-to add the matching **toleration** to pods that have a valid, active reservation,
-subject to the GPU budget for that reservation.
+This blocks all ordinary pods from scheduling there.  
+
+The controller's job is to add the matching **toleration** to pods
+that have a valid, active reservation, subject to the GPU budget 
+for that reservation.  (Current budgets are always 1 unit, but the 
+system is designed to accommodate greater values in the future.)
 
 ### Control loop
 
