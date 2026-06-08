@@ -16,7 +16,9 @@ A configurable fraction of our GPU nodes will carry a taint:
 gpu-class-reservation=<gpu-class-label>:NoSchedule
 ```
 
-This blocks all ordinary pods from scheduling there.  
+This blocks all ordinary pods from scheduling there.  (Note that this is 
+distinct from and in addition to "gpu-class=<gpu-class-label>:NoSchedule" 
+which ensures that only jobs intended for that GPU type end up there.)
 
 The controller's job is to add the matching **toleration** to pods
 that have a valid, active reservation, subject to the GPU budget 
