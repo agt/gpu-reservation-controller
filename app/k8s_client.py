@@ -201,7 +201,7 @@ async def emit_runtime_capped_event(
         if hours
         else f"{minutes}m{secs:02d}s"
     )
-    event = k8s_client.V1Event(
+    event = k8s_client.CoreV1Event(
         metadata=k8s_client.V1ObjectMeta(
             name=f"gpu-runcap-{pod.metadata.uid}",
             namespace=namespace,
