@@ -81,6 +81,7 @@ def pod_has_toleration(pod, key: str, value: str, effect: str) -> bool:
 
 async def read_pod(name: str, namespace: str):
     """Fetch the current pod object (re-read before patching to get fresh state)."""
+    log.debug("k8s: read_namespaced_pod %s/%s", namespace, name)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None, lambda: _core_v1.read_namespaced_pod(name, namespace)
@@ -102,6 +103,9 @@ async def count_tolerated_gpu_usage(
     - already carries the toleration ``tol_key=tol_value:NoSchedule``
     - is not the pod identified by *exclude_uid* (the one we're evaluating)
     """
+    log.debug(
+        "k8s: list_namespaced_pod namespace=%s selector=%s", namespace, label_selector
+    )
     loop = asyncio.get_running_loop()
     pod_list = await loop.run_in_executor(
         None,
@@ -119,6 +123,10 @@ async def count_tolerated_gpu_usage(
         if not pod_has_toleration(pod, tol_key, tol_value, "NoSchedule"):
             continue
         total += get_pod_gpu_count(pod)
+    log.debug(
+        "k8s: counted %d tolerated GPU(s) in %s (excluding uid=%s)",
+        total, namespace, exclude_uid,
+    )
     return total
 
 
@@ -156,6 +164,10 @@ async def apply_toleration(
         existing.append(entry)
 
     patch = {"spec": {"tolerations": existing + [new_tol]}}
+    log.debug(
+        "k8s: patch_namespaced_pod %s/%s (add toleration %s=%s:NoSchedule)",
+        namespace, pod_name, tol_key, tol_value,
+    )
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(
         None,
@@ -172,6 +184,10 @@ async def apply_toleration(
 
 async def set_active_deadline(pod_name: str, namespace: str, seconds: int) -> None:
     """Patch pod's spec.activeDeadlineSeconds to *seconds*."""
+    log.debug(
+        "k8s: patch_namespaced_pod %s/%s (activeDeadlineSeconds=%d)",
+        namespace, pod_name, seconds,
+    )
     loop = asyncio.get_running_loop()
     patch = {"spec": {"activeDeadlineSeconds": seconds}}
     await loop.run_in_executor(
@@ -225,6 +241,9 @@ async def emit_runtime_capped_event(
         reporting_component="gpu-reservation-controller",
         action="CapRuntime",
     )
+    log.debug(
+        "k8s: create_namespaced_event %s (pod=%s, reason=RuntimeCapped)", namespace, pod_name
+    )
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(
         None,
@@ -272,8 +291,16 @@ class PodWatcher:
                     w = watch.Watch()
 
                     # LIST first — surfaces pods that exist before we started.
+                    log.debug(
+                        "k8s: list_pod_for_all_namespaces selector=%s",
+                        self._label_selector,
+                    )
                     pod_list = _core_v1.list_pod_for_all_namespaces(
                         label_selector=self._label_selector
+                    )
+                    log.debug(
+                        "k8s: list returned %d pod(s), resourceVersion=%s",
+                        len(pod_list.items), pod_list.metadata.resource_version,
                     )
                     for pod in pod_list.items:
                         loop.call_soon_threadsafe(queue.put_nowait, ("ADDED", pod))
@@ -283,12 +310,24 @@ class PodWatcher:
                     # timeout_seconds asks the API server to close the stream cleanly
                     # before any proxy/LB idle timeout fires, avoiding spurious
                     # "Response ended prematurely" errors on reconnect.
+                    log.debug(
+                        "k8s: watch list_pod_for_all_namespaces selector=%s"
+                        " resourceVersion=%s timeout_seconds=270",
+                        self._label_selector, resource_version,
+                    )
                     for event in w.stream(
                         _core_v1.list_pod_for_all_namespaces,
                         label_selector=self._label_selector,
                         resource_version=resource_version,
                         timeout_seconds=270,
                     ):
+                        obj = event["object"]
+                        log.debug(
+                            "k8s: watch event %s pod %s/%s",
+                            event["type"],
+                            obj.metadata.namespace,
+                            obj.metadata.name,
+                        )
                         loop.call_soon_threadsafe(
                             queue.put_nowait, (event["type"], event["object"])
                         )
