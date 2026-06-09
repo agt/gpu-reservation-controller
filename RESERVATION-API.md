@@ -248,14 +248,29 @@ X-API-Key: gpures_...
     "date": "2026-09-01",
     "gpu_count": 4,
     "status": "active",
+    "kind": "user",
     "notes": null,
     "created_at": "2026-08-20T10:15:00",
     "updated_at": "2026-08-20T10:15:00",
     "cancelled_at": null,
-    "cancelled_by_id": null
+    "cancelled_by_id": null,
+    "created_by_id": null
   }
 ]
 ```
+
+**On-demand / ad-hoc blocks.** A reservation with `"kind": "ondemand"` is a userless
+capacity block (admin-scheduled or auto-filled). For these rows `user_id`, `user`,
+`group_id`, and `group` are all `null`, but `gpu_class`, `policy`, `slot_index`, `date`,
+and `gpu_count` are populated, so the block occupies a real slot and consumes capacity
+exactly like a booking. Consumers must therefore tolerate a `null` `user`/`group` and
+should branch on `kind` (`"user"` vs `"ondemand"`). `created_by_id` is the admin who
+scheduled the block, or `null` when the auto-fill sweep created it.
+
+For the Kubernetes controller this means an `"ondemand"` row has **no user pod to admit** —
+treat it purely as reserved capacity (it occupies the slot's GPUs for its window) rather than
+mapping it to a user. A typical controller skips `"ondemand"` rows when reconciling per-user
+pods, while still counting them against the slot's GPU usage.
 
 ### Computing the reservation time window
 
@@ -576,10 +591,10 @@ both new additions and role corrections without a separate `PATCH` call.
 | `id` | integer | |
 | `name` | string | Unique |
 | `description` | string \| null | |
-| `valid_from` | date \| null | Group bookable on or after this date |
-| `valid_until` | date \| null | Group bookable on or before this date |
-| `min_days_ahead` | integer \| null | Users must book at least N days in advance |
-| `max_days_ahead` | integer \| null | Users cannot book more than N days out |
+| `valid_from` | date \| null | Group bookable on or after this date; admins and group managers get a 90-day grace window before this date |
+| `valid_until` | date \| null | Group bookable on or before this date; admins and group managers get a 90-day grace window after this date |
+| `min_days_ahead` | integer \| null | Members must book at least N days in advance (ignored for admins and group managers) |
+| `max_days_ahead` | integer \| null | Members cannot book more than N days out (ignored for admins and group managers) |
 | `max_reservations_per_user` | integer \| null | Per-user simultaneous cap |
 | `max_reservations_total` | integer \| null | Group-wide simultaneous cap |
 | `is_active` | boolean | Inactive groups cannot accept new reservations |
@@ -635,19 +650,21 @@ Returned by `GET /api/groups/{group_id}/members`.
   "date": "2026-09-01",
   "gpu_count": 4,
   "status": "active",
+  "kind": "user",
   "notes": null,
   "created_at": "2026-08-20T10:15:00",
   "updated_at": "2026-08-20T10:15:00",
   "cancelled_at": null,
-  "cancelled_by_id": null
+  "cancelled_by_id": null,
+  "created_by_id": null
 }
 ```
 
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | integer | |
-| `user_id` | integer | |
-| `user` | UserBrief | |
+| `user_id` | integer \| null | `null` for on-demand blocks (`kind="ondemand"`) |
+| `user` | UserBrief \| null | `null` for on-demand blocks |
 | `group_id` | integer \| null | |
 | `group` | GroupBrief \| null | |
 | `gpu_class_id` | integer | |
@@ -658,11 +675,13 @@ Returned by `GET /api/groups/{group_id}/members`.
 | `date` | date | Calendar date of the reservation |
 | `gpu_count` | integer | Number of GPUs reserved |
 | `status` | `"active"` \| `"cancelled"` | |
+| `kind` | `"user"` \| `"ondemand"` | `"ondemand"` = userless ad-hoc capacity block |
 | `notes` | string \| null | Free-text note from the user |
 | `created_at` | datetime | UTC |
 | `updated_at` | datetime | UTC |
 | `cancelled_at` | datetime \| null | UTC |
 | `cancelled_by_id` | integer \| null | User ID of whoever cancelled |
+| `created_by_id` | integer \| null | Admin who scheduled an on-demand block; `null` if auto-filled |
 
 ---
 
