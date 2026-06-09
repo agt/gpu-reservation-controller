@@ -36,8 +36,8 @@ class PolicyBrief(BaseModel):
 
 class ReservationResponse(BaseModel):
     id: int
-    user_id: int
-    user: UserBrief
+    user_id: Optional[int] = None   # null for kind="ondemand"
+    user: Optional[UserBrief] = None  # null for kind="ondemand"
     group_id: Optional[int] = None
     group: Optional[GroupBrief] = None
     gpu_class_id: int
@@ -48,11 +48,13 @@ class ReservationResponse(BaseModel):
     date: date               # calendar date of the reservation
     gpu_count: int           # number of GPUs reserved
     status: str              # "active" | "cancelled"
+    kind: str                # "user" | "ondemand"
     notes: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     cancelled_at: Optional[datetime] = None
     cancelled_by_id: Optional[int] = None
+    created_by_id: Optional[int] = None  # admin who created an ondemand block; null if auto-filled
 
 
 class GpuClassDetail(BaseModel):

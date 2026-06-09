@@ -120,7 +120,9 @@ class ControllerState:
         candidates = [
             r
             for r in self.reservations
-            if r.user.username == namespace
+            if r.kind == "user"
+            and r.user is not None
+            and r.user.username == namespace
             and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
             and slot_end(r) > now  # still has time left
         ]
@@ -213,6 +215,8 @@ class ControllerState:
                 r
                 for r in self.reservations
                 if r.id != current_reservation.id
+                and r.kind == "user"
+                and r.user is not None
                 and r.user.username == namespace
                 and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
                 and r.gpu_count == gpu_count
