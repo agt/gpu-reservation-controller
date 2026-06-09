@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -48,7 +49,7 @@ from .k8s_client import (
 from .reservation_client import ReservationClient
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
 )
 log = logging.getLogger(__name__)
