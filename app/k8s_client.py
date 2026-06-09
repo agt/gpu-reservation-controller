@@ -280,18 +280,22 @@ class PodWatcher:
                     resource_version = pod_list.metadata.resource_version
 
                     # WATCH — stream incremental events from where the list left off.
+                    # timeout_seconds asks the API server to close the stream cleanly
+                    # before any proxy/LB idle timeout fires, avoiding spurious
+                    # "Response ended prematurely" errors on reconnect.
                     for event in w.stream(
                         _core_v1.list_pod_for_all_namespaces,
                         label_selector=self._label_selector,
                         resource_version=resource_version,
+                        timeout_seconds=270,
                     ):
                         loop.call_soon_threadsafe(
                             queue.put_nowait, (event["type"], event["object"])
                         )
 
                 except Exception as exc:  # noqa: BLE001
-                    log.warning(
-                        "Pod watch error (%s); reconnecting in 5 s", exc
+                    log.debug(
+                        "Pod watch stream ended (%s); reconnecting in 5 s", exc
                     )
                     time.sleep(5)
 
