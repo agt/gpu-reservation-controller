@@ -31,6 +31,7 @@ from .config import Config
 from .controller import (
     TOLERATION_KEY,
     ControllerState,
+    OnDemandCandidate,
     QueueEntry,
     slot_end,
     slot_start,
@@ -41,6 +42,8 @@ from .k8s_client import (
     count_tolerated_gpu_usage,
     emit_runtime_capped_event,
     get_pod_gpu_count,
+    get_pod_min_runtime_seconds,
+    get_pod_phase,
     init_k8s,
     pod_has_toleration,
     read_pod,
@@ -97,6 +100,8 @@ async def _refresh_reservations(
 
     # Drop / re-match queue entries whose reservation was cancelled.
     state.reconcile_queue()
+    # Prune occupancy for on-demand blocks that are no longer active.
+    state.reconcile_ondemand()
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +211,132 @@ async def _try_apply_toleration(
 
 
 # ---------------------------------------------------------------------------
+# On-demand placement coroutine
+# ---------------------------------------------------------------------------
+
+
+async def _try_place_ondemand(
+    state: ControllerState, uid: str, candidate: OnDemandCandidate
+) -> bool:
+    """Attempt to place an on-demand candidate onto a suitable block.
+
+    Returns ``True``  — candidate should be removed (placed, or pod gone/terminal).
+    Returns ``False`` — candidate should remain; ``candidate.next_attempt_at``
+                        has been pushed forward.
+
+    Placement steps:
+    1. Find a suitable block (class + window + capacity + min-runtime).
+    2. Reserve capacity optimistically (before any await) to prevent races
+       within the single-threaded event loop.
+    3. Re-read the pod; if it is gone or terminal, roll back and drop.
+    4. Apply toleration.
+    5. Cap runtime to the block's window end and emit a RuntimeCapped event.
+    """
+    now = datetime.now()
+    block = state.find_ondemand_block(
+        candidate.gpu_class_label,
+        now,
+        candidate.gpu_requested,
+        candidate.min_runtime_seconds,
+    )
+    if block is None:
+        delay = random.randint(120, 300)
+        log.debug(
+            "On-demand candidate %s/%s: no suitable block available; retry in %d s",
+            candidate.pod_namespace,
+            candidate.pod_name,
+            delay,
+        )
+        candidate.next_attempt_at = datetime.now() + timedelta(seconds=delay)
+        return False
+
+    # --- optimistic reservation (before any await) ---
+    state.record_ondemand_placement(block.id, uid, candidate.gpu_requested)
+
+    try:
+        fresh_pod = await read_pod(candidate.pod_name, candidate.pod_namespace)
+
+        # Drop gone or terminal pods.
+        phase = get_pod_phase(fresh_pod)
+        if phase in ("Succeeded", "Failed", "Unknown"):
+            log.info(
+                "On-demand candidate %s/%s is %s; dropping",
+                candidate.pod_namespace,
+                candidate.pod_name,
+                phase,
+            )
+            state.release_ondemand_pod(uid)
+            return True
+
+        if pod_has_toleration(fresh_pod, TOLERATION_KEY, candidate.gpu_class_label, "NoSchedule"):
+            # Toleration was applied externally between the event and now.
+            log.info(
+                "On-demand pod %s/%s already has toleration; "
+                "recording as placed on block #%d",
+                candidate.pod_namespace,
+                candidate.pod_name,
+                block.id,
+            )
+            # Keep the occupancy record — it was placed somehow.
+            return True
+
+        await apply_toleration(
+            candidate.pod_name,
+            candidate.pod_namespace,
+            fresh_pod,
+            TOLERATION_KEY,
+            candidate.gpu_class_label,
+        )
+        log.info(
+            "Placed on-demand pod %s/%s onto block #%d "
+            "(gpu-class=%s, gpus=%d, block has %d/%d free after placement)",
+            candidate.pod_namespace,
+            candidate.pod_name,
+            block.id,
+            candidate.gpu_class_label,
+            candidate.gpu_requested,
+            state.ondemand_available(block),
+            block.gpu_count,
+        )
+
+        # Cap runtime to the on-demand block's window end (no back-to-back chaining).
+        remaining = int((slot_end(block) - datetime.now()).total_seconds())
+        remaining = max(remaining, 1)
+        try:
+            current_deadline = fresh_pod.spec.active_deadline_seconds
+            if current_deadline is None or current_deadline > remaining:
+                await set_active_deadline(
+                    candidate.pod_name, candidate.pod_namespace, remaining
+                )
+                await emit_runtime_capped_event(
+                    fresh_pod, candidate.pod_name, candidate.pod_namespace, remaining
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Failed to enforce activeDeadlineSeconds on on-demand pod %s/%s: %s",
+                candidate.pod_namespace,
+                candidate.pod_name,
+                exc,
+            )
+
+        return True
+
+    except Exception as exc:  # noqa: BLE001
+        # Roll back the optimistic occupancy record so capacity is not leaked.
+        state.release_ondemand_pod(uid)
+        delay = random.randint(120, 300)
+        log.warning(
+            "Error placing on-demand pod %s/%s: %s; retry in %d s",
+            candidate.pod_namespace,
+            candidate.pod_name,
+            exc,
+            delay,
+        )
+        candidate.next_attempt_at = datetime.now() + timedelta(seconds=delay)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Background loop 1: reservation refresh
 # ---------------------------------------------------------------------------
 
@@ -231,19 +362,21 @@ async def reservation_fetch_loop(
 # ---------------------------------------------------------------------------
 
 
-async def pod_watch_loop(state: ControllerState) -> None:
-    """Stream pod events and update the task queue accordingly.
+async def pod_watch_loop(state: ControllerState, config: Config) -> None:
+    """Stream pod events and update the task queue / on-demand candidates.
 
-    - ADDED / MODIFIED with gpu-class label and no toleration → enqueue
-    - ADDED / MODIFIED with gpu-class label and toleration already present
-      → dequeue (toleration applied externally or by a previous controller run)
+    Reserved path (kind="user"):
+    - ADDED / MODIFIED, no toleration → enqueue for reservation matching
+    - ADDED / MODIFIED, toleration present → dequeue (already admitted)
     - DELETED → dequeue
+    - ADDED inside open window → fast-path immediate toleration attempt
 
-    **Fast path:** when a pod ADDED event arrives while its reservation window
-    is already open (e.g. a JupyterHub pod launched mid-window), the toleration
-    is attempted immediately rather than waiting up to 30 s for the next
-    queue-processor tick.  MODIFIED events respect the normal retry cadence so
-    a rapid burst of updates doesn't hammer the Kubernetes API.
+    On-demand path (kind="ondemand", when ``config.ondemand_placement_enabled``):
+    - ADDED, Pending, has ``dsmlp/minimum-runtime-seconds`` annotation,
+      no matching user reservation → add as on-demand candidate
+    - DELETED or terminal (Succeeded/Failed) → release any held on-demand slot
+      and attempt immediate placement of a waiting candidate of the same class
+    - MODIFIED with toleration present → dequeue from candidates (already placed)
     """
     watcher = PodWatcher(label_selector="gpu-class")
     async for event_type, pod in watcher.events():
@@ -258,31 +391,91 @@ async def pod_watch_loop(state: ControllerState) -> None:
             continue
 
         if event_type == "DELETED":
+            # --- reserved path cleanup ---
             state.dequeue_pod(uid)
+            # --- on-demand path cleanup ---
+            state.remove_ondemand_candidate(uid)
+            if config.ondemand_placement_enabled:
+                block_id = state.release_ondemand_pod(uid)
+                if block_id is not None:
+                    await _recycle_ondemand_block(state, gpu_class_label)
 
         elif event_type in ("ADDED", "MODIFIED"):
-            if pod_has_toleration(pod, TOLERATION_KEY, gpu_class_label, "NoSchedule"):
-                # Pod already has the toleration — remove from queue if present.
+            phase = get_pod_phase(pod)
+            has_tol = pod_has_toleration(pod, TOLERATION_KEY, gpu_class_label, "NoSchedule")
+
+            # --- terminal on-demand pod: free its slot ---
+            if config.ondemand_placement_enabled and phase in ("Succeeded", "Failed"):
+                state.remove_ondemand_candidate(uid)
+                block_id = state.release_ondemand_pod(uid)
+                if block_id is not None:
+                    await _recycle_ondemand_block(state, gpu_class_label)
+                continue
+
+            if has_tol:
+                # Pod already admitted — remove from whichever queue it may be in.
                 state.dequeue_pod(uid)
+                state.remove_ondemand_candidate(uid)
             else:
                 gpu_count = get_pod_gpu_count(pod)
-                state.enqueue_pod(uid, name, namespace, gpu_class_label, gpu_count)
+                reservation = state.find_best_reservation(namespace, gpu_class_label)
 
-                # Fast path: ADDED pod inside an open window — don't wait for
-                # the queue processor's 30-second polling interval.
-                if event_type == "ADDED":
-                    entry = state.task_queue.get(uid)
-                    if entry is not None:
-                        now = datetime.now()
-                        if slot_start(entry.reservation) <= now < slot_end(entry.reservation):
-                            log.info(
-                                "Pod %s/%s arrived inside reservation window; "
-                                "attempting immediate toleration",
-                                namespace,
-                                name,
+                if reservation is not None:
+                    # ---- reserved path ----
+                    state.enqueue_pod(uid, name, namespace, gpu_class_label, gpu_count)
+
+                    # Fast path: ADDED pod inside an open window — don't wait for
+                    # the queue processor's 30-second polling interval.
+                    if event_type == "ADDED":
+                        entry = state.task_queue.get(uid)
+                        if entry is not None:
+                            now = datetime.now()
+                            if slot_start(entry.reservation) <= now < slot_end(entry.reservation):
+                                log.info(
+                                    "Pod %s/%s arrived inside reservation window; "
+                                    "attempting immediate toleration",
+                                    namespace,
+                                    name,
+                                )
+                                if await _try_apply_toleration(state, uid, entry):
+                                    state.task_queue.pop(uid, None)
+
+                elif config.ondemand_placement_enabled and event_type == "ADDED":
+                    # ---- on-demand path ----
+                    # Only ADDED events enqueue candidates; MODIFIED events for a
+                    # pod we're already tracking are handled by the processor loop.
+                    if phase == "Pending":
+                        min_rt = get_pod_min_runtime_seconds(pod)
+                        if min_rt is not None:
+                            state.add_ondemand_candidate(
+                                uid, name, namespace, gpu_class_label, gpu_count, min_rt
                             )
-                            if await _try_apply_toleration(state, uid, entry):
-                                state.task_queue.pop(uid, None)
+
+
+# ---------------------------------------------------------------------------
+# On-demand recycling helper
+# ---------------------------------------------------------------------------
+
+
+async def _recycle_ondemand_block(
+    state: ControllerState, gpu_class_label: str
+) -> None:
+    """After a pod vacates an on-demand block, try to place the next candidate.
+
+    Scans ``state.ondemand_candidates`` for a candidate of the same GPU class
+    whose ``next_attempt_at`` has passed and immediately tries to place it.
+    Only the first successful placement is made per call; the queue processor
+    will handle any remaining candidates on its next tick.
+    """
+    now = datetime.now()
+    for uid, candidate in list(state.ondemand_candidates.items()):
+        if candidate.gpu_class_label != gpu_class_label:
+            continue
+        if now < candidate.next_attempt_at:
+            continue
+        if await _try_place_ondemand(state, uid, candidate):
+            state.ondemand_candidates.pop(uid, None)
+            return  # one placement per recycle event is enough
 
 
 # ---------------------------------------------------------------------------
@@ -290,24 +483,29 @@ async def pod_watch_loop(state: ControllerState) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def queue_processor_loop(state: ControllerState) -> None:
+async def queue_processor_loop(state: ControllerState, config: Config) -> None:
     """Every 30 s, scan the work queue and apply tolerations where eligible.
 
-    Per-entry logic:
+    Reserved-path logic per entry:
     1. If the reservation window has expired → remove from queue.
     2. If the window hasn't opened yet, or the entry is in retry cooldown → skip.
     3. Delegate budget check + patch to ``_try_apply_toleration``.
 
-    Note: pods that arrive *inside* an open window are handled immediately by
-    the pod-watch loop fast path and typically won't reach this loop at all.
-    This loop covers pods that were queued before the window opened, and retries
-    for pods that were ineligible (budget full) on a previous attempt.
+    On-demand-path logic (when ``config.ondemand_placement_enabled``):
+    4. For each candidate whose ``next_attempt_at`` has passed, attempt placement.
+    5. Drop candidates whose pod no longer exists or is terminal.
+
+    Note: reserved pods that arrive inside an open window are handled immediately
+    by the pod-watch loop fast path and typically won't reach this loop at all.
+    This loop covers pods queued before their window opened and retries for pods
+    that were ineligible on a previous attempt.
     """
     while True:
         await asyncio.sleep(30)
         now = datetime.now()
         to_remove: list[str] = []
 
+        # --- reserved path ---
         for uid, entry in list(state.task_queue.items()):
             start = slot_start(entry.reservation)
             end = slot_end(entry.reservation)
@@ -333,6 +531,17 @@ async def queue_processor_loop(state: ControllerState) -> None:
 
         for uid in to_remove:
             state.task_queue.pop(uid, None)
+
+        # --- on-demand path ---
+        if config.ondemand_placement_enabled:
+            od_to_remove: list[str] = []
+            for uid, candidate in list(state.ondemand_candidates.items()):
+                if now < candidate.next_attempt_at:
+                    continue
+                if await _try_place_ondemand(state, uid, candidate):
+                    od_to_remove.append(uid)
+            for uid in od_to_remove:
+                state.ondemand_candidates.pop(uid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -373,8 +582,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             reservation_fetch_loop(state, client, config.reservation_fetch_interval),
             name="reservation-fetch",
         ),
-        asyncio.create_task(pod_watch_loop(state), name="pod-watch"),
-        asyncio.create_task(queue_processor_loop(state), name="queue-processor"),
+        asyncio.create_task(pod_watch_loop(state, config), name="pod-watch"),
+        asyncio.create_task(queue_processor_loop(state, config), name="queue-processor"),
     ]
     log.info("GPU reservation controller started")
 

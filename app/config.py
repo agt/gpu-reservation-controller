@@ -15,6 +15,7 @@ class Config:
     reservation_lookahead_days: int   # how many calendar days ahead to fetch
     kubeconfig_path: Optional[str]    # None → use in-cluster service account
     health_port: int
+    ondemand_placement_enabled: bool  # enable/disable on-demand pod placement
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -39,4 +40,8 @@ class Config:
             ),
             kubeconfig_path=os.environ.get("KUBECONFIG") or None,
             health_port=int(os.environ.get("HEALTH_PORT", "8000")),
+            ondemand_placement_enabled=os.environ.get(
+                "ONDEMAND_PLACEMENT_ENABLED", "true"
+            ).lower()
+            not in ("false", "0", "no"),
         )

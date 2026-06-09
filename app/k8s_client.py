@@ -52,6 +52,37 @@ def init_k8s(kubeconfig_path: Optional[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def get_pod_phase(pod) -> str:
+    """Return the pod's phase string (e.g. "Pending", "Running", "Succeeded", "Failed").
+
+    Returns an empty string if the phase is unavailable.
+    """
+    return (pod.status.phase if pod.status else None) or ""
+
+
+def get_pod_min_runtime_seconds(pod) -> Optional[int]:
+    """Read the ``dsmlp/minimum-runtime-seconds`` annotation from *pod*.
+
+    Returns the integer value if the annotation is present and parseable as a
+    positive integer, or ``None`` otherwise.
+    """
+    annotations: dict = pod.metadata.annotations or {}
+    raw = annotations.get("dsmlp/minimum-runtime-seconds")
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+        return value if value > 0 else None
+    except (ValueError, TypeError):
+        log.warning(
+            "Pod %s/%s has non-integer dsmlp/minimum-runtime-seconds=%r; ignoring",
+            pod.metadata.namespace,
+            pod.metadata.name,
+            raw,
+        )
+        return None
+
+
 def get_pod_gpu_count(pod) -> int:
     """Sum nvidia.com/gpu resource requests across all containers in *pod*."""
     total = 0
