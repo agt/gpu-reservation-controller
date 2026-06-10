@@ -7,10 +7,11 @@ Public surface
 --------------
 init_k8s(kubeconfig_path)          — load credentials once at startup
 get_pod_gpu_count(pod)             — sum nvidia.com/gpu requests
+get_pod_booking_reference(pod)     — read dsmlp/booking-reference annotation
 pod_has_toleration(pod, ...)       — check for a specific toleration
 read_pod(name, namespace)          — fetch current pod object
 count_tolerated_gpu_usage(...)     — sum GPU usage of eligible sibling pods
-apply_toleration(...)              — PATCH a pod to add one toleration
+apply_toleration(...)              — PATCH a pod to add toleration + booking annotation
 PodWatcher                         — async-generator based pod event stream
 """
 
@@ -97,6 +98,12 @@ def get_pod_gpu_count(pod) -> int:
     return total
 
 
+def get_pod_booking_reference(pod) -> Optional[str]:
+    """Return the ``dsmlp/booking-reference`` annotation value, or ``None``."""
+    annotations: dict = pod.metadata.annotations or {}
+    return annotations.get("dsmlp/booking-reference")
+
+
 def pod_has_toleration(pod, key: str, value: str, effect: str) -> bool:
     """Return True if *pod* already carries the named toleration."""
     for t in pod.spec.tolerations or []:
@@ -125,6 +132,7 @@ async def count_tolerated_gpu_usage(
     tol_key: str,
     tol_value: str,
     exclude_uid: str,
+    booking_reference: str,
 ) -> int:
     """Count nvidia.com/gpu already consumed by sibling pods in *namespace*.
 
@@ -132,6 +140,7 @@ async def count_tolerated_gpu_usage(
     - matches *label_selector*
     - is in Running or Pending phase
     - already carries the toleration ``tol_key=tol_value:NoSchedule``
+    - has a ``dsmlp/booking-reference`` annotation equal to *booking_reference*
     - is not the pod identified by *exclude_uid* (the one we're evaluating)
     """
     log.debug(
@@ -153,10 +162,12 @@ async def count_tolerated_gpu_usage(
             continue
         if not pod_has_toleration(pod, tol_key, tol_value, "NoSchedule"):
             continue
+        if get_pod_booking_reference(pod) != booking_reference:
+            continue
         total += get_pod_gpu_count(pod)
     log.debug(
-        "k8s: counted %d tolerated GPU(s) in %s (excluding uid=%s)",
-        total, namespace, exclude_uid,
+        "k8s: counted %d tolerated GPU(s) in %s for booking %s (excluding uid=%s)",
+        total, namespace, booking_reference, exclude_uid,
     )
     return total
 
@@ -167,8 +178,10 @@ async def apply_toleration(
     pod,
     tol_key: str,
     tol_value: str,
+    booking_reference: str,
 ) -> None:
-    """Patch *pod* to add toleration ``tol_key=tol_value:NoSchedule``.
+    """Patch *pod* to add toleration ``tol_key=tol_value:NoSchedule`` and set
+    the ``dsmlp/booking-reference`` annotation.
 
     The patch preserves all existing tolerations; Kubernetes rejects requests
     that would remove tolerations from running pods.
@@ -194,10 +207,13 @@ async def apply_toleration(
             entry["tolerationSeconds"] = t.toleration_seconds
         existing.append(entry)
 
-    patch = {"spec": {"tolerations": existing + [new_tol]}}
+    patch = {
+        "metadata": {"annotations": {"dsmlp/booking-reference": booking_reference}},
+        "spec": {"tolerations": existing + [new_tol]},
+    }
     log.debug(
-        "k8s: patch_namespaced_pod %s/%s (add toleration %s=%s:NoSchedule)",
-        namespace, pod_name, tol_key, tol_value,
+        "k8s: patch_namespaced_pod %s/%s (add toleration %s=%s:NoSchedule, booking=%s)",
+        namespace, pod_name, tol_key, tol_value, booking_reference,
     )
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(
@@ -205,11 +221,12 @@ async def apply_toleration(
         lambda: _core_v1.patch_namespaced_pod(pod_name, namespace, patch),
     )
     log.info(
-        "Applied toleration %s=%s:NoSchedule to pod %s/%s",
+        "Applied toleration %s=%s:NoSchedule to pod %s/%s (booking=%s)",
         tol_key,
         tol_value,
         namespace,
         pod_name,
+        booking_reference,
     )
 
 

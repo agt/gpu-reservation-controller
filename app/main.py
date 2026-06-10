@@ -41,6 +41,7 @@ from .k8s_client import (
     apply_toleration,
     count_tolerated_gpu_usage,
     emit_runtime_capped_event,
+    get_pod_booking_reference,
     get_pod_gpu_count,
     get_pod_min_runtime_seconds,
     get_pod_phase,
@@ -148,6 +149,7 @@ async def _try_apply_toleration(
     **Does not** evaluate timing (window open/closed, retry cooldown); callers
     are responsible for those guards before invoking this function.
     """
+    booking_reference = f"res-{entry.reservation.id}"
     try:
         other_gpus = await count_tolerated_gpu_usage(
             namespace=entry.pod_namespace,
@@ -155,6 +157,7 @@ async def _try_apply_toleration(
             tol_key=TOLERATION_KEY,
             tol_value=entry.gpu_class_label,
             exclude_uid=uid,
+            booking_reference=booking_reference,
         )
 
         total_requested = entry.gpu_requested + other_gpus
@@ -178,6 +181,7 @@ async def _try_apply_toleration(
                     fresh_pod,
                     TOLERATION_KEY,
                     entry.gpu_class_label,
+                    booking_reference,
                 )
                 await _enforce_deadline(state, fresh_pod, entry)
             return True
@@ -250,6 +254,7 @@ async def _try_place_ondemand(
         candidate.next_attempt_at = datetime.now() + timedelta(seconds=delay)
         return False
 
+    booking_reference = f"ondemand-{block.id}"
     # --- optimistic reservation (before any await) ---
     state.record_ondemand_placement(block.id, uid, candidate.gpu_requested)
 
@@ -286,6 +291,7 @@ async def _try_place_ondemand(
             fresh_pod,
             TOLERATION_KEY,
             candidate.gpu_class_label,
+            booking_reference,
         )
         log.info(
             "Placed on-demand pod %s/%s onto block #%d "
