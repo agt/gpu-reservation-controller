@@ -231,13 +231,17 @@ async def apply_toleration(
 
 
 async def set_active_deadline(pod_name: str, namespace: str, seconds: int) -> None:
-    """Patch pod's spec.activeDeadlineSeconds to *seconds*."""
+    """Patch pod's spec.activeDeadlineSeconds to *seconds* and record the limit
+    in the ``dsmlp/pod-runtime-limit-seconds`` annotation."""
     log.debug(
         "k8s: patch_namespaced_pod %s/%s (activeDeadlineSeconds=%d)",
         namespace, pod_name, seconds,
     )
     loop = asyncio.get_running_loop()
-    patch = {"spec": {"activeDeadlineSeconds": seconds}}
+    patch = {
+        "metadata": {"annotations": {"dsmlp/pod-runtime-limit-seconds": str(seconds)}},
+        "spec": {"activeDeadlineSeconds": seconds},
+    }
     await loop.run_in_executor(
         None,
         lambda: _core_v1.patch_namespaced_pod(pod_name, namespace, patch),
