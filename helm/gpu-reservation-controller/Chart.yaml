@@ -1,0 +1,13 @@
+apiVersion: v2
+name: gpu-reservation-controller
+description: Kubernetes controller that enforces time-bound GPU reservations by patching pods with tolerations
+type: application
+version: 0.1.0
+appVersion: "latest"
+keywords:
+  - gpu
+  - reservation
+  - controller
+  - kubernetes
+maintainers:
+  - email: agt@ucsd.edu

@@ -1,0 +1,17 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "gpu-reservation-controller.fullname" . }}
+  labels:
+    {{- include "gpu-reservation-controller.labels" . | nindent 4 }}
+rules:
+  # The controller lists and watches pods across all namespaces to detect
+  # reservation candidates, and patches pods in any user namespace to apply
+  # tolerations and set activeDeadlineSeconds.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "patch"]
+  # emit_runtime_capped_event creates a Normal event on each admitted pod.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create"]

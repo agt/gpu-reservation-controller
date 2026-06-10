@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "gpu-reservation-controller.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gpu-reservation-controller.labels" . | nindent 4 }}
+spec:
+  # The controller holds in-memory queue state; running more than one replica
+  # would result in duplicate toleration patches.  Always keep this at 1.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "gpu-reservation-controller.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "gpu-reservation-controller.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "gpu-reservation-controller.serviceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: controller
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.config.healthPort }}
+              protocol: TCP
+          env:
+            # --- Required ---
+            - name: RESERVATION_API_URL
+              value: {{ required "reservationApiUrl is required" .Values.reservationApiUrl | quote }}
+            - name: RESERVATION_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.apiKeySecret.name | quote }}
+                  key: {{ .Values.apiKeySecret.key | quote }}
+
+            # --- Optional tuning ---
+            - name: RESERVATION_FETCH_INTERVAL
+              value: {{ .Values.config.reservationFetchInterval | quote }}
+            - name: RESERVATION_LOOKAHEAD_DAYS
+              value: {{ .Values.config.reservationLookaheadDays | quote }}
+            - name: HEALTH_PORT
+              value: {{ .Values.config.healthPort | quote }}
+            - name: ONDEMAND_PLACEMENT_ENABLED
+              value: {{ .Values.config.ondemandPlacementEnabled | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.config.logLevel | quote }}
+            {{- if .Values.config.timezone }}
+            - name: TZ
+              value: {{ .Values.config.timezone | quote }}
+            {{- end }}
+
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

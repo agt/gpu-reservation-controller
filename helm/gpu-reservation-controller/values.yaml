@@ -1,0 +1,108 @@
+# Default values for gpu-reservation-controller.
+
+replicaCount: 1
+
+image:
+  repository: gpu-reservation-controller
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# Required application configuration
+# ---------------------------------------------------------------------------
+
+# Base URL of the reservation management API (required).
+# Example: https://gpures.example.edu
+reservationApiUrl: ""
+
+# Reference to a pre-existing Secret containing the API service key.
+# The Secret must exist in the release namespace before deploying this chart.
+# The key value is injected as the RESERVATION_API_KEY environment variable.
+apiKeySecret:
+  name: gpu-reservation-api-key
+  key: api-key
+
+# ---------------------------------------------------------------------------
+# Optional tuning — defaults mirror application defaults
+# ---------------------------------------------------------------------------
+
+config:
+  # Seconds between reservation refresh cycles.
+  reservationFetchInterval: 300
+
+  # Calendar days ahead to fetch reservations.
+  reservationLookaheadDays: 7
+
+  # Port for the GET /health liveness endpoint.
+  healthPort: 8000
+
+  # Enable on-demand pod placement (set to false to disable).
+  ondemandPlacementEnabled: true
+
+  # IANA timezone for reservation window arithmetic.
+  # Leave empty to use the container's system default.
+  # Example: America/Los_Angeles
+  timezone: ""
+
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  logLevel: "INFO"
+
+# ---------------------------------------------------------------------------
+# ServiceAccount and RBAC
+# ---------------------------------------------------------------------------
+
+serviceAccount:
+  # Set to false to use an existing ServiceAccount specified by .name below.
+  create: true
+  # If empty and create=true, defaults to the fully-qualified release name.
+  name: ""
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Service (exposes the /health endpoint within the cluster)
+# ---------------------------------------------------------------------------
+
+service:
+  type: ClusterIP
+  port: 8000
+
+# ---------------------------------------------------------------------------
+# Deployment tuning
+# ---------------------------------------------------------------------------
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Additional arbitrary environment variables injected into the container.
+# Accepts the same structure as a Kubernetes EnvVar list entry, so both
+# plain values and secretKeyRef/configMapKeyRef sources are supported.
+# Example:
+#   extraEnv:
+#     - name: HTTP_PROXY
+#       value: "http://proxy.example.com:3128"
+extraEnv: []
