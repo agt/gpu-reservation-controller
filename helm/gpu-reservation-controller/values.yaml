@@ -33,6 +33,9 @@ config:
   # Seconds between reservation refresh cycles.
   reservationFetchInterval: 300
 
+  # Seconds between queue-processor ticks (pod LIST frequency).
+  podListTickInterval: 300
+
   # Calendar days ahead to fetch reservations.
   reservationLookaheadDays: 7
 

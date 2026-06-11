@@ -49,7 +49,7 @@ app/
 |------|---------|----------------|
 | `reservation_fetch_loop` | every `RESERVATION_FETCH_INTERVAL` s (default 300) | Re-fetches active reservations; resolves `gpu_class_id → label_value`; reconciles stale queue entries |
 | `pod_watch_loop` | continuous (LIST + WATCH) | Enqueues pods with `gpu-class` label that lack the toleration; dequeues deleted pods; **fast-path**: applies toleration immediately when a new pod arrives inside an open window |
-| `queue_processor_loop` | every 30 s | Handles pods queued before their window opened; retries pods that were over-budget; schedules retries with 2–5 min jitter |
+| `queue_processor_loop` | every `POD_LIST_TICK_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; schedules retries with 2–5 min jitter |
 
 ---
 
@@ -215,6 +215,7 @@ above applies.
 | `ONDEMAND_PLACEMENT_ENABLED` | `true` | Set to `false` to disable on-demand placement entirely |
 | `NOSHOWN_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
 | `NOSHOWN_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared |
+| `POD_LIST_TICK_INTERVAL` | `300` | Seconds between queue-processor ticks (pod LIST frequency) |
 
 ---
 
