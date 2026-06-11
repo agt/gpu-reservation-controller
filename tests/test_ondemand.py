@@ -353,7 +353,7 @@ class TestReconcileOccupancy:
 class TestCandidateManagement:
     def test_add_candidate(self):
         state = ControllerState()
-        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600)
+        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now())
         assert "uid-1" in state.ondemand_candidates
         c = state.ondemand_candidates["uid-1"]
         assert c.gpu_class_label == "h100"
@@ -361,19 +361,19 @@ class TestCandidateManagement:
 
     def test_add_is_idempotent(self):
         state = ControllerState()
-        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600)
-        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600)
+        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now())
+        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now())
         assert len(state.ondemand_candidates) == 1
 
     def test_already_placed_pod_not_re_added(self):
         state = ControllerState()
         state.occupancy[42] = {"uid-1": 1}
-        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600)
+        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now())
         assert "uid-1" not in state.ondemand_candidates
 
     def test_remove_candidate(self):
         state = ControllerState()
-        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600)
+        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now())
         state.remove_ondemand_candidate("uid-1")
         assert "uid-1" not in state.ondemand_candidates
 

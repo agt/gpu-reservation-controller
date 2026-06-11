@@ -94,6 +94,7 @@ class OnDemandCandidate:
     gpu_class_label: str   # value of pod label "gpu-class" (e.g. "h100")
     gpu_requested: int     # nvidia.com/gpu units requested by this pod
     min_runtime_seconds: int  # dsmlp/minimum-runtime-seconds annotation value
+    pod_created_at: datetime  # metadata.creationTimestamp; used for FIFO ordering
     next_attempt_at: datetime  # earliest time to try placement
 
 
@@ -614,6 +615,7 @@ class ControllerState:
         gpu_class_label: str,
         gpu_requested: int,
         min_runtime_seconds: int,
+        pod_created_at: datetime,
     ) -> None:
         """Register a pod as an on-demand placement candidate (idempotent).
 
@@ -636,6 +638,7 @@ class ControllerState:
             gpu_class_label=gpu_class_label,
             gpu_requested=gpu_requested,
             min_runtime_seconds=min_runtime_seconds,
+            pod_created_at=pod_created_at,
             next_attempt_at=datetime.now(),
         )
         self.ondemand_candidates[pod_uid] = candidate
