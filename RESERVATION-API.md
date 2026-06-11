@@ -81,11 +81,12 @@ Responses are always JSON.
 
 ### Date and time formats
 
-| Type | Format | Example |
-|------|--------|---------|
-| Date | `YYYY-MM-DD` | `2026-09-01` |
-| Datetime | ISO 8601 UTC, no timezone suffix | `2026-09-01T08:00:00` |
-| Time-of-day | `HH:MM:SS` | `08:00:00` |
+| Type | Format | Example | Notes |
+|------|--------|---------|-------|
+| Date | `YYYY-MM-DD` | `2026-09-01` | Calendar date; no timezone |
+| Datetime (audit) | ISO 8601, `Z` suffix | `2026-09-01T08:00:00Z` | `created_at`, `updated_at`, `cancelled_at` — always UTC |
+| Datetime (slot) | ISO 8601, `Z` suffix | `2026-09-12T03:00:00Z` | `start_utc`, `end_utc` — slot boundaries converted to UTC by the server |
+| Time-of-day | `HH:MM:SS` | `08:00:00` | `policy.start_time` — local wall-clock, no timezone |
 
 ### Pagination
 
@@ -249,12 +250,14 @@ X-API-Key: gpures_...
       "repeat_count": 1
     },
     "date": "2026-09-01",
+    "start_utc": "2026-09-01T15:00:00Z",
+    "end_utc": "2026-09-01T23:00:00Z",
     "gpu_count": 4,
     "status": "active",
     "kind": "user",
     "notes": null,
-    "created_at": "2026-08-20T10:15:00",
-    "updated_at": "2026-08-20T10:15:00",
+    "created_at": "2026-08-20T10:15:00Z",
+    "updated_at": "2026-08-20T10:15:00Z",
     "cancelled_at": null,
     "cancelled_by_id": null,
     "created_by_id": null
@@ -275,26 +278,45 @@ treat it purely as reserved capacity (it occupies the slot's GPUs for its window
 mapping it to a user. A typical controller skips `"ondemand"` rows when reconciling per-user
 pods, while still counting them against the slot's GPU usage.
 
-### Computing the reservation time window
+### Reading the reservation time window
 
-Each reservation maps to an exact clock window using fields from the nested
-`policy` object:
+Every `ReservationResponse` now includes pre-computed UTC timestamps:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `start_utc` | string (ISO 8601, `Z`) | Slot start in UTC |
+| `end_utc` | string (ISO 8601, `Z`) | Slot end in UTC |
+
+Use these directly — no timezone knowledge required:
+
+```python
+# Python example — compute activeDeadlineSeconds for the k8s controller
+from datetime import datetime, timezone
+
+end = datetime.strptime(reservation["end_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+active_deadline_seconds = max(0, int((end - datetime.now(timezone.utc)).total_seconds()))
+```
+
+**How they are computed.** The server derives these from the stored local-time fields
+(`date`, `policy.start_time`, `slot_index`, `policy.duration_minutes`) using the
+`TIMEZONE` environment variable configured at deployment time.  The raw fields remain
+in the response for backward compatibility and human display:
 
 ```
-slot_start = policy.start_time  +  slot_index × policy.duration_minutes
-slot_end   = slot_start         +  policy.duration_minutes
+slot_start_local = policy.start_time  +  slot_index × policy.duration_minutes
+slot_end_local   = slot_start_local   +  policy.duration_minutes
+start_utc        = slot_start_local converted to UTC via TIMEZONE
+end_utc          = slot_end_local   converted to UTC via TIMEZONE
 ```
 
-Both are offsets in minutes from midnight on `date`, expressed in the cluster's
-local timezone (the server does not store a timezone — coordinate with the
-cluster operator).
-
-**Example:** `start_time = "08:00:00"`, `duration_minutes = 240`,
-`slot_index = 1`, `date = "2026-09-01"`:
+**Example** — server configured with `TIMEZONE=America/Los_Angeles` (PDT, UTC−7):
+`start_time = "20:00:00"`, `duration_minutes = 120`, `slot_index = 0`,
+`date = "2026-06-11"`:
 
 ```
-slot_start = 480 + 1 × 240 = 720 min  →  2026-09-01 12:00
-slot_end   = 720 + 240     = 960 min  →  2026-09-01 16:00
+slot_start_local = 2026-06-11 20:00 PDT
+start_utc        = "2026-06-12T03:00:00Z"
+end_utc          = "2026-06-12T05:00:00Z"
 ```
 
 ### Kubernetes node targeting
@@ -702,12 +724,14 @@ Returned by `GET /api/groups/{group_id}/members`.
     "repeat_count": 1
   },
   "date": "2026-09-01",
+  "start_utc": "2026-09-01T15:00:00Z",
+  "end_utc": "2026-09-01T23:00:00Z",
   "gpu_count": 4,
   "status": "active",
   "kind": "user",
   "notes": null,
-  "created_at": "2026-08-20T10:15:00",
-  "updated_at": "2026-08-20T10:15:00",
+  "created_at": "2026-08-20T10:15:00Z",
+  "updated_at": "2026-08-20T10:15:00Z",
   "cancelled_at": null,
   "cancelled_by_id": null,
   "created_by_id": null
@@ -725,15 +749,17 @@ Returned by `GET /api/groups/{group_id}/members`.
 | `gpu_class` | `{id, name}` | |
 | `policy_id` | integer | |
 | `slot_index` | integer | 0-based index into repeating slots |
-| `policy` | PolicyBrief | Embedded; see time-window calculation in §4 |
-| `date` | date | Calendar date of the reservation |
+| `policy` | PolicyBrief | Embedded; raw local-time fields for display |
+| `date` | date | Calendar date of the reservation (local time) |
+| `start_utc` | string (ISO 8601, `Z`) | Slot start converted to UTC; use this for time comparisons |
+| `end_utc` | string (ISO 8601, `Z`) | Slot end converted to UTC; use this for `activeDeadlineSeconds` |
 | `gpu_count` | integer | Number of GPUs reserved |
 | `status` | `"active"` \| `"cancelled"` | |
 | `kind` | `"user"` \| `"ondemand"` | `"ondemand"` = userless ad-hoc capacity block |
 | `notes` | string \| null | Free-text note from the user |
-| `created_at` | datetime | UTC |
-| `updated_at` | datetime | UTC |
-| `cancelled_at` | datetime \| null | UTC |
+| `created_at` | datetime (UTC, `Z`) | |
+| `updated_at` | datetime (UTC, `Z`) | |
+| `cancelled_at` | datetime \| null (UTC, `Z`) | |
 | `cancelled_by_id` | integer \| null | User ID of whoever cancelled |
 | `created_by_id` | integer \| null | Admin who scheduled an on-demand block; `null` if auto-filled |
 
