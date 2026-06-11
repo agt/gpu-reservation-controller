@@ -125,17 +125,16 @@ class ControllerState:
         # Pending, but do not match any user reservation.
         self.ondemand_candidates: dict[str, OnDemandCandidate] = {}
 
-        # Occupancy map for on-demand blocks: block reservation id →
-        # { pod_uid: gpu_count }.  This is the authoritative record of what
-        # the controller has placed onto each on-demand block.  Available
-        # capacity = block.gpu_count - sum(values).
+        # Unified occupancy map for ALL admitted pods (reserved, on-demand, and
+        # no-show alike): reservation id → { pod_uid: gpu_count }.  Available
+        # capacity on any reservation = reservation.gpu_count - sum(values).
         #
-        # Reconstructed at startup from the dsmlp/ondemand-block-id annotation
-        # that is stamped on each pod at placement time (see pod_watch_loop).
-        # Pods placed by a controller version predating that annotation will not
-        # be counted, so the first restart after upgrading may briefly allow one
-        # extra placement per affected block.
-        self.ondemand_occupancy: dict[int, dict[str, int]] = {}
+        # Kept warm incrementally (record_placement on admission, release_pod on
+        # vacate) and rebuilt from a live cluster snapshot each queue-processor
+        # tick (reconcile_occupancy), so a missed watch event self-heals within
+        # one tick.  Each pod is bucketed by the reservation id parsed from its
+        # dsmlp/booking-reference, so no separate annotation is needed.
+        self.occupancy: dict[int, dict[str, int]] = {}
 
         # Safety interlock (guard 3): set of GPU class labels that currently
         # have at least one reservation-holder pod stuck Pending.  Updated each
@@ -619,11 +618,11 @@ class ControllerState:
         """Register a pod as an on-demand placement candidate (idempotent).
 
         If the pod is already registered with the same parameters this is a
-        no-op.  A pod already tracked in ``ondemand_occupancy`` (already
-        placed) is also left untouched.
+        no-op.  A pod already tracked in ``occupancy`` (already placed) is also
+        left untouched.
         """
         # Already placed — don't re-add as a candidate.
-        for occupants in self.ondemand_occupancy.values():
+        for occupants in self.occupancy.values():
             if pod_uid in occupants:
                 return
 
@@ -663,13 +662,24 @@ class ControllerState:
             )
 
     # ------------------------------------------------------------------
-    # On-demand block matching and occupancy
+    # Occupancy: availability, placement, release, reconciliation
     # ------------------------------------------------------------------
 
-    def ondemand_available(self, block: ReservationResponse) -> int:
-        """Return the number of GPUs still available on *block*."""
-        used = sum(self.ondemand_occupancy.get(block.id, {}).values())
-        return max(0, block.gpu_count - used)
+    def available(
+        self, reservation: ReservationResponse, exclude_uid: Optional[str] = None
+    ) -> int:
+        """Return the GPUs still free on *reservation*, across all kinds.
+
+        Counts every pod recorded against *reservation* in the unified occupancy
+        map.  *exclude_uid* omits one pod (the one being evaluated) so a retry
+        does not count itself.
+        """
+        used = sum(
+            g
+            for uid, g in self.occupancy.get(reservation.id, {}).items()
+            if uid != exclude_uid
+        )
+        return max(0, reservation.gpu_count - used)
 
     def find_ondemand_block(
         self,
@@ -681,10 +691,11 @@ class ControllerState:
         """Find the best on-demand block for a given pod.
 
         Criteria (all must hold):
-        - ``kind == "ondemand"``
+        - ``kind == "ondemand"`` or the reservation has been declared a no-show
+        - not currently claimed by a live chained holder
         - GPU class label matches *gpu_class_label*
         - Window is currently open: ``slot_start(r) <= now < slot_end(r)``
-        - Sufficient capacity: ``ondemand_available(r) >= gpu_requested``
+        - Sufficient capacity: ``available(r) >= gpu_requested``
         - Enough time remains: ``(slot_end(r) - now).total_seconds() >= min_runtime_seconds``
 
         Selection: prefer the block with the **latest** ``slot_end`` (maximises the
@@ -697,7 +708,7 @@ class ControllerState:
             and r.id not in self.claimed_reservation_ids
             and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
             and slot_start(r) <= now < slot_end(r)
-            and self.ondemand_available(r) >= gpu_requested
+            and self.available(r) >= gpu_requested
             and (slot_end(r) - now).total_seconds() >= min_runtime_seconds
         ]
         if not candidates:
@@ -705,94 +716,80 @@ class ControllerState:
         # Latest slot_end first; break ties by most available capacity (desc).
         return max(
             candidates,
-            key=lambda r: (slot_end(r), self.ondemand_available(r)),
+            key=lambda r: (slot_end(r), self.available(r)),
         )
 
-    def record_ondemand_placement(
-        self, block_id: int, pod_uid: str, gpu_count: int
+    def record_placement(
+        self, reservation_id: int, pod_uid: str, gpu_count: int
     ) -> None:
-        """Record that *pod_uid* has been placed onto *block_id*, consuming *gpu_count* GPUs."""
-        if block_id not in self.ondemand_occupancy:
-            self.ondemand_occupancy[block_id] = {}
-        self.ondemand_occupancy[block_id][pod_uid] = gpu_count
+        """Record that *pod_uid* occupies *gpu_count* GPUs on *reservation_id*.
+
+        Idempotent by pod uid.  Used by every admission path (reserved,
+        on-demand, no-show) and by occupancy reconstruction.
+        """
+        if reservation_id not in self.occupancy:
+            self.occupancy[reservation_id] = {}
+        self.occupancy[reservation_id][pod_uid] = gpu_count
         log.debug(
-            "Recorded on-demand placement: block #%d ← pod uid=%s (%d GPU(s)); "
-            "block now has %d/%d free",
-            block_id,
+            "Recorded placement: reservation #%d ← pod uid=%s (%d GPU(s)); %d/%d free",
+            reservation_id,
             pod_uid,
             gpu_count,
-            self.ondemand_available_by_id(block_id),
-            self._block_gpu_count(block_id),
+            self.available_by_id(reservation_id),
+            self._reservation_gpu_count(reservation_id),
         )
 
-    def release_ondemand_pod(self, pod_uid: str) -> Optional[int]:
-        """Remove *pod_uid* from whatever on-demand block it occupies.
+    def release_pod(self, pod_uid: str) -> Optional[int]:
+        """Remove *pod_uid* from whatever reservation it occupies.
 
-        Returns the block id it was released from, or ``None`` if the pod was
-        not tracked in any block (e.g. it was a candidate that was never placed,
-        or a reserved-path pod).
+        Returns the reservation id it was released from, or ``None`` if the pod
+        was not tracked (e.g. a candidate that was never placed).
         """
-        for block_id, occupants in self.ondemand_occupancy.items():
+        for reservation_id, occupants in self.occupancy.items():
             if pod_uid in occupants:
                 gpu_count = occupants.pop(pod_uid)
                 log.info(
-                    "Released on-demand slot: block #%d ← pod uid=%s freed %d GPU(s)",
-                    block_id,
+                    "Released slot: reservation #%d ← pod uid=%s freed %d GPU(s)",
+                    reservation_id,
                     pod_uid,
                     gpu_count,
                 )
                 # Clean up empty dicts to keep the map tidy.
                 if not occupants:
-                    del self.ondemand_occupancy[block_id]
-                return block_id
+                    del self.occupancy[reservation_id]
+                return reservation_id
         return None
 
-    def ondemand_available_by_id(self, block_id: int) -> int:
-        """GPU capacity remaining for *block_id* (0 if block not in occupancy map)."""
-        # Look up the block's gpu_count from the reservations list.
-        gpu_count = self._block_gpu_count(block_id)
+    def available_by_id(self, reservation_id: int) -> int:
+        """GPU capacity remaining for *reservation_id* (0 if unknown)."""
+        gpu_count = self._reservation_gpu_count(reservation_id)
         if gpu_count == 0:
             return 0
-        used = sum(self.ondemand_occupancy.get(block_id, {}).values())
+        used = sum(self.occupancy.get(reservation_id, {}).values())
         return max(0, gpu_count - used)
 
-    def _block_gpu_count(self, block_id: int) -> int:
-        """Return gpu_count for an on-demand block by id, or 0 if not found."""
+    def _reservation_gpu_count(self, reservation_id: int) -> int:
+        """Return gpu_count for a reservation by id, or 0 if not found."""
         for r in self.reservations:
-            if r.id == block_id:
+            if r.id == reservation_id:
                 return r.gpu_count
         return 0
 
-    # ------------------------------------------------------------------
-    # On-demand reconciliation
-    # ------------------------------------------------------------------
+    def reconcile_occupancy(self, placements: list[tuple[int, str, int]]) -> None:
+        """Rebuild the occupancy map from a live cluster snapshot.
 
-    def reconcile_ondemand(self) -> None:
-        """Prune occupancy entries for on-demand blocks that are no longer active.
+        *placements* is ``(reservation_id, pod_uid, gpu_count)`` for every live
+        (Running/Pending) tolerated pod, bucketed by the reservation id parsed
+        from its booking-reference.  Rebuilding wholesale is self-healing: a pod
+        deleted during a watch disconnect is dropped here even if its DELETE
+        event was missed.
 
-        Called after each reservation refresh alongside ``reconcile_queue``.
-        Removes occupancy entries for blocks that have been cancelled or whose
-        window has ended.  The pods that were placed on those blocks will have
-        already been killed by ``activeDeadlineSeconds`` or will be reaped
-        by the next pod-watch event.
+        Called each queue-processor tick.  An optimistic record made between
+        ticks whose patch is not yet visible in the snapshot may be briefly
+        dropped; the placing coroutine has already committed and the next tick
+        re-captures it, so the window is bounded by the tick interval.
         """
-        now = datetime.now()
-        active_ondemand_ids = {
-            r.id
-            for r in self.reservations
-            if (r.kind == "ondemand" or r.id in self.noshow_reservation_ids)
-            and slot_end(r) > now
-        }
-        stale_block_ids = [
-            bid
-            for bid in list(self.ondemand_occupancy.keys())
-            if bid not in active_ondemand_ids
-        ]
-        for bid in stale_block_ids:
-            occupants = self.ondemand_occupancy.pop(bid)
-            log.info(
-                "On-demand block #%d is no longer active; "
-                "pruned %d occupant(s) from tracking",
-                bid,
-                len(occupants),
-            )
+        rebuilt: dict[int, dict[str, int]] = {}
+        for reservation_id, pod_uid, gpu_count in placements:
+            rebuilt.setdefault(reservation_id, {})[pod_uid] = gpu_count
+        self.occupancy = rebuilt

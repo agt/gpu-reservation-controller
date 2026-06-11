@@ -272,7 +272,7 @@ def test_guard3_blocks_matching_gpu_class(monkeypatch):
 
     assert result is False, "guard 3 should keep candidate when its class is stuck"
     assert called == [], "read_pod must not be called"
-    assert state.ondemand_occupancy == {}
+    assert state.occupancy == {}
 
 
 def test_guard3_does_not_block_other_gpu_class(monkeypatch):

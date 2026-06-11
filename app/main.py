@@ -39,21 +39,18 @@ from .controller import (
 from .k8s_client import (
     PodWatcher,
     apply_toleration,
-    count_tolerated_gpu_usage,
     emit_runtime_capped_event,
     get_pod_booking_reference,
     get_pod_gpu_count,
     get_pod_min_runtime_seconds,
-    get_pod_ondemand_block_id,
     get_pod_phase,
     init_k8s,
     is_gpu_only_pending,
-    list_reservation_holder_pods,
-    list_stuck_reservation_holder_pods,
     parse_booking_reference,
     pod_has_toleration,
     read_pod,
     set_active_deadline,
+    snapshot_tolerated_pods,
 )
 from .reservation_client import ReservationClient
 
@@ -106,8 +103,8 @@ async def _refresh_reservations(
 
     # Drop / re-match queue entries whose reservation was cancelled.
     state.reconcile_queue()
-    # Prune occupancy for on-demand blocks that are no longer active.
-    state.reconcile_ondemand()
+    # Occupancy is rebuilt from a live cluster snapshot each queue-processor
+    # tick (reconcile_occupancy), so no reservation-driven prune is needed here.
 
 
 # ---------------------------------------------------------------------------
@@ -151,62 +148,62 @@ async def _try_apply_toleration(
     Returns ``False`` — entry should remain; ``entry.next_attempt_at`` has
                         been pushed forward (budget full or transient error).
 
+    The budget check reads the in-memory occupancy map (no API round-trip) and
+    optimistically records the placement before any ``await`` so two concurrent
+    attempts on the single event loop cannot both claim the same slot; the record
+    is rolled back on failure.
+
     **Does not** evaluate timing (window open/closed, retry cooldown); callers
     are responsible for those guards before invoking this function.
     """
     booking_reference = f"res-{entry.reservation.id}"
-    try:
-        other_gpus = await count_tolerated_gpu_usage(
-            namespace=entry.pod_namespace,
-            label_selector=f"gpu-class={entry.gpu_class_label}",
-            tol_key=TOLERATION_KEY,
-            tol_value=entry.gpu_class_label,
-            exclude_uid=uid,
-            booking_reference=booking_reference,
+
+    available = state.available(entry.reservation, exclude_uid=uid)
+    if entry.gpu_requested > available:
+        delay = random.randint(120, 300)
+        log.debug(
+            "Pod %s/%s: GPU budget full "
+            "(%d requested > %d available of %d reserved); retry in %d s",
+            entry.pod_namespace,
+            entry.pod_name,
+            entry.gpu_requested,
+            available,
+            entry.reservation.gpu_count,
+            delay,
         )
+        entry.next_attempt_at = datetime.now() + timedelta(seconds=delay)
+        return False
 
-        total_requested = entry.gpu_requested + other_gpus
-        if total_requested <= entry.reservation.gpu_count:
-            # Re-fetch the pod immediately before patching so we include any
-            # tolerations that arrived since we last saw it.
-            fresh_pod = await read_pod(entry.pod_name, entry.pod_namespace)
+    # Optimistically reserve capacity before any await (single-threaded loop).
+    state.record_placement(entry.reservation.id, uid, entry.gpu_requested)
+    try:
+        # Re-fetch the pod immediately before patching so we include any
+        # tolerations that arrived since we last saw it.
+        fresh_pod = await read_pod(entry.pod_name, entry.pod_namespace)
 
-            if pod_has_toleration(
-                fresh_pod, TOLERATION_KEY, entry.gpu_class_label, "NoSchedule"
-            ):
-                log.info(
-                    "Pod %s/%s already has toleration; dequeuing",
-                    entry.pod_namespace,
-                    entry.pod_name,
-                )
-            else:
-                await apply_toleration(
-                    entry.pod_name,
-                    entry.pod_namespace,
-                    fresh_pod,
-                    TOLERATION_KEY,
-                    entry.gpu_class_label,
-                    booking_reference,
-                )
-                await _enforce_deadline(state, fresh_pod, entry)
-            return True
-
-        else:
-            delay = random.randint(120, 300)
-            log.debug(
-                "Pod %s/%s: GPU budget full "
-                "(%d requested + %d in use > %d reserved); retry in %d s",
+        if pod_has_toleration(
+            fresh_pod, TOLERATION_KEY, entry.gpu_class_label, "NoSchedule"
+        ):
+            log.info(
+                "Pod %s/%s already has toleration; dequeuing",
                 entry.pod_namespace,
                 entry.pod_name,
-                entry.gpu_requested,
-                other_gpus,
-                entry.reservation.gpu_count,
-                delay,
             )
-            entry.next_attempt_at = datetime.now() + timedelta(seconds=delay)
-            return False
+        else:
+            await apply_toleration(
+                entry.pod_name,
+                entry.pod_namespace,
+                fresh_pod,
+                TOLERATION_KEY,
+                entry.gpu_class_label,
+                booking_reference,
+            )
+            await _enforce_deadline(state, fresh_pod, entry)
+        return True
 
     except Exception as exc:  # noqa: BLE001
+        # Roll back the optimistic reservation so capacity is not leaked.
+        state.release_pod(uid)
         delay = random.randint(120, 300)
         log.warning(
             "Error processing pod %s/%s: %s; retry in %d s",
@@ -277,7 +274,7 @@ async def _try_place_ondemand(
     else:
         booking_reference = f"ondemand-{block.id}"
     # --- optimistic reservation (before any await) ---
-    state.record_ondemand_placement(block.id, uid, candidate.gpu_requested)
+    state.record_placement(block.id, uid, candidate.gpu_requested)
 
     try:
         fresh_pod = await read_pod(candidate.pod_name, candidate.pod_namespace)
@@ -291,7 +288,7 @@ async def _try_place_ondemand(
                 candidate.pod_name,
                 phase,
             )
-            state.release_ondemand_pod(uid)
+            state.release_pod(uid)
             return True
 
         # Guard 1: GPU-only-pending check.
@@ -312,7 +309,7 @@ async def _try_place_ondemand(
                 candidate.pod_name,
                 msg,
             )
-            state.release_ondemand_pod(uid)
+            state.release_pod(uid)
             return True
         if gpu_only is None:
             # Scheduling conditions not yet populated; keep candidate, retry next tick.
@@ -321,7 +318,7 @@ async def _try_place_ondemand(
                 candidate.pod_namespace,
                 candidate.pod_name,
             )
-            state.release_ondemand_pod(uid)
+            state.release_pod(uid)
             candidate.next_attempt_at = datetime.now() + timedelta(seconds=30)
             return False
 
@@ -354,7 +351,7 @@ async def _try_place_ondemand(
             block.id,
             candidate.gpu_class_label,
             candidate.gpu_requested,
-            state.ondemand_available(block),
+            state.available(block),
             block.gpu_count,
         )
 
@@ -382,7 +379,7 @@ async def _try_place_ondemand(
 
     except Exception as exc:  # noqa: BLE001
         # Roll back the optimistic occupancy record so capacity is not leaked.
-        state.release_ondemand_pod(uid)
+        state.release_pod(uid)
         delay = random.randint(120, 300)
         log.warning(
             "Error placing on-demand pod %s/%s: %s; retry in %d s",
@@ -462,7 +459,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
             # --- on-demand path cleanup ---
             state.remove_ondemand_candidate(uid)
             if config.ondemand_placement_enabled:
-                block_id = state.release_ondemand_pod(uid)
+                block_id = state.release_pod(uid)
                 if block_id is not None:
                     await _recycle_ondemand_block(state, gpu_class_label)
 
@@ -473,7 +470,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
             # --- terminal on-demand pod: free its slot ---
             if config.ondemand_placement_enabled and phase in ("Succeeded", "Failed"):
                 state.remove_ondemand_candidate(uid)
-                block_id = state.release_ondemand_pod(uid)
+                block_id = state.release_pod(uid)
                 if block_id is not None:
                     await _recycle_ondemand_block(state, gpu_class_label)
                 continue
@@ -486,12 +483,11 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                 # session spans; pass its booking id so all are cleared at once.
                 booking_id = parse_booking_reference(get_pod_booking_reference(pod))
                 state.mark_pod_seen_for_noshow(namespace, gpu_class_label, booking_id)
-                # Reconstruct on-demand occupancy from the annotation stamped at
-                # placement time so that capacity accounting survives a restart.
-                block_id = get_pod_ondemand_block_id(pod)
-                if block_id is not None:
-                    gpu_count = get_pod_gpu_count(pod)
-                    state.record_ondemand_placement(block_id, uid, gpu_count)
+                # Keep occupancy warm between ticks: record this admitted pod under
+                # its booking-reference id (covers reserved / on-demand / no-show
+                # alike), so capacity accounting survives a restart.
+                if booking_id is not None:
+                    state.record_placement(booking_id, uid, get_pod_gpu_count(pod))
             else:
                 gpu_count = get_pod_gpu_count(pod)
                 reservation = state.find_best_reservation(namespace, gpu_class_label)
@@ -580,22 +576,45 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
         await asyncio.sleep(30)
         now = datetime.now()
 
-        # Refresh the claimed-reservation set from live holder pods *before*
-        # declaring any no-shows, so a reservation a holder is chained through is
-        # never converted to on-demand capacity while the holder is still running
-        # (closes the res-/noshow- double-count).  On failure, keep the previous
-        # set rather than dropping protection.
+        # One cluster snapshot of tolerated pods drives occupancy, the claimed
+        # set, and guard 3 — replacing the per-attempt namespaced counts and the
+        # separate guard scans.  On failure, keep the previous state rather than
+        # dropping budget / no-show protection.
+        snapshot = None
         try:
-            holder_ids = await list_reservation_holder_pods(TOLERATION_KEY)
-            state.refresh_claimed_reservations(holder_ids, now)
+            snapshot = await snapshot_tolerated_pods(TOLERATION_KEY)
         except Exception as exc:  # noqa: BLE001
-            log.warning("Failed to refresh claimed reservations: %s", exc)
+            log.warning("Failed to snapshot tolerated pods: %s", exc)
+
+        if snapshot is not None:
+            live = [p for p in snapshot if p.phase in ("Running", "Pending")]
+            # Rebuild occupancy from live tolerated pods (self-healing).
+            state.reconcile_occupancy(
+                [
+                    (p.reservation_id, p.uid, p.gpu_count)
+                    for p in live
+                    if p.reservation_id is not None
+                ]
+            )
+            # Claim every window a live reserved-path holder occupies (chain-aware)
+            # before declaring no-shows.
+            holder_ids = [
+                p.reservation_id
+                for p in live
+                if p.reservation_id is not None
+                and (p.booking_reference or "").startswith("res-")
+            ]
+            state.refresh_claimed_reservations(holder_ids, now)
 
         state.check_noshow_deadlines(now)
 
-        # Guard 3: refresh safety interlock once per tick.
-        if config.ondemand_placement_enabled:
-            stuck = await list_stuck_reservation_holder_pods(TOLERATION_KEY)
+        # Guard 3: refresh safety interlock from the same snapshot.
+        if config.ondemand_placement_enabled and snapshot is not None:
+            stuck = [
+                (p.namespace, p.name, p.gpu_class)
+                for p in snapshot
+                if p.phase == "Pending" and p.scheduled_false and p.gpu_class
+            ]
             new_classes = {gpu_class for _, _, gpu_class in stuck}
             old_classes = state.stuck_holder_gpu_classes
             state.stuck_holder_gpu_classes = new_classes

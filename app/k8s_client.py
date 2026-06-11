@@ -9,12 +9,12 @@ init_k8s(kubeconfig_path)                    — load credentials once at startu
 get_pod_gpu_count(pod)                       — sum nvidia.com/gpu requests
 get_pod_booking_reference(pod)               — read dsmlp/booking-reference annotation
 get_pod_ondemand_block_id(pod)               — read dsmlp/ondemand-block-id annotation
+parse_booking_reference(ref)                 — reservation id from a booking-reference
 pod_has_toleration(pod, ...)                 — check for a specific toleration
 is_gpu_only_pending(pod, toleration_key)     — guard 1: GPU-only scheduling failure check
 read_pod(name, namespace)                    — fetch current pod object
-count_tolerated_gpu_usage(...)               — sum GPU usage of eligible sibling pods
+snapshot_tolerated_pods(tol_key)             — one LIST → occupancy + claims + guard 3
 apply_toleration(...)                        — PATCH a pod to add toleration + booking annotation
-list_stuck_reservation_holder_pods(tol_key) — guard 3: find admitted pods stuck Pending
 PodWatcher                                   — async-generator based pod event stream
 """
 
@@ -24,6 +24,7 @@ import asyncio
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
@@ -233,134 +234,66 @@ async def read_pod(name: str, namespace: str):
     )
 
 
-async def count_tolerated_gpu_usage(
-    namespace: str,
-    label_selector: str,
-    tol_key: str,
-    tol_value: str,
-    exclude_uid: str,
-    booking_reference: str,
-) -> int:
-    """Count nvidia.com/gpu already consumed by sibling pods in *namespace*.
+@dataclass(frozen=True)
+class ToleratedPodInfo:
+    """A point-in-time view of one pod carrying the controller's toleration.
 
-    A pod is counted only if it:
-    - matches *label_selector*
-    - is in Running or Pending phase
-    - already carries the toleration ``tol_key=tol_value:NoSchedule``
-    - has a ``dsmlp/booking-reference`` annotation equal to *booking_reference*
-    - is not the pod identified by *exclude_uid* (the one we're evaluating)
+    Returned by ``snapshot_tolerated_pods``; a single cluster LIST yields
+    everything the queue-processor tick needs — occupancy reconstruction, the
+    claimed-reservation set, and the guard-3 safety interlock — so no per-attempt
+    or per-purpose LIST is required.
     """
-    log.debug(
-        "k8s: list_namespaced_pod namespace=%s selector=%s", namespace, label_selector
-    )
-    loop = asyncio.get_running_loop()
-    pod_list = await loop.run_in_executor(
-        None,
-        lambda: _core_v1.list_namespaced_pod(
-            namespace=namespace, label_selector=label_selector
-        ),
-    )
-    total = 0
-    for pod in pod_list.items:
-        if pod.metadata.uid == exclude_uid:
-            continue
-        phase = (pod.status.phase if pod.status else None) or ""
-        if phase not in ("Running", "Pending"):
-            continue
-        if not pod_has_toleration(pod, tol_key, tol_value, "NoSchedule"):
-            continue
-        if get_pod_booking_reference(pod) != booking_reference:
-            continue
-        total += get_pod_gpu_count(pod)
-    log.debug(
-        "k8s: counted %d tolerated GPU(s) in %s for booking %s (excluding uid=%s)",
-        total, namespace, booking_reference, exclude_uid,
-    )
-    return total
+
+    namespace: str
+    name: str
+    uid: str
+    gpu_class: str
+    booking_reference: Optional[str]
+    reservation_id: Optional[int]
+    gpu_count: int
+    phase: str
+    scheduled_false: bool  # PodScheduled condition present with status == "False"
 
 
-async def list_stuck_reservation_holder_pods(
-    toleration_key: str,
-) -> list[tuple[str, str, str]]:
-    """Guard 3: find reservation-holder pods that are stuck in Pending.
+async def snapshot_tolerated_pods(toleration_key: str) -> list[ToleratedPodInfo]:
+    """Return one ``ToleratedPodInfo`` per pod carrying a *toleration_key* toleration.
 
-    A pod is a "stuck reservation holder" when all of the following hold:
-    - Has a toleration with key == *toleration_key* (was admitted by this
-      controller for a user or on-demand reservation)
-    - Phase is "Pending"
-    - Has a ``PodScheduled`` condition with ``status == "False"`` (the
-      scheduler has determined it cannot be placed)
-
-    Returns a list of ``(namespace, name, gpu_class_label)`` tuples — empty
-    if none found.  Pods whose ``gpu-class`` label value is absent or empty
-    are skipped; we cannot determine which class they affect.
-
-    Uses ``list_pod_for_all_namespaces`` with ``label_selector="gpu-class"``,
-    the same selector as ``PodWatcher`` — no new RBAC permission required.
+    Scans all ``gpu-class``-labelled pods (the same selector as ``PodWatcher`` —
+    no new RBAC permission) and shapes each admitted pod into the fields the
+    controller needs.  One snapshot per queue-processor tick drives occupancy
+    reconstruction, the claimed-reservation set, and guard 3, replacing the
+    former per-attempt namespaced counts and the separate guard scans.
     """
     loop = asyncio.get_running_loop()
-    log.debug("k8s: list_pod_for_all_namespaces selector=gpu-class (guard-3 check)")
+    log.debug(
+        "k8s: list_pod_for_all_namespaces selector=gpu-class (tolerated snapshot)"
+    )
     pod_list = await loop.run_in_executor(
         None,
         lambda: _core_v1.list_pod_for_all_namespaces(label_selector="gpu-class"),
     )
-    stuck: list[tuple[str, str, str]] = []
+    out: list[ToleratedPodInfo] = []
     for pod in pod_list.items:
-        if get_pod_phase(pod) != "Pending":
-            continue
         if not _pod_has_any_reservation_toleration(pod, toleration_key):
             continue
         conditions = (pod.status.conditions or []) if pod.status else []
         scheduled = next((c for c in conditions if c.type == "PodScheduled"), None)
-        if scheduled is not None and scheduled.status == "False":
-            gpu_class_label = (pod.metadata.labels or {}).get("gpu-class", "")
-            if not gpu_class_label:
-                log.warning(
-                    "Stuck reservation-holder pod %s/%s has no gpu-class label; "
-                    "cannot scope interlock — skipping",
-                    pod.metadata.namespace,
-                    pod.metadata.name,
-                )
-                continue
-            stuck.append((pod.metadata.namespace, pod.metadata.name, gpu_class_label))
-    log.debug("k8s: guard-3 found %d stuck reservation-holder pod(s)", len(stuck))
-    return stuck
-
-
-async def list_reservation_holder_pods(toleration_key: str) -> list[int]:
-    """Return the booking reservation ids of live reserved-path holder pods.
-
-    A holder pod (a) carries a toleration with key == *toleration_key*, (b) is in
-    Running or Pending phase, and (c) has a ``dsmlp/booking-reference`` with the
-    ``res-`` prefix.  The ids feed ``refresh_claimed_reservations`` so that every
-    window a holder occupies — including back-to-back chained windows it never
-    booked a pod directly under — is protected from no-show conversion.
-
-    Uses ``list_pod_for_all_namespaces`` with ``label_selector="gpu-class"``, the
-    same selector as ``PodWatcher`` — no new RBAC permission required.  Returns
-    raw ids (duplicates possible when a holder runs several pods); the caller
-    de-duplicates via set union.
-    """
-    loop = asyncio.get_running_loop()
-    log.debug("k8s: list_pod_for_all_namespaces selector=gpu-class (holder scan)")
-    pod_list = await loop.run_in_executor(
-        None,
-        lambda: _core_v1.list_pod_for_all_namespaces(label_selector="gpu-class"),
-    )
-    ids: list[int] = []
-    for pod in pod_list.items:
-        if get_pod_phase(pod) not in ("Running", "Pending"):
-            continue
-        if not _pod_has_any_reservation_toleration(pod, toleration_key):
-            continue
-        ref = get_pod_booking_reference(pod)
-        if not ref or not ref.startswith("res-"):
-            continue
-        rid = parse_booking_reference(ref)
-        if rid is not None:
-            ids.append(rid)
-    log.debug("k8s: holder scan found %d reserved-path holder pod(s)", len(ids))
-    return ids
+        booking = get_pod_booking_reference(pod)
+        out.append(
+            ToleratedPodInfo(
+                namespace=pod.metadata.namespace,
+                name=pod.metadata.name,
+                uid=pod.metadata.uid,
+                gpu_class=(pod.metadata.labels or {}).get("gpu-class", ""),
+                booking_reference=booking,
+                reservation_id=parse_booking_reference(booking),
+                gpu_count=get_pod_gpu_count(pod),
+                phase=get_pod_phase(pod),
+                scheduled_false=(scheduled is not None and scheduled.status == "False"),
+            )
+        )
+    log.debug("k8s: tolerated snapshot returned %d pod(s)", len(out))
+    return out
 
 
 async def apply_toleration(

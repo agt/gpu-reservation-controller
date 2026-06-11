@@ -3,7 +3,7 @@
 Covers: initialize_noshow_tracking, update_noshow_tracking, reconcile_noshow,
 check_noshow_deadlines, mark_pod_seen_for_noshow, enqueue_pod deadline clearing,
 find_best_reservation skipping no-shows, find_ondemand_block including no-shows,
-reconcile_ondemand including no-shows, and compute_max_deadline_seconds skipping
+reconcile_occupancy including no-shows, and compute_max_deadline_seconds skipping
 no-shows.
 
 No Kubernetes or HTTP calls are made.
@@ -451,7 +451,7 @@ class TestFindOndemandBlockIncludesNoshow:
         now = _window_open_now()
         state = _state(r)
         state.noshow_reservation_ids.add(1)
-        state.record_ondemand_placement(1, "uid-a", 2)  # fills all capacity
+        state.record_placement(1, "uid-a", 2)  # fills all capacity
         assert state.find_ondemand_block(GPU_CLASS_LABEL, now, 1, 1) is None
 
     def test_noshow_respects_min_runtime(self):
@@ -490,27 +490,20 @@ class TestFindOndemandBlockIncludesNoshow:
 
 
 # ---------------------------------------------------------------------------
-# TestReconcileOndemandIncludesNoshow
+# TestReconcileOccupancyNoshow
 # ---------------------------------------------------------------------------
 
 
-class TestReconcileOndemandIncludesNoshow:
-    def test_active_noshow_occupancy_preserved(self):
+class TestReconcileOccupancyNoshow:
+    def test_noshow_block_occupancy_rebuilt_from_snapshot(self):
+        # Occupancy is keyed by reservation id regardless of kind: a noshow-1
+        # squatter present in the snapshot is retained; a vanished one is dropped.
         r = _user_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
         state.noshow_reservation_ids.add(1)
-        state.ondemand_occupancy[1] = {"uid-a": 1}
-        state.reconcile_ondemand()
-        assert 1 in state.ondemand_occupancy
-
-    def test_expired_noshow_occupancy_pruned(self):
-        # FIXED_DATE window is in the past, so slot_end < datetime.now()
-        r = _user_reservation(1)
-        state = _state(r)
-        state.noshow_reservation_ids.add(1)
-        state.ondemand_occupancy[1] = {"uid-a": 1}
-        state.reconcile_ondemand()
-        assert 1 not in state.ondemand_occupancy
+        state.occupancy[1] = {"uid-gone": 1}
+        state.reconcile_occupancy([(1, "uid-a", 1)])
+        assert state.occupancy == {1: {"uid-a": 1}}
 
 
 # ---------------------------------------------------------------------------

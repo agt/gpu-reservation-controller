@@ -176,7 +176,7 @@ class TestFindOndemandBlock:
     def test_no_match_capacity_exhausted(self):
         block = _ondemand_block(1, gpu_count=1)
         state = _state_with_block(block)
-        state.record_ondemand_placement(1, "pod-a", 1)
+        state.record_placement(1, "pod-a", 1)
         now = _now_inside_block(block)
         result = state.find_ondemand_block(GPU_CLASS_LABEL, now, 1, 60)
         assert result is None
@@ -250,35 +250,44 @@ class TestOccupancy:
     def test_available_decreases_on_record(self):
         block = _ondemand_block(1, gpu_count=4)
         state = _state_with_block(block)
-        assert state.ondemand_available(block) == 4
-        state.record_ondemand_placement(1, "pod-a", 2)
-        assert state.ondemand_available(block) == 2
+        assert state.available(block) == 4
+        state.record_placement(1, "pod-a", 2)
+        assert state.available(block) == 2
 
     def test_available_increases_on_release(self):
         block = _ondemand_block(1, gpu_count=4)
         state = _state_with_block(block)
-        state.record_ondemand_placement(1, "pod-a", 2)
-        state.release_ondemand_pod("pod-a")
-        assert state.ondemand_available(block) == 4
+        state.record_placement(1, "pod-a", 2)
+        state.release_pod("pod-a")
+        assert state.available(block) == 4
+
+    def test_available_excludes_named_uid(self):
+        # The reserved path passes exclude_uid so a retry doesn't count itself.
+        block = _ondemand_block(1, gpu_count=4)
+        state = _state_with_block(block)
+        state.record_placement(1, "pod-a", 2)
+        state.record_placement(1, "pod-b", 1)
+        assert state.available(block) == 1
+        assert state.available(block, exclude_uid="pod-a") == 3
 
     def test_release_returns_block_id(self):
         block = _ondemand_block(1, gpu_count=2)
         state = _state_with_block(block)
-        state.record_ondemand_placement(1, "pod-a", 1)
-        result = state.release_ondemand_pod("pod-a")
+        state.record_placement(1, "pod-a", 1)
+        result = state.release_pod("pod-a")
         assert result == 1
 
     def test_release_unknown_pod_returns_none(self):
         block = _ondemand_block(1, gpu_count=2)
         state = _state_with_block(block)
-        result = state.release_ondemand_pod("ghost-pod")
+        result = state.release_pod("ghost-pod")
         assert result is None
 
     def test_multi_tenant_fills_to_limit(self):
         block = _ondemand_block(1, gpu_count=2)
         state = _state_with_block(block)
-        state.record_ondemand_placement(1, "pod-a", 1)
-        state.record_ondemand_placement(1, "pod-b", 1)
+        state.record_placement(1, "pod-a", 1)
+        state.record_placement(1, "pod-b", 1)
         now = _now_inside_block(block)
         # Block is now full; a third request should not find it
         result = state.find_ondemand_block(GPU_CLASS_LABEL, now, 1, 60)
@@ -287,9 +296,9 @@ class TestOccupancy:
     def test_multi_tenant_partial_release_allows_new(self):
         block = _ondemand_block(1, gpu_count=2)
         state = _state_with_block(block)
-        state.record_ondemand_placement(1, "pod-a", 1)
-        state.record_ondemand_placement(1, "pod-b", 1)
-        state.release_ondemand_pod("pod-a")
+        state.record_placement(1, "pod-a", 1)
+        state.record_placement(1, "pod-b", 1)
+        state.release_pod("pod-a")
         now = _now_inside_block(block)
         result = state.find_ondemand_block(GPU_CLASS_LABEL, now, 1, 60)
         assert result is not None
@@ -297,47 +306,43 @@ class TestOccupancy:
     def test_occupancy_cleaned_up_when_empty(self):
         block = _ondemand_block(1, gpu_count=1)
         state = _state_with_block(block)
-        state.record_ondemand_placement(1, "pod-a", 1)
-        state.release_ondemand_pod("pod-a")
-        assert 1 not in state.ondemand_occupancy
+        state.record_placement(1, "pod-a", 1)
+        state.release_pod("pod-a")
+        assert 1 not in state.occupancy
 
 
 # ---------------------------------------------------------------------------
-# reconcile_ondemand
+# reconcile_occupancy — rebuild from a live cluster snapshot
 # ---------------------------------------------------------------------------
 
 
-class TestReconcileOndemand:
-    def test_prunes_cancelled_block(self):
-        block = _ondemand_block(1, gpu_count=2)
-        state = _state_with_block(block)
-        state.record_ondemand_placement(1, "pod-a", 1)
-        # Remove the block from active reservations (simulates cancellation)
-        state.reservations = []
-        state.reconcile_ondemand()
-        assert 1 not in state.ondemand_occupancy
+class TestReconcileOccupancy:
+    def test_rebuilds_from_snapshot(self):
+        state = ControllerState()
+        state.reconcile_occupancy(
+            [(1, "pod-a", 2), (1, "pod-b", 1), (2, "pod-c", 1)]
+        )
+        assert state.occupancy == {1: {"pod-a": 2, "pod-b": 1}, 2: {"pod-c": 1}}
 
-    def test_prunes_expired_block(self):
-        """A block whose window has ended should be pruned."""
-        block = _ondemand_block(99, duration_minutes=30)
-        state = _state_with_block(block)
-        state.record_ondemand_placement(99, "pod-a", 1)
-        # Simulate the block's window ending by using a past date
-        past_date = (datetime.now() - timedelta(days=1)).date()
-        expired_block = block.model_copy(update={"date": past_date})
-        state.reservations = [expired_block]
-        state.reconcile_ondemand()
-        assert 99 not in state.ondemand_occupancy
+    def test_empty_snapshot_clears(self):
+        state = ControllerState()
+        state.occupancy = {1: {"pod-a": 1}}
+        state.reconcile_occupancy([])
+        assert state.occupancy == {}
 
-    def test_preserves_active_block(self):
-        # Use a block whose window is open at the actual current time so that
-        # reconcile_ondemand (which calls datetime.now() internally) sees it
-        # as still active.
-        block = _currently_open_block(1, gpu_count=2)
-        state = _state_with_block(block)
-        state.record_ondemand_placement(1, "pod-a", 1)
-        state.reconcile_ondemand()
-        assert 1 in state.ondemand_occupancy
+    def test_prunes_stale_pod(self):
+        # pod-gone is no longer in the snapshot → dropped (self-heal on a missed
+        # DELETE event); pod-a survives.
+        state = ControllerState()
+        state.occupancy = {1: {"pod-a": 1, "pod-gone": 1}}
+        state.reconcile_occupancy([(1, "pod-a", 1)])
+        assert state.occupancy == {1: {"pod-a": 1}}
+
+    def test_overwrites_gpu_count(self):
+        state = ControllerState()
+        state.occupancy = {1: {"pod-a": 1}}
+        state.reconcile_occupancy([(1, "pod-a", 3)])
+        assert state.occupancy == {1: {"pod-a": 3}}
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +367,7 @@ class TestCandidateManagement:
 
     def test_already_placed_pod_not_re_added(self):
         state = ControllerState()
-        state.ondemand_occupancy[42] = {"uid-1": 1}
+        state.occupancy[42] = {"uid-1": 1}
         state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600)
         assert "uid-1" not in state.ondemand_candidates
 
