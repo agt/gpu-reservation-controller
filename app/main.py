@@ -22,7 +22,7 @@ import logging
 import os
 import random
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator
 
 from fastapi import FastAPI
@@ -121,7 +121,7 @@ async def _enforce_deadline(
     enforcement failure never rolls back an already-applied toleration.
     """
     try:
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         max_secs = state.compute_max_deadline_seconds(now, entry.reservation)
         current = fresh_pod.spec.active_deadline_seconds
         if current is None or current > max_secs:
@@ -171,7 +171,7 @@ async def _try_apply_toleration(
             entry.reservation.gpu_count,
             delay,
         )
-        entry.next_attempt_at = datetime.now() + timedelta(seconds=delay)
+        entry.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
         return False
 
     # Optimistically reserve capacity before any await (single-threaded loop).
@@ -212,7 +212,7 @@ async def _try_apply_toleration(
             exc,
             delay,
         )
-        entry.next_attempt_at = datetime.now() + timedelta(seconds=delay)
+        entry.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
         return False
 
 
@@ -238,7 +238,7 @@ async def _try_place_ondemand(
     4. Apply toleration.
     5. Cap runtime to the block's window end and emit a RuntimeCapped event.
     """
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     block = state.find_ondemand_block(
         candidate.gpu_class_label,
         now,
@@ -253,7 +253,7 @@ async def _try_place_ondemand(
             candidate.pod_name,
             delay,
         )
-        candidate.next_attempt_at = datetime.now() + timedelta(seconds=delay)
+        candidate.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
         return False
 
     # Guard 3: safety interlock — hold on-demand placement for any GPU class
@@ -266,7 +266,7 @@ async def _try_place_ondemand(
             candidate.pod_name,
             candidate.gpu_class_label,
         )
-        candidate.next_attempt_at = datetime.now() + timedelta(seconds=30)
+        candidate.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=30)
         return False
 
     if block.id in state.noshow_reservation_ids:
@@ -319,7 +319,7 @@ async def _try_place_ondemand(
                 candidate.pod_name,
             )
             state.release_pod(uid)
-            candidate.next_attempt_at = datetime.now() + timedelta(seconds=30)
+            candidate.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=30)
             return False
 
         if pod_has_toleration(fresh_pod, TOLERATION_KEY, candidate.gpu_class_label, "NoSchedule"):
@@ -355,7 +355,7 @@ async def _try_place_ondemand(
         )
 
         # Cap runtime to the on-demand block's window end (no back-to-back chaining).
-        remaining = int((slot_end(block) - datetime.now()).total_seconds())
+        remaining = int((slot_end(block) - datetime.now(timezone.utc)).total_seconds())
         remaining = max(remaining, 1)
         try:
             current_deadline = fresh_pod.spec.active_deadline_seconds
@@ -387,7 +387,7 @@ async def _try_place_ondemand(
             exc,
             delay,
         )
-        candidate.next_attempt_at = datetime.now() + timedelta(seconds=delay)
+        candidate.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
         return False
 
 
@@ -408,7 +408,7 @@ async def reservation_fetch_loop(
         await asyncio.sleep(config.reservation_fetch_interval)
         try:
             await _refresh_reservations(state, client)
-            now = datetime.now()
+            now = datetime.now(timezone.utc)
             state.reconcile_noshow()
             state.update_noshow_tracking(
                 now,
@@ -500,7 +500,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                     if event_type == "ADDED":
                         entry = state.task_queue.get(uid)
                         if entry is not None:
-                            now = datetime.now()
+                            now = datetime.now(timezone.utc)
                             if slot_start(entry.reservation) <= now < slot_end(entry.reservation):
                                 log.info(
                                     "Pod %s/%s arrived inside reservation window; "
@@ -519,7 +519,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                         min_rt = get_pod_min_runtime_seconds(pod)
                         if min_rt is not None:
                             ts = pod.metadata.creation_timestamp
-                            pod_created_at = ts.replace(tzinfo=None) if ts is not None else datetime.now()
+                            pod_created_at = ts if ts is not None else datetime.now(timezone.utc)
                             state.add_ondemand_candidate(
                                 uid, name, namespace, gpu_class_label, gpu_count, min_rt,
                                 pod_created_at,
@@ -541,7 +541,7 @@ async def _recycle_ondemand_block(
     Only the first successful placement is made per call; the queue processor
     will handle any remaining candidates on its next tick.
     """
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     ordered = sorted(state.ondemand_candidates.items(), key=lambda kv: kv[1].pod_created_at)
     for uid, candidate in ordered:
         if candidate.gpu_class_label != gpu_class_label:
@@ -577,7 +577,7 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
     """
     while True:
         await asyncio.sleep(config.pod_list_tick_interval)
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         # One cluster snapshot of tolerated pods drives occupancy, the claimed
         # set, and guard 3 — replacing the per-attempt namespaced counts and the
@@ -702,7 +702,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             len(state.reservations),
             len(state.gpu_class_labels),
         )
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         state.initialize_noshow_tracking(
             now,
             config.noshown_timeout_minutes,

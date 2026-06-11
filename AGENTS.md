@@ -69,9 +69,12 @@ Do not call `_core_v1.*` directly from async code without wrapping in an executo
 
 ### Time-window arithmetic
 
-All datetime objects are **naive** (no tzinfo).  The system timezone (`TZ` env
-var) provides the implicit timezone, consistent with how the reservation server
-stores times.  Do not introduce `pytz` or `zoneinfo` without a clear requirement.
+All datetime objects are **UTC-aware** (`timezone.utc` from the standard library).
+The reservation API now supplies `start_utc` / `end_utc` directly on each
+`ReservationResponse`; `slot_start` and `slot_end` in `controller.py` simply
+return those fields.  Every `datetime.now()` call uses `datetime.now(timezone.utc)`.
+Do not introduce naive datetimes or `pytz`/`zoneinfo` — `datetime.timezone.utc`
+is sufficient.
 
 ### Testing
 
