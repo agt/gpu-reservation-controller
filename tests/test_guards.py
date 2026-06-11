@@ -258,7 +258,7 @@ def test_guard3_blocks_matching_gpu_class(monkeypatch):
     candidate = OnDemandCandidate(
         pod_uid="uid-1", pod_name="pod-1", pod_namespace="ns-1",
         gpu_class_label="h100", gpu_requested=1, min_runtime_seconds=60,
-        next_attempt_at=datetime.now(),
+        pod_created_at=datetime.now(), next_attempt_at=datetime.now(),
     )
 
     called = []
@@ -306,7 +306,7 @@ def test_guard3_does_not_block_other_gpu_class(monkeypatch):
     candidate = OnDemandCandidate(
         pod_uid="uid-2", pod_name="pod-2", pod_namespace="ns-2",
         gpu_class_label="a100", gpu_requested=1, min_runtime_seconds=60,
-        next_attempt_at=datetime.now(),
+        pod_created_at=datetime.now(), next_attempt_at=datetime.now(),
     )
 
     # Guard 3 should NOT fire; the function will proceed to read_pod.

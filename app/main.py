@@ -518,8 +518,11 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                     if phase == "Pending":
                         min_rt = get_pod_min_runtime_seconds(pod)
                         if min_rt is not None:
+                            ts = pod.metadata.creation_timestamp
+                            pod_created_at = ts.replace(tzinfo=None) if ts is not None else datetime.now()
                             state.add_ondemand_candidate(
-                                uid, name, namespace, gpu_class_label, gpu_count, min_rt
+                                uid, name, namespace, gpu_class_label, gpu_count, min_rt,
+                                pod_created_at,
                             )
 
 
@@ -539,7 +542,8 @@ async def _recycle_ondemand_block(
     will handle any remaining candidates on its next tick.
     """
     now = datetime.now()
-    for uid, candidate in list(state.ondemand_candidates.items()):
+    ordered = sorted(state.ondemand_candidates.items(), key=lambda kv: kv[1].pod_created_at)
+    for uid, candidate in ordered:
         if candidate.gpu_class_label != gpu_class_label:
             continue
         if now < candidate.next_attempt_at:
@@ -664,7 +668,8 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
         # --- on-demand path ---
         if config.ondemand_placement_enabled:
             od_to_remove: list[str] = []
-            for uid, candidate in list(state.ondemand_candidates.items()):
+            ordered = sorted(state.ondemand_candidates.items(), key=lambda kv: kv[1].pod_created_at)
+            for uid, candidate in ordered:
                 if now < candidate.next_attempt_at:
                     continue
                 if await _try_place_ondemand(state, uid, candidate):
