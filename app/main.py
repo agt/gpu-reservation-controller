@@ -555,7 +555,7 @@ async def _recycle_ondemand_block(
 
 
 async def queue_processor_loop(state: ControllerState, config: Config) -> None:
-    """Every 30 s, scan the work queue and apply tolerations where eligible.
+    """Every ``config.pod_list_tick_interval`` s, scan the work queue and apply tolerations where eligible.
 
     Reserved-path logic per entry:
     1. If the reservation window has expired → remove from queue.
@@ -572,7 +572,7 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
     that were ineligible on a previous attempt.
     """
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(config.pod_list_tick_interval)
         now = datetime.now()
 
         # One cluster snapshot of tolerated pods drives occupancy, the claimed

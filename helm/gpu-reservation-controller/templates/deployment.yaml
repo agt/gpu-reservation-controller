@@ -51,6 +51,8 @@ spec:
             # --- Optional tuning ---
             - name: RESERVATION_FETCH_INTERVAL
               value: {{ .Values.config.reservationFetchInterval | quote }}
+            - name: POD_LIST_TICK_INTERVAL
+              value: {{ .Values.config.podListTickInterval | quote }}
             - name: RESERVATION_LOOKAHEAD_DAYS
               value: {{ .Values.config.reservationLookaheadDays | quote }}
             - name: HEALTH_PORT

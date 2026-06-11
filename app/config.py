@@ -18,6 +18,7 @@ class Config:
     ondemand_placement_enabled: bool  # enable/disable on-demand pod placement
     noshown_timeout_minutes: int   # minutes after slot_start before no-show is declared
     noshown_grace_minutes: int     # grace period when controller starts mid-window
+    pod_list_tick_interval: int    # seconds between queue-processor ticks
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -51,5 +52,8 @@ class Config:
             ),
             noshown_grace_minutes=int(
                 os.environ.get("NOSHOWN_GRACE_MINUTES", "30")
+            ),
+            pod_list_tick_interval=int(
+                os.environ.get("POD_LIST_TICK_INTERVAL", "300")
             ),
         )
