@@ -5,20 +5,23 @@ never stall the asyncio event loop.
 
 Public surface
 --------------
-init_k8s(kubeconfig_path)          — load credentials once at startup
-get_pod_gpu_count(pod)             — sum nvidia.com/gpu requests
-get_pod_booking_reference(pod)     — read dsmlp/booking-reference annotation
-pod_has_toleration(pod, ...)       — check for a specific toleration
-read_pod(name, namespace)          — fetch current pod object
-count_tolerated_gpu_usage(...)     — sum GPU usage of eligible sibling pods
-apply_toleration(...)              — PATCH a pod to add toleration + booking annotation
-PodWatcher                         — async-generator based pod event stream
+init_k8s(kubeconfig_path)                    — load credentials once at startup
+get_pod_gpu_count(pod)                       — sum nvidia.com/gpu requests
+get_pod_booking_reference(pod)               — read dsmlp/booking-reference annotation
+pod_has_toleration(pod, ...)                 — check for a specific toleration
+is_gpu_only_pending(pod, toleration_key)     — guard 1: GPU-only scheduling failure check
+read_pod(name, namespace)                    — fetch current pod object
+count_tolerated_gpu_usage(...)               — sum GPU usage of eligible sibling pods
+apply_toleration(...)                        — PATCH a pod to add toleration + booking annotation
+list_stuck_reservation_holder_pods(tol_key) — guard 3: find admitted pods stuck Pending
+PodWatcher                                   — async-generator based pod event stream
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
@@ -112,6 +115,62 @@ def pod_has_toleration(pod, key: str, value: str, effect: str) -> bool:
     return False
 
 
+def _pod_has_any_reservation_toleration(pod, toleration_key: str) -> bool:
+    """Return True if *pod* has any toleration whose key equals *toleration_key*.
+
+    Key-only match (any value/effect) — used to identify pods that were
+    admitted by this controller regardless of the GPU-class value.
+    """
+    return any(t.key == toleration_key for t in (pod.spec.tolerations or []))
+
+
+def is_gpu_only_pending(pod, toleration_key: str) -> Optional[bool]:
+    """Guard 1: determine whether *pod* is Pending solely due to GPU shortage.
+
+    Inspects ``pod.status.conditions[type=PodScheduled]`` to classify the
+    scheduling failure.
+
+    Returns:
+        ``True``  — confirmed GPU-only: message contains ``Insufficient
+                    nvidia.com/gpu`` and no other ``Insufficient <resource>``.
+                    The controller's own reservation taint appearing in the
+                    message is accepted (the pod lacks the toleration yet).
+        ``False`` — confirmed non-GPU constraint: message contains
+                    ``Insufficient <anything-else>``.  Drop the candidate;
+                    our toleration cannot fix its scheduling problem.
+        ``None``  — indeterminate: no ``PodScheduled`` condition yet, pod is
+                    not Pending, or message carries no ``Insufficient`` signal.
+                    Keep the candidate and retry on the next processor tick.
+    """
+    if get_pod_phase(pod) != "Pending":
+        return None
+
+    conditions = (pod.status.conditions or []) if pod.status else []
+    scheduled = next((c for c in conditions if c.type == "PodScheduled"), None)
+    if scheduled is None or scheduled.status != "False":
+        return None
+    if scheduled.reason != "Unschedulable":
+        return None
+
+    message = scheduled.message or ""
+
+    # Check for any non-GPU resource shortages first.  If any exist, we
+    # return False immediately even if GPU is also short — the pod cannot
+    # be helped by our toleration alone.  Strip trailing punctuation from
+    # the match group because the scheduler appends commas and periods
+    # (e.g. "Insufficient nvidia.com/gpu, 3 Insufficient memory.").
+    for m in re.finditer(r"Insufficient (\S+)", message):
+        resource = m.group(1).rstrip(".,;)")
+        if resource != "nvidia.com/gpu":
+            return False
+
+    # GPU shortage must be explicitly mentioned.
+    if "Insufficient nvidia.com/gpu" not in message:
+        return None
+
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Async wrappers around blocking kubernetes calls
 # ---------------------------------------------------------------------------
@@ -170,6 +229,54 @@ async def count_tolerated_gpu_usage(
         total, namespace, booking_reference, exclude_uid,
     )
     return total
+
+
+async def list_stuck_reservation_holder_pods(
+    toleration_key: str,
+) -> list[tuple[str, str, str]]:
+    """Guard 3: find reservation-holder pods that are stuck in Pending.
+
+    A pod is a "stuck reservation holder" when all of the following hold:
+    - Has a toleration with key == *toleration_key* (was admitted by this
+      controller for a user or on-demand reservation)
+    - Phase is "Pending"
+    - Has a ``PodScheduled`` condition with ``status == "False"`` (the
+      scheduler has determined it cannot be placed)
+
+    Returns a list of ``(namespace, name, gpu_class_label)`` tuples — empty
+    if none found.  Pods whose ``gpu-class`` label value is absent or empty
+    are skipped; we cannot determine which class they affect.
+
+    Uses ``list_pod_for_all_namespaces`` with ``label_selector="gpu-class"``,
+    the same selector as ``PodWatcher`` — no new RBAC permission required.
+    """
+    loop = asyncio.get_running_loop()
+    log.debug("k8s: list_pod_for_all_namespaces selector=gpu-class (guard-3 check)")
+    pod_list = await loop.run_in_executor(
+        None,
+        lambda: _core_v1.list_pod_for_all_namespaces(label_selector="gpu-class"),
+    )
+    stuck: list[tuple[str, str, str]] = []
+    for pod in pod_list.items:
+        if get_pod_phase(pod) != "Pending":
+            continue
+        if not _pod_has_any_reservation_toleration(pod, toleration_key):
+            continue
+        conditions = (pod.status.conditions or []) if pod.status else []
+        scheduled = next((c for c in conditions if c.type == "PodScheduled"), None)
+        if scheduled is not None and scheduled.status == "False":
+            gpu_class_label = (pod.metadata.labels or {}).get("gpu-class", "")
+            if not gpu_class_label:
+                log.warning(
+                    "Stuck reservation-holder pod %s/%s has no gpu-class label; "
+                    "cannot scope interlock — skipping",
+                    pod.metadata.namespace,
+                    pod.metadata.name,
+                )
+                continue
+            stuck.append((pod.metadata.namespace, pod.metadata.name, gpu_class_label))
+    log.debug("k8s: guard-3 found %d stuck reservation-holder pod(s)", len(stuck))
+    return stuck
 
 
 async def apply_toleration(

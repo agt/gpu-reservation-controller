@@ -46,6 +46,8 @@ from .k8s_client import (
     get_pod_min_runtime_seconds,
     get_pod_phase,
     init_k8s,
+    is_gpu_only_pending,
+    list_stuck_reservation_holder_pods,
     pod_has_toleration,
     read_pod,
     set_active_deadline,
@@ -254,6 +256,19 @@ async def _try_place_ondemand(
         candidate.next_attempt_at = datetime.now() + timedelta(seconds=delay)
         return False
 
+    # Guard 3: safety interlock — hold on-demand placement for any GPU class
+    # that has a stuck reservation-holder pod.  Other classes are unaffected.
+    if candidate.gpu_class_label in state.stuck_holder_gpu_classes:
+        log.debug(
+            "On-demand candidate %s/%s: safety interlock active for gpu-class=%s; "
+            "retry in 30 s",
+            candidate.pod_namespace,
+            candidate.pod_name,
+            candidate.gpu_class_label,
+        )
+        candidate.next_attempt_at = datetime.now() + timedelta(seconds=30)
+        return False
+
     if block.id in state.noshow_reservation_ids:
         booking_reference = f"noshow-{block.id}"
     else:
@@ -275,6 +290,37 @@ async def _try_place_ondemand(
             )
             state.release_ondemand_pod(uid)
             return True
+
+        # Guard 1: GPU-only-pending check.
+        gpu_only = is_gpu_only_pending(fresh_pod, TOLERATION_KEY)
+        if gpu_only is False:
+            # Pod has non-GPU resource constraints; our toleration cannot help.
+            msg = ""
+            if fresh_pod.status and fresh_pod.status.conditions:
+                sched = next(
+                    (c for c in fresh_pod.status.conditions if c.type == "PodScheduled"),
+                    None,
+                )
+                if sched:
+                    msg = (sched.message or "")[:120]
+            log.info(
+                "On-demand candidate %s/%s: not GPU-only-pending (%r); dropping",
+                candidate.pod_namespace,
+                candidate.pod_name,
+                msg,
+            )
+            state.release_ondemand_pod(uid)
+            return True
+        if gpu_only is None:
+            # Scheduling conditions not yet populated; keep candidate, retry next tick.
+            log.debug(
+                "On-demand candidate %s/%s: scheduling conditions not yet set; retry in 30 s",
+                candidate.pod_namespace,
+                candidate.pod_name,
+            )
+            state.release_ondemand_pod(uid)
+            candidate.next_attempt_at = datetime.now() + timedelta(seconds=30)
+            return False
 
         if pod_has_toleration(fresh_pod, TOLERATION_KEY, candidate.gpu_class_label, "NoSchedule"):
             # Toleration was applied externally between the event and now.
@@ -521,6 +567,28 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
         await asyncio.sleep(30)
         now = datetime.now()
         state.check_noshow_deadlines(now)
+
+        # Guard 3: refresh safety interlock once per tick.
+        if config.ondemand_placement_enabled:
+            stuck = await list_stuck_reservation_holder_pods(TOLERATION_KEY)
+            new_classes = {gpu_class for _, _, gpu_class in stuck}
+            old_classes = state.stuck_holder_gpu_classes
+            state.stuck_holder_gpu_classes = new_classes
+            for gpu_class in new_classes - old_classes:
+                affected = [(ns, name) for ns, name, gc in stuck if gc == gpu_class]
+                log.warning(
+                    "Safety interlock activated for gpu-class=%s: %d reservation-holder "
+                    "pod(s) stuck Pending (%s); on-demand placement for this class held",
+                    gpu_class,
+                    len(affected),
+                    ", ".join(f"{ns}/{name}" for ns, name in affected),
+                )
+            for gpu_class in old_classes - new_classes:
+                log.info(
+                    "Safety interlock cleared for gpu-class=%s: on-demand placement resumed",
+                    gpu_class,
+                )
+
         to_remove: list[str] = []
 
         # --- reserved path ---

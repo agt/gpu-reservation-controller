@@ -136,6 +136,12 @@ class ControllerState:
         # later phase.
         self.ondemand_occupancy: dict[int, dict[str, int]] = {}
 
+        # Safety interlock (guard 3): set of GPU class labels that currently
+        # have at least one reservation-holder pod stuck Pending.  Updated each
+        # queue_processor_loop tick.  On-demand placement is held for any class
+        # in this set; other classes are unaffected.  Empty = no interlock.
+        self.stuck_holder_gpu_classes: set[str] = set()
+
         # No-show tracking:
         # Maps reservation_id → deadline by which a matching pod must appear.
         # Cleared when a pod is matched; moved to noshow_reservation_ids on expiry.
