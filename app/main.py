@@ -44,6 +44,7 @@ from .k8s_client import (
     get_pod_booking_reference,
     get_pod_gpu_count,
     get_pod_min_runtime_seconds,
+    get_pod_ondemand_block_id,
     get_pod_phase,
     init_k8s,
     is_gpu_only_pending,
@@ -341,6 +342,7 @@ async def _try_place_ondemand(
             TOLERATION_KEY,
             candidate.gpu_class_label,
             booking_reference,
+            extra_annotations={"dsmlp/ondemand-block-id": str(block.id)},
         )
         log.info(
             "Placed on-demand pod %s/%s onto block #%d "
@@ -479,6 +481,12 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                 state.dequeue_pod(uid)
                 state.remove_ondemand_candidate(uid)
                 state.mark_pod_seen_for_noshow(namespace, gpu_class_label)
+                # Reconstruct on-demand occupancy from the annotation stamped at
+                # placement time so that capacity accounting survives a restart.
+                block_id = get_pod_ondemand_block_id(pod)
+                if block_id is not None:
+                    gpu_count = get_pod_gpu_count(pod)
+                    state.record_ondemand_placement(block_id, uid, gpu_count)
             else:
                 gpu_count = get_pod_gpu_count(pod)
                 reservation = state.find_best_reservation(namespace, gpu_class_label)
@@ -690,6 +698,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await client.aclose()
         log.info("Controller stopped")
 
 

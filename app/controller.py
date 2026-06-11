@@ -130,10 +130,11 @@ class ControllerState:
         # the controller has placed onto each on-demand block.  Available
         # capacity = block.gpu_count - sum(values).
         #
-        # NOTE: this map is in-memory only.  On controller restart it cannot
-        # be rebuilt from Kubernetes state (the toleration encodes only the
-        # GPU class, not the block id).  Reconstruction is deferred to a
-        # later phase.
+        # Reconstructed at startup from the dsmlp/ondemand-block-id annotation
+        # that is stamped on each pod at placement time (see pod_watch_loop).
+        # Pods placed by a controller version predating that annotation will not
+        # be counted, so the first restart after upgrading may briefly allow one
+        # extra placement per affected block.
         self.ondemand_occupancy: dict[int, dict[str, int]] = {}
 
         # Safety interlock (guard 3): set of GPU class labels that currently

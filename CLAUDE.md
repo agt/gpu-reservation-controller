@@ -147,6 +147,12 @@ Kubernetes API and the reservation API within one fetch cycle.  Queue entries
 that were waiting for a window that has already opened will be re-evaluated
 immediately on the next processor tick.
 
+On-demand occupancy is reconstructed from the `dsmlp/ondemand-block-id`
+annotation stamped on each pod at placement time.  The startup pod LIST reads
+these annotations; pods placed by a controller version that predates the
+annotation will not be counted, so the first restart after upgrading may
+briefly permit one extra placement per affected block.
+
 ---
 
 ## Environment variables
@@ -160,6 +166,9 @@ immediately on the next processor tick.
 | `KUBECONFIG` | *(absent = in-cluster)* | Path to kubeconfig file for out-of-cluster use |
 | `HEALTH_PORT` | `8000` | Port for `GET /health` |
 | `TZ` | system default | Timezone for reservation window arithmetic |
+| `ONDEMAND_PLACEMENT_ENABLED` | `true` | Set to `false` to disable on-demand placement entirely |
+| `NOSHOWN_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
+| `NOSHOWN_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared |
 
 ---
 

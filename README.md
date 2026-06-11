@@ -60,8 +60,61 @@ system is designed to accommodate greater values in the future.)
 │           PATCH pod → set activeDeadlineSeconds      │
 │           Create RuntimeCapped Event on pod          │
 │      c. Otherwise: retry in 2–5 min                  │
+│                                                      │
+│    On-demand path (when ONDEMAND_PLACEMENT_ENABLED): │
+│      d. Safety interlock (guard 3): if a reservation │
+│         holder is stuck Pending for a GPU class,     │
+│         hold on-demand placement for that class      │
+│      e. For each on-demand candidate whose retry     │
+│         cooldown has passed, find a suitable block:  │
+│           kind="ondemand" (or no-show reclaimed),    │
+│           matching GPU class, sufficient free GPUs,  │
+│           remaining window >= minimum-runtime-seconds│
+│           PATCH pod → add toleration + block-id      │
+│           PATCH pod → set activeDeadlineSeconds      │
+│           Create RuntimeCapped Event on pod          │
 └──────────────────────────────────────────────────────┘
 ```
+
+### On-demand placement
+
+When `ONDEMAND_PLACEMENT_ENABLED=true` (the default), the controller also
+handles pods that have **no matching user reservation** but carry the
+`dsmlp/minimum-runtime-seconds` annotation.  These pods are treated as
+*on-demand candidates* and are placed onto `kind=ondemand` blocks when
+capacity is available.
+
+**Candidate selection** — a Pending pod becomes an on-demand candidate when:
+- It has a `gpu-class` label but no matching user reservation.
+- It carries `dsmlp/minimum-runtime-seconds=<N>` (a positive integer).
+- Only `ADDED` events create candidates; `MODIFIED` bursts are ignored.
+
+**Block selection** — a block is eligible when:
+- `kind == "ondemand"` (or it has been reclaimed from a no-show reservation).
+- Its GPU class matches the pod's `gpu-class` label.
+- Its window is currently open and has at least `minimum-runtime-seconds` remaining.
+- It has sufficient free GPU capacity for the pod's request.
+
+Among eligible blocks, the controller prefers the one whose window ends
+soonest (minimising the time a block sits partially filled).
+
+**Safety interlock (guard 3)** — if any reservation-holder pod for a given
+GPU class is stuck in Pending (admitted but the scheduler cannot place it),
+on-demand placement is suspended for that class until the stuck pod is
+resolved.  Other GPU classes are unaffected.
+
+**No-show reclaim** — if a reservation holder fails to launch a pod within
+`NOSHOWN_TIMEOUT_MINUTES` of the window opening, that reservation is marked
+as a no-show and its capacity becomes available for on-demand candidates.
+
+**Recycling** — when an on-demand pod terminates, the freed capacity is
+immediately offered to the next waiting candidate of the same GPU class
+without waiting for the next queue-processor tick.
+
+**Occupancy tracking across restarts** — each pod receives a
+`dsmlp/ondemand-block-id` annotation at placement time.  On restart, the
+startup pod LIST reads these annotations to reconstruct the occupancy map,
+preventing over-placement after a controller restart.
 
 ### Toleration applied
 
@@ -136,6 +189,9 @@ All settings are supplied via environment variables.
 | `KUBECONFIG` | no | *(absent)* | Path to a kubeconfig file; if unset, in-cluster service-account credentials are used |
 | `HEALTH_PORT` | no | `8000` | Port for the `GET /health` liveness endpoint |
 | `TZ` | no | system default | IANA timezone for reservation window arithmetic, e.g. `America/Los_Angeles` |
+| `ONDEMAND_PLACEMENT_ENABLED` | no | `true` | Set to `false` to disable on-demand placement and run reserved-path logic only |
+| `NOSHOWN_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and opening the block to on-demand pods |
+| `NOSHOWN_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress |
 
 > **Security note:** The controller requires a **`read_only`**-scoped service
 > key — it only calls `GET` endpoints.  Do not provision a `read_write` key for

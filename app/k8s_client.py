@@ -8,6 +8,7 @@ Public surface
 init_k8s(kubeconfig_path)                    — load credentials once at startup
 get_pod_gpu_count(pod)                       — sum nvidia.com/gpu requests
 get_pod_booking_reference(pod)               — read dsmlp/booking-reference annotation
+get_pod_ondemand_block_id(pod)               — read dsmlp/ondemand-block-id annotation
 pod_has_toleration(pod, ...)                 — check for a specific toleration
 is_gpu_only_pending(pod, toleration_key)     — guard 1: GPU-only scheduling failure check
 read_pod(name, namespace)                    — fetch current pod object
@@ -105,6 +106,28 @@ def get_pod_booking_reference(pod) -> Optional[str]:
     """Return the ``dsmlp/booking-reference`` annotation value, or ``None``."""
     annotations: dict = pod.metadata.annotations or {}
     return annotations.get("dsmlp/booking-reference")
+
+
+def get_pod_ondemand_block_id(pod) -> Optional[int]:
+    """Return the ``dsmlp/ondemand-block-id`` annotation as an int, or ``None``.
+
+    This annotation is stamped at on-demand placement time so the controller
+    can reconstruct ``ondemand_occupancy`` after a restart from the pod LIST.
+    """
+    annotations: dict = pod.metadata.annotations or {}
+    raw = annotations.get("dsmlp/ondemand-block-id")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        log.warning(
+            "Pod %s/%s has non-integer dsmlp/ondemand-block-id=%r; ignoring",
+            pod.metadata.namespace,
+            pod.metadata.name,
+            raw,
+        )
+        return None
 
 
 def pod_has_toleration(pod, key: str, value: str, effect: str) -> bool:
@@ -286,10 +309,12 @@ async def apply_toleration(
     tol_key: str,
     tol_value: str,
     booking_reference: str,
+    extra_annotations: Optional[dict[str, str]] = None,
 ) -> None:
     """Patch *pod* to add toleration ``tol_key=tol_value:NoSchedule`` and set
     the ``dsmlp/booking-reference`` annotation.
 
+    *extra_annotations* are merged into the metadata annotations patch.
     The patch preserves all existing tolerations; Kubernetes rejects requests
     that would remove tolerations from running pods.
     """
@@ -314,8 +339,11 @@ async def apply_toleration(
             entry["tolerationSeconds"] = t.toleration_seconds
         existing.append(entry)
 
+    annotations = {"dsmlp/booking-reference": booking_reference}
+    if extra_annotations:
+        annotations.update(extra_annotations)
     patch = {
-        "metadata": {"annotations": {"dsmlp/booking-reference": booking_reference}},
+        "metadata": {"annotations": annotations},
         "spec": {"tolerations": existing + [new_tol]},
     }
     log.debug(
@@ -445,6 +473,7 @@ class PodWatcher:
 
         def _run_watch() -> None:
             """Blocking watch loop; runs in a thread-pool thread."""
+            _fail_count = 0
             while True:
                 try:
                     w = watch.Watch()
@@ -474,6 +503,7 @@ class PodWatcher:
                         " resourceVersion=%s timeout_seconds=270",
                         self._label_selector, resource_version,
                     )
+                    _fail_count = 0  # successful LIST+WATCH cycle; reset counter
                     for event in w.stream(
                         _core_v1.list_pod_for_all_namespaces,
                         label_selector=self._label_selector,
@@ -492,9 +522,18 @@ class PodWatcher:
                         )
 
                 except Exception as exc:  # noqa: BLE001
-                    log.debug(
-                        "Pod watch stream ended (%s); reconnecting in 5 s", exc
-                    )
+                    _fail_count += 1
+                    if _fail_count == 1 or _fail_count % 120 == 0:
+                        log.warning(
+                            "Pod watch stream error (failure #%d): %s; "
+                            "reconnecting in 5 s",
+                            _fail_count,
+                            exc,
+                        )
+                    else:
+                        log.debug(
+                            "Pod watch stream ended (%s); reconnecting in 5 s", exc
+                        )
                     time.sleep(5)
 
         # Submit the blocking watch to the default thread-pool executor.
