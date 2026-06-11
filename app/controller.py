@@ -136,6 +136,160 @@ class ControllerState:
         # later phase.
         self.ondemand_occupancy: dict[int, dict[str, int]] = {}
 
+        # No-show tracking:
+        # Maps reservation_id → deadline by which a matching pod must appear.
+        # Cleared when a pod is matched; moved to noshow_reservation_ids on expiry.
+        self.noshow_deadlines: dict[int, datetime] = {}
+
+        # Reservations permanently declared no-show for this controller lifetime.
+        # These are treated as on-demand capacity for placement purposes.
+        self.noshow_reservation_ids: set[int] = set()
+
+    # ------------------------------------------------------------------
+    # No-show tracking
+    # ------------------------------------------------------------------
+
+    def initialize_noshow_tracking(
+        self,
+        now: datetime,
+        timeout_minutes: int,
+        grace_minutes: int,
+    ) -> None:
+        """Set up no-show deadlines for all active user reservations.
+
+        Called once after the initial reservation fetch in the lifespan.
+        For each active user reservation:
+        - Window not yet open: deadline = slot_start + timeout_minutes
+        - Window already open (mid-window startup): deadline = now + grace_minutes
+        - Window already expired: skipped
+
+        The initial pod LIST events processed shortly after by pod_watch_loop
+        will clear deadlines for reservations that already have matching pods.
+        """
+        for r in self.reservations:
+            if r.kind != "user" or r.user is None:
+                continue
+            if r.id in self.noshow_deadlines:
+                continue  # already tracked (e.g. called twice)
+            end = slot_end(r)
+            start = slot_start(r)
+            if end <= now:
+                continue
+            if start > now:
+                deadline = start + timedelta(minutes=timeout_minutes)
+            else:
+                deadline = now + timedelta(minutes=grace_minutes)
+            self.noshow_deadlines[r.id] = deadline
+            log.debug(
+                "No-show tracking: reservation #%d deadline=%s",
+                r.id,
+                deadline.strftime("%Y-%m-%d %H:%M"),
+            )
+
+    def update_noshow_tracking(
+        self,
+        now: datetime,
+        timeout_minutes: int,
+        grace_minutes: int,
+    ) -> None:
+        """Add newly-fetched reservations to no-show tracking.
+
+        Called after each subsequent reservation refresh.  Does not overwrite
+        existing deadlines and does not resurrect already-declared no-shows.
+        """
+        for r in self.reservations:
+            if r.kind != "user" or r.user is None:
+                continue
+            if r.id in self.noshow_deadlines:
+                continue
+            if r.id in self.noshow_reservation_ids:
+                continue
+            end = slot_end(r)
+            start = slot_start(r)
+            if end <= now:
+                continue
+            if start > now:
+                deadline = start + timedelta(minutes=timeout_minutes)
+            else:
+                deadline = now + timedelta(minutes=grace_minutes)
+            self.noshow_deadlines[r.id] = deadline
+            log.debug(
+                "No-show tracking (new): reservation #%d deadline=%s",
+                r.id,
+                deadline.strftime("%Y-%m-%d %H:%M"),
+            )
+
+    def reconcile_noshow(self) -> None:
+        """Prune no-show state for reservations no longer in the active list.
+
+        Called after each reservation refresh alongside reconcile_queue.
+        """
+        active_ids = {r.id for r in self.reservations}
+        stale = [rid for rid in self.noshow_deadlines if rid not in active_ids]
+        for rid in stale:
+            self.noshow_deadlines.pop(rid)
+            log.debug("No-show deadline pruned: reservation #%d left active list", rid)
+        stale_noshow = [rid for rid in self.noshow_reservation_ids if rid not in active_ids]
+        for rid in stale_noshow:
+            self.noshow_reservation_ids.discard(rid)
+            log.info("No-show reservation #%d removed: left active list", rid)
+
+    def check_noshow_deadlines(self, now: datetime) -> None:
+        """Declare no-shows for any reservation whose deadline has passed.
+
+        Called at the start of each queue_processor_loop tick.  Moves expired
+        entries from noshow_deadlines into noshow_reservation_ids.
+        """
+        expired = [
+            rid for rid, deadline in self.noshow_deadlines.items() if now >= deadline
+        ]
+        for rid in expired:
+            del self.noshow_deadlines[rid]
+            self.noshow_reservation_ids.add(rid)
+            res = next((r for r in self.reservations if r.id == rid), None)
+            user = res.user.username if (res and res.user) else "unknown"
+            gpu_class = self.gpu_class_labels.get(res.gpu_class_id, "unknown") if res else "unknown"
+            log.info(
+                "Reservation #%d declared no-show (user=%s, gpu-class=%s): "
+                "no matching pod appeared before deadline; "
+                "capacity opened for on-demand placement",
+                rid,
+                user,
+                gpu_class,
+            )
+
+    def mark_pod_seen_for_noshow(
+        self, namespace: str, gpu_class_label: str
+    ) -> None:
+        """Clear the no-show deadline for the soonest matching reservation.
+
+        Called when a pod with an existing toleration is detected (already
+        admitted), so we have no booking-reference to look up the exact
+        reservation.  Clears the deadline for the soonest active user
+        reservation matching namespace + gpu_class_label that still has a
+        pending deadline, mirroring find_best_reservation's selection logic.
+        """
+        candidates = [
+            r
+            for r in self.reservations
+            if r.kind == "user"
+            and r.user is not None
+            and r.user.username == namespace
+            and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
+            and r.id in self.noshow_deadlines
+        ]
+        if not candidates:
+            return
+        best = min(candidates, key=slot_start)
+        self.noshow_deadlines.pop(best.id, None)
+        log.debug(
+            "No-show deadline cleared for reservation #%d: "
+            "matching pod already admitted (namespace=%s, gpu-class=%s)",
+            best.id,
+            namespace,
+            gpu_class_label,
+        )
+
     # ------------------------------------------------------------------
     # Reservation matching
     # ------------------------------------------------------------------
@@ -161,6 +315,7 @@ class ControllerState:
             and r.user.username == namespace
             and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
             and slot_end(r) > now  # still has time left
+            and r.id not in self.noshow_reservation_ids
         ]
         if not candidates:
             return None
@@ -187,6 +342,9 @@ class ControllerState:
         reservation = self.find_best_reservation(pod_namespace, gpu_class_label)
         if reservation is None:
             return  # no matching reservation; nothing to do
+
+        # A pod appeared for this reservation — clear its no-show deadline.
+        self.noshow_deadlines.pop(reservation.id, None)
 
         existing = self.task_queue.get(pod_uid)
         if existing and existing.reservation.id == reservation.id:
@@ -257,6 +415,7 @@ class ControllerState:
                 and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
                 and r.gpu_count == gpu_count
                 and slot_end(r) > now
+                and r.id not in self.noshow_reservation_ids
             ],
             key=slot_start,
         )
@@ -416,7 +575,7 @@ class ControllerState:
         candidates = [
             r
             for r in self.reservations
-            if r.kind == "ondemand"
+            if (r.kind == "ondemand" or r.id in self.noshow_reservation_ids)
             and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
             and slot_start(r) <= now < slot_end(r)
             and self.ondemand_available(r) >= gpu_requested
@@ -502,7 +661,8 @@ class ControllerState:
         active_ondemand_ids = {
             r.id
             for r in self.reservations
-            if r.kind == "ondemand" and slot_end(r) > now
+            if (r.kind == "ondemand" or r.id in self.noshow_reservation_ids)
+            and slot_end(r) > now
         }
         stale_block_ids = [
             bid

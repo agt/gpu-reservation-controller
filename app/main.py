@@ -254,7 +254,10 @@ async def _try_place_ondemand(
         candidate.next_attempt_at = datetime.now() + timedelta(seconds=delay)
         return False
 
-    booking_reference = f"ondemand-{block.id}"
+    if block.id in state.noshow_reservation_ids:
+        booking_reference = f"noshow-{block.id}"
+    else:
+        booking_reference = f"ondemand-{block.id}"
     # --- optimistic reservation (before any await) ---
     state.record_ondemand_placement(block.id, uid, candidate.gpu_requested)
 
@@ -348,17 +351,24 @@ async def _try_place_ondemand(
 
 
 async def reservation_fetch_loop(
-    state: ControllerState, client: ReservationClient, interval: int
+    state: ControllerState, client: ReservationClient, config: Config
 ) -> None:
-    """Re-fetch reservations every *interval* seconds.
+    """Re-fetch reservations every ``config.reservation_fetch_interval`` seconds.
 
     The initial fetch is done synchronously in the lifespan before this loop
     starts, so we sleep first and then enter the refresh–sleep cycle.
     """
     while True:
-        await asyncio.sleep(interval)
+        await asyncio.sleep(config.reservation_fetch_interval)
         try:
             await _refresh_reservations(state, client)
+            now = datetime.now()
+            state.reconcile_noshow()
+            state.update_noshow_tracking(
+                now,
+                config.noshown_timeout_minutes,
+                config.noshown_grace_minutes,
+            )
         except Exception as exc:  # noqa: BLE001
             log.error("Reservation refresh failed: %s", exc)
 
@@ -422,6 +432,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                 # Pod already admitted — remove from whichever queue it may be in.
                 state.dequeue_pod(uid)
                 state.remove_ondemand_candidate(uid)
+                state.mark_pod_seen_for_noshow(namespace, gpu_class_label)
             else:
                 gpu_count = get_pod_gpu_count(pod)
                 reservation = state.find_best_reservation(namespace, gpu_class_label)
@@ -509,6 +520,7 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
     while True:
         await asyncio.sleep(30)
         now = datetime.now()
+        state.check_noshow_deadlines(now)
         to_remove: list[str] = []
 
         # --- reserved path ---
@@ -574,6 +586,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             len(state.reservations),
             len(state.gpu_class_labels),
         )
+        now = datetime.now()
+        state.initialize_noshow_tracking(
+            now,
+            config.noshown_timeout_minutes,
+            config.noshown_grace_minutes,
+        )
+        log.info(
+            "No-show tracking initialised: %d reservation(s) watched",
+            len(state.noshow_deadlines),
+        )
     except Exception as exc:  # noqa: BLE001
         log.error(
             "Initial reservation fetch failed (%s); controller will retry "
@@ -585,7 +607,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Launch the three background loops as asyncio tasks.
     tasks = [
         asyncio.create_task(
-            reservation_fetch_loop(state, client, config.reservation_fetch_interval),
+            reservation_fetch_loop(state, client, config),
             name="reservation-fetch",
         ),
         asyncio.create_task(pod_watch_loop(state, config), name="pod-watch"),

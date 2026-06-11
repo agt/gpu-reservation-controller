@@ -16,6 +16,8 @@ class Config:
     kubeconfig_path: Optional[str]    # None → use in-cluster service account
     health_port: int
     ondemand_placement_enabled: bool  # enable/disable on-demand pod placement
+    noshown_timeout_minutes: int   # minutes after slot_start before no-show is declared
+    noshown_grace_minutes: int     # grace period when controller starts mid-window
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -44,4 +46,10 @@ class Config:
                 "ONDEMAND_PLACEMENT_ENABLED", "true"
             ).lower()
             not in ("false", "0", "no"),
+            noshown_timeout_minutes=int(
+                os.environ.get("NOSHOWN_TIMEOUT_MINUTES", "15")
+            ),
+            noshown_grace_minutes=int(
+                os.environ.get("NOSHOWN_GRACE_MINUTES", "30")
+            ),
         )
