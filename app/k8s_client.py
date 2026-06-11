@@ -108,6 +108,31 @@ def get_pod_booking_reference(pod) -> Optional[str]:
     return annotations.get("dsmlp/booking-reference")
 
 
+# Prefixes used in dsmlp/booking-reference values.  All three embed the
+# reservation id that the pod was admitted under; the prefix records which path
+# admitted it (reserved / on-demand / no-show) and is otherwise cosmetic.
+_BOOKING_REFERENCE_PREFIXES = ("res-", "ondemand-", "noshow-")
+
+
+def parse_booking_reference(reference: Optional[str]) -> Optional[int]:
+    """Extract the reservation id embedded in a ``dsmlp/booking-reference`` value.
+
+    ``"res-42"`` / ``"ondemand-42"`` / ``"noshow-42"`` all return ``42``.
+    Returns ``None`` for an unrecognised prefix, a non-integer suffix, or
+    ``None``/empty input.  This is the single key used to reconstruct occupancy
+    from the cluster, so it must accept every prefix ``apply_toleration`` writes.
+    """
+    if not reference:
+        return None
+    for prefix in _BOOKING_REFERENCE_PREFIXES:
+        if reference.startswith(prefix):
+            try:
+                return int(reference[len(prefix):])
+            except ValueError:
+                return None
+    return None
+
+
 def get_pod_ondemand_block_id(pod) -> Optional[int]:
     """Return the ``dsmlp/ondemand-block-id`` annotation as an int, or ``None``.
 

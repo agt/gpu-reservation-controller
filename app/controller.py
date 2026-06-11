@@ -152,6 +152,15 @@ class ControllerState:
         # These are treated as on-demand capacity for placement purposes.
         self.noshow_reservation_ids: set[int] = set()
 
+        # Reservation ids currently "claimed" by a live reserved-path holder pod
+        # — each holder's booking reservation plus the back-to-back chain its
+        # runtime cap extends across (see reservations_claimed_by).  A reservation
+        # in this set must not be declared a no-show or lent out as on-demand
+        # capacity, because a holder is actively occupying its window via a
+        # chained deadline even though no pod is booked directly under it.
+        # Recomputed from the live pod snapshot each queue-processor tick.
+        self.claimed_reservation_ids: set[int] = set()
+
     # ------------------------------------------------------------------
     # No-show tracking
     # ------------------------------------------------------------------
@@ -390,6 +399,63 @@ class ControllerState:
                 pod_uid,
             )
 
+    def _chain_for(
+        self,
+        reservation: ReservationResponse,
+        now: datetime,
+    ) -> list[ReservationResponse]:
+        """Return the back-to-back chain *following* *reservation*, in window order.
+
+        A reservation extends the chain when it shares the same namespace, GPU
+        class, and gpu_count, has not yet expired, is not a no-show, and starts
+        exactly when the previous window ends (``slot_start(next) ==
+        slot_end(previous)``).  *reservation* itself is **not** included.
+
+        Shared by ``compute_max_deadline_seconds`` (runtime-cap arithmetic) and
+        ``reservations_claimed_by`` (no-show protection) so both agree on what a
+        single holder pod's session spans.
+        """
+        if reservation.user is None:
+            return []
+        namespace = reservation.user.username
+        gpu_class_label = self.gpu_class_labels.get(reservation.gpu_class_id)
+        gpu_count = reservation.gpu_count
+
+        candidates = sorted(
+            [
+                r
+                for r in self.reservations
+                if r.id != reservation.id
+                and r.kind == "user"
+                and r.user is not None
+                and r.user.username == namespace
+                and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
+                and r.gpu_count == gpu_count
+                and slot_end(r) > now
+                and r.id not in self.noshow_reservation_ids
+            ],
+            key=slot_start,
+        )
+
+        chain: list[ReservationResponse] = []
+        prev_end = slot_end(reservation)
+        visited: set[int] = set()
+        while True:
+            next_res = next(
+                (
+                    r
+                    for r in candidates
+                    if r.id not in visited and slot_start(r) == prev_end
+                ),
+                None,
+            )
+            if next_res is None:
+                break
+            chain.append(next_res)
+            prev_end = slot_end(next_res)
+            visited.add(next_res.id)
+        return chain
+
     def compute_max_deadline_seconds(
         self,
         now: datetime,
@@ -403,49 +469,30 @@ class ControllerState:
 
         "Back-to-back" means slot_start(next) == slot_end(previous) exactly.
         """
-        namespace = current_reservation.user.username
-        gpu_class_label = self.gpu_class_labels.get(current_reservation.gpu_class_id)
-        gpu_count = current_reservation.gpu_count
-
         prev_end = slot_end(current_reservation)
-        remaining = max(0.0, (prev_end - now).total_seconds())
-
-        # Collect future reservations that could extend the chain.
-        candidates = sorted(
-            [
-                r
-                for r in self.reservations
-                if r.id != current_reservation.id
-                and r.kind == "user"
-                and r.user is not None
-                and r.user.username == namespace
-                and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
-                and r.gpu_count == gpu_count
-                and slot_end(r) > now
-                and r.id not in self.noshow_reservation_ids
-            ],
-            key=slot_start,
-        )
-
-        total = remaining
-        visited: set[int] = set()
-
-        while True:
-            next_res = next(
-                (
-                    r
-                    for r in candidates
-                    if r.id not in visited and slot_start(r) == prev_end
-                ),
-                None,
-            )
-            if next_res is None:
-                break
-            total += next_res.policy.duration_minutes * 60.0
-            prev_end = slot_end(next_res)
-            visited.add(next_res.id)
-
+        total = max(0.0, (prev_end - now).total_seconds())
+        for res in self._chain_for(current_reservation, now):
+            total += res.policy.duration_minutes * 60.0
         return int(total)
+
+    def reservations_claimed_by(
+        self,
+        reservation_id: int,
+        now: Optional[datetime] = None,
+    ) -> set[int]:
+        """Return the set of reservation ids a holder booked under *reservation_id*
+        occupies: the reservation itself plus its back-to-back chain.
+
+        Used to protect every window a single chained holder pod spans from being
+        declared a no-show or lent out as on-demand capacity, closing the
+        booked-id-vs-occupied-id gap.
+        """
+        now = now or datetime.now()
+        res = next((r for r in self.reservations if r.id == reservation_id), None)
+        claimed = {reservation_id}
+        if res is not None and res.kind == "user" and res.user is not None:
+            claimed |= {r.id for r in self._chain_for(res, now)}
+        return claimed
 
     def reconcile_queue(self) -> None:
         """Re-validate queue entries against the current reservation list.
