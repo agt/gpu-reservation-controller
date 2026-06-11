@@ -341,7 +341,6 @@ async def _try_place_ondemand(
             TOLERATION_KEY,
             candidate.gpu_class_label,
             booking_reference,
-            extra_annotations={"dsmlp/ondemand-block-id": str(block.id)},
         )
         log.info(
             "Placed on-demand pod %s/%s onto block #%d "

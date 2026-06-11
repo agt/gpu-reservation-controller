@@ -123,10 +123,12 @@ reclaim their window across a restart.
 immediately offered to the next waiting candidate of the same GPU class
 without waiting for the next queue-processor tick.
 
-**Occupancy tracking across restarts** — each pod receives a
-`dsmlp/ondemand-block-id` annotation at placement time.  On restart, the
-startup pod LIST reads these annotations to reconstruct the occupancy map,
-preventing over-placement after a controller restart.
+**Occupancy tracking across restarts** — capacity for every admitted pod
+(reserved, on-demand, and no-show alike) is tracked in one occupancy map keyed
+by reservation id.  The map is rebuilt from the cluster — the reservation id
+parsed from each pod's `dsmlp/booking-reference` — by the startup pod LIST and,
+on every queue-processor tick, from a live snapshot, so a missed event or a
+restart self-heals within one tick.
 
 ### Toleration applied
 
@@ -141,9 +143,8 @@ effect:   NoSchedule
 
 | Annotation | Written when | Purpose |
 |------------|--------------|---------|
-| `dsmlp/booking-reference` | toleration applied | Identifies the booking the pod was admitted under (`res-<id>`, `ondemand-<id>`, or `noshow-<id>`); used by the per-booking GPU budget count |
-| `dsmlp/ondemand-block-id` | on-demand placement | Block the pod occupies; read back at startup to reconstruct the occupancy map |
-| `dsmlp/pod-runtime-limit-seconds` | deadline set | Records the applied `activeDeadlineSeconds` value for operator visibility |
+| `dsmlp/booking-reference` | toleration applied | Identifies the reservation the pod was admitted under (`res-<id>`, `ondemand-<id>`, or `noshow-<id>`); the id is the key for the per-reservation GPU budget and for rebuilding occupancy from the cluster |
+| `dsmlp/pod-runtime-limit-seconds` | deadline set | Records the applied `activeDeadlineSeconds` value for operator visibility and in-pod notification widgets |
 
 (`dsmlp/minimum-runtime-seconds` is the one annotation **consumed** rather
 than written — see On-demand placement above.)

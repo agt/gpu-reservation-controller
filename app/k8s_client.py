@@ -8,7 +8,6 @@ Public surface
 init_k8s(kubeconfig_path)                    — load credentials once at startup
 get_pod_gpu_count(pod)                       — sum nvidia.com/gpu requests
 get_pod_booking_reference(pod)               — read dsmlp/booking-reference annotation
-get_pod_ondemand_block_id(pod)               — read dsmlp/ondemand-block-id annotation
 parse_booking_reference(ref)                 — reservation id from a booking-reference
 pod_has_toleration(pod, ...)                 — check for a specific toleration
 is_gpu_only_pending(pod, toleration_key)     — guard 1: GPU-only scheduling failure check
@@ -132,28 +131,6 @@ def parse_booking_reference(reference: Optional[str]) -> Optional[int]:
             except ValueError:
                 return None
     return None
-
-
-def get_pod_ondemand_block_id(pod) -> Optional[int]:
-    """Return the ``dsmlp/ondemand-block-id`` annotation as an int, or ``None``.
-
-    This annotation is stamped at on-demand placement time so the controller
-    can reconstruct ``ondemand_occupancy`` after a restart from the pod LIST.
-    """
-    annotations: dict = pod.metadata.annotations or {}
-    raw = annotations.get("dsmlp/ondemand-block-id")
-    if raw is None:
-        return None
-    try:
-        return int(raw)
-    except (ValueError, TypeError):
-        log.warning(
-            "Pod %s/%s has non-integer dsmlp/ondemand-block-id=%r; ignoring",
-            pod.metadata.namespace,
-            pod.metadata.name,
-            raw,
-        )
-        return None
 
 
 def pod_has_toleration(pod, key: str, value: str, effect: str) -> bool:
@@ -303,14 +280,14 @@ async def apply_toleration(
     tol_key: str,
     tol_value: str,
     booking_reference: str,
-    extra_annotations: Optional[dict[str, str]] = None,
 ) -> None:
     """Patch *pod* to add toleration ``tol_key=tol_value:NoSchedule`` and set
     the ``dsmlp/booking-reference`` annotation.
 
-    *extra_annotations* are merged into the metadata annotations patch.
-    The patch preserves all existing tolerations; Kubernetes rejects requests
-    that would remove tolerations from running pods.
+    The booking-reference is the single key from which occupancy is later
+    reconstructed (see parse_booking_reference).  The patch preserves all
+    existing tolerations; Kubernetes rejects requests that would remove
+    tolerations from running pods.
     """
     new_tol = {
         "key": tol_key,
@@ -333,11 +310,8 @@ async def apply_toleration(
             entry["tolerationSeconds"] = t.toleration_seconds
         existing.append(entry)
 
-    annotations = {"dsmlp/booking-reference": booking_reference}
-    if extra_annotations:
-        annotations.update(extra_annotations)
     patch = {
-        "metadata": {"annotations": annotations},
+        "metadata": {"annotations": {"dsmlp/booking-reference": booking_reference}},
         "spec": {"tolerations": existing + [new_tol]},
     }
     log.debug(

@@ -85,16 +85,20 @@ When patching, all existing tolerations are preserved (Kubernetes rejects
 patches that remove tolerations from running pods).  The pod is re-fetched
 immediately before patching to avoid working with a stale toleration list.
 
-The patch also stamps annotations on the pod:
+The patch also stamps the pod with the `dsmlp/booking-reference` annotation:
+`res-<id>` (reserved path), `ondemand-<id>`, or `noshow-<id>`.  This is the
+controller's single record of which reservation a pod was admitted under.  The
+GPU **budget check** (`ControllerState.available`) counts every pod recorded
+against a reservation id in the **unified occupancy map** (one map for reserved,
+on-demand, and no-show alike — keyed by reservation id), so each reservation has
+an independent budget; the id parsed from this annotation
+(`parse_booking_reference`) is also how occupancy is rebuilt from the cluster
+after a restart.  The prefix records the admission path and is otherwise
+cosmetic.
 
-- `dsmlp/booking-reference` — `res-<id>` (reserved path), `ondemand-<id>`, or
-  `noshow-<id>`; the GPU **budget check** (`count_tolerated_gpu_usage`) counts
-  only sibling pods whose booking-reference matches, so each booking has an
-  independent budget.
-- `dsmlp/ondemand-block-id` — on-demand placements only; read back at startup
-  to reconstruct occupancy.
-- `dsmlp/pod-runtime-limit-seconds` — written by `set_active_deadline`
-  alongside the `activeDeadlineSeconds` spec patch.
+`set_active_deadline` additionally writes `dsmlp/pod-runtime-limit-seconds`
+(mirroring the `activeDeadlineSeconds` spec patch; consumed by in-pod
+notification widgets).
 
 ### Runtime capping
 
@@ -162,11 +166,14 @@ Kubernetes API and the reservation API within one fetch cycle.  Queue entries
 that were waiting for a window that has already opened will be re-evaluated
 immediately on the next processor tick.
 
-On-demand occupancy is reconstructed from the `dsmlp/ondemand-block-id`
-annotation stamped on each pod at placement time.  The startup pod LIST reads
-these annotations; pods placed by a controller version that predates the
-annotation will not be counted, so the first restart after upgrading may
-briefly permit one extra placement per affected block.
+Occupancy is reconstructed from the `dsmlp/booking-reference` annotation: the
+reservation id parsed from each admitted pod's booking-reference is summed into
+the unified occupancy map.  The startup pod LIST seeds this, and every
+queue-processor tick rebuilds the map wholesale from a live cluster snapshot
+(`snapshot_tolerated_pods` → `reconcile_occupancy`), so a missed watch event
+self-heals within one tick.  An optimistic placement recorded between ticks whose
+patch is not yet visible in the snapshot may be briefly dropped and re-captured
+on the next tick — a window bounded by the 30 s tick interval.
 
 **No-show state does not survive restarts.**  `noshow_reservation_ids` is
 in-memory and never written back to the reservation API (the key is
@@ -179,6 +186,18 @@ mid-window (e.g. idle-culled), the reservation's deadline was already
 cleared, so the next refresh's `update_noshow_tracking` re-arms it with the
 grace timeout — this is what eventually converts vacated windows to
 on-demand capacity.
+
+**Chained holders are protected from no-show conversion.**  A pod admitted
+under `res-X` whose runtime cap is chained across back-to-back windows (`X`,
+`X+1`, …) physically occupies those later windows even though no pod is booked
+directly under them.  Each queue-processor tick scans live reserved-path holder
+pods and marks every window they occupy (`reservations_claimed_by`) as
+**claimed**; claimed reservations have their no-show deadline cleared and are
+skipped by `check_noshow_deadlines`, `update_noshow_tracking`, and
+`find_ondemand_block`.  This stops a reservation a holder is still using from
+being declared a no-show and double-booked as on-demand capacity.  When the
+holder vacates, the reservation leaves the claimed set and the grace re-arm path
+above applies.
 
 ---
 
