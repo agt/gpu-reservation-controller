@@ -64,9 +64,13 @@ pod.metadata.namespace  ==  reservation.user.username
 pod.labels["gpu-class"] ==  gpu_class.label_value   # from GET /api/gpu-classes/{id}
 ```
 
-`label_value` is fetched once per GPU class per refresh cycle and cached in
-`ControllerState.gpu_class_labels`.  If a GPU class has no `label_value`, its
-reservations are skipped with a warning.
+`label_value` is cached in `ControllerState.gpu_class_labels`.  Each refresh
+cycle re-resolves only GPU classes **not already cached** (classes that drop
+out of the active reservation list also drop out of the cache); a cached value
+is reused as long as the class stays in the list, so changing a class's
+`label_value` in the reservation app takes effect only after the class has no
+active reservations for a cycle or the controller restarts.  If a GPU class
+has no `label_value`, its reservations are skipped with a warning.
 
 ### Toleration applied
 
@@ -80,6 +84,17 @@ effect:   NoSchedule
 When patching, all existing tolerations are preserved (Kubernetes rejects
 patches that remove tolerations from running pods).  The pod is re-fetched
 immediately before patching to avoid working with a stale toleration list.
+
+The patch also stamps annotations on the pod:
+
+- `dsmlp/booking-reference` — `res-<id>` (reserved path), `ondemand-<id>`, or
+  `noshow-<id>`; the GPU **budget check** (`count_tolerated_gpu_usage`) counts
+  only sibling pods whose booking-reference matches, so each booking has an
+  independent budget.
+- `dsmlp/ondemand-block-id` — on-demand placements only; read back at startup
+  to reconstruct occupancy.
+- `dsmlp/pod-runtime-limit-seconds` — written by `set_active_deadline`
+  alongside the `activeDeadlineSeconds` spec patch.
 
 ### Runtime capping
 
@@ -153,6 +168,18 @@ these annotations; pods placed by a controller version that predates the
 annotation will not be counted, so the first restart after upgrading may
 briefly permit one extra placement per affected block.
 
+**No-show state does not survive restarts.**  `noshow_reservation_ids` is
+in-memory and never written back to the reservation API (the key is
+read-only).  After a restart, every mid-window user reservation — including
+ones previously declared no-show — receives a fresh
+`NOSHOWN_GRACE_MINUTES` deadline, so a late-arriving holder can reclaim
+their window across a restart.  Within a single controller lifetime the
+declaration is permanent.  Related: when a holder's pod is deleted
+mid-window (e.g. idle-culled), the reservation's deadline was already
+cleared, so the next refresh's `update_noshow_tracking` re-arms it with the
+grace timeout — this is what eventually converts vacated windows to
+on-demand capacity.
+
 ---
 
 ## Environment variables
@@ -188,4 +215,8 @@ The Dockerfile builds a minimal image:
 - Health check: `GET http://localhost:8000/health`
 - Entrypoint: `uvicorn app.main:app --host 0.0.0.0 --port 8000`
 
-See README.md for RBAC requirements and a sample Deployment manifest.
+A Helm chart at `helm/gpu-reservation-controller/` renders the
+ServiceAccount, ClusterRole/Binding, Deployment, and `/health` Service; keep
+its `values.yaml`/`deployment.yaml` env wiring in sync when adding settings
+to `config.py`.  See README.md for RBAC requirements and a sample manual
+Deployment manifest.

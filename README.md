@@ -30,8 +30,10 @@ system is designed to accommodate greater values in the future.)
 ```
 ┌──────────────────────────────────────────────────────┐
 │ 1. Reservation fetch (every RESERVATION_FETCH_INTERVAL s)
-│    GET /api/reservations?status=active&date_start=today
-│    GET /api/gpu-classes/{id}  → resolve label_value
+│    GET /api/reservations?status=active                │
+│        &date_start=today&date_end=today+LOOKAHEAD     │
+│        (paginated, 200/page)                          │
+│    GET /api/gpu-classes/{id}  → resolve label_value   │
 └──────────────────────────────────────────────────────┘
            │ updates in-memory reservation list
            ▼
@@ -54,9 +56,11 @@ system is designed to accommodate greater values in the future.)
 │    Handles pods queued before their window opened,   │
 │    and retries for pods that were over-budget:       │
 │      a. Count nvidia.com/gpu already in use by other │
-│         sibling pods that have the toleration        │
+│         sibling pods that hold the toleration for    │
+│         the same booking (matched via the            │
+│         dsmlp/booking-reference annotation)          │
 │      b. If pod_gpus + sibling_gpus ≤ reserved_gpus:  │
-│           PATCH pod → add toleration                 │
+│           PATCH pod → add toleration + annotations   │
 │           PATCH pod → set activeDeadlineSeconds      │
 │           Create RuntimeCapped Event on pod          │
 │      c. Otherwise: retry in 2–5 min                  │
@@ -96,7 +100,8 @@ capacity is available.
 - It has sufficient free GPU capacity for the pod's request.
 
 Among eligible blocks, the controller prefers the one whose window ends
-soonest (minimising the time a block sits partially filled).
+**latest** (maximising the pod's effective runtime before the block's
+`activeDeadlineSeconds` cap kicks in); ties are broken by most free capacity.
 
 **Safety interlock (guard 3)** — if any reservation-holder pod for a given
 GPU class is stuck in Pending (admitted but the scheduler cannot place it),
@@ -106,6 +111,13 @@ resolved.  Other GPU classes are unaffected.
 **No-show reclaim** — if a reservation holder fails to launch a pod within
 `NOSHOWN_TIMEOUT_MINUTES` of the window opening, that reservation is marked
 as a no-show and its capacity becomes available for on-demand candidates.
+If a holder's pod is later deleted mid-window (e.g. idle-culled), the next
+reservation refresh re-arms a fresh deadline of `NOSHOWN_GRACE_MINUTES`, so
+a vacated window is also reclaimed for on-demand use if the holder does not
+return.  No-show state is **in-memory only**: it is not written back to the
+reservation API, and a controller restart clears it — mid-window reservations
+then get a fresh `NOSHOWN_GRACE_MINUTES` deadline, so a late holder can
+reclaim their window across a restart.
 
 **Recycling** — when an on-demand pod terminates, the freed capacity is
 immediately offered to the next waiting candidate of the same GPU class
@@ -124,6 +136,17 @@ operator: Equal
 value:    <pod's gpu-class label value>   # e.g. "h100"
 effect:   NoSchedule
 ```
+
+### Annotations stamped on managed pods
+
+| Annotation | Written when | Purpose |
+|------------|--------------|---------|
+| `dsmlp/booking-reference` | toleration applied | Identifies the booking the pod was admitted under (`res-<id>`, `ondemand-<id>`, or `noshow-<id>`); used by the per-booking GPU budget count |
+| `dsmlp/ondemand-block-id` | on-demand placement | Block the pod occupies; read back at startup to reconstruct the occupancy map |
+| `dsmlp/pod-runtime-limit-seconds` | deadline set | Records the applied `activeDeadlineSeconds` value for operator visibility |
+
+(`dsmlp/minimum-runtime-seconds` is the one annotation **consumed** rather
+than written — see On-demand placement above.)
 
 ### Runtime capping
 
@@ -221,6 +244,24 @@ curl http://localhost:8000/health
 ---
 
 ## Kubernetes deployment
+
+### Helm (recommended)
+
+A chart at `helm/gpu-reservation-controller/` renders the ServiceAccount,
+ClusterRole/Binding, Deployment, and a Service for `/health`. The API-key
+Secret must exist beforehand (step 1 below); everything in steps 2–3 is
+covered by the chart:
+
+```bash
+helm install gpu-reservation-controller ./helm/gpu-reservation-controller \
+  --namespace gpu-system --create-namespace \
+  --set reservationApiUrl=https://gpures.example.edu \
+  --set config.timezone=America/Los_Angeles
+```
+
+See `helm/gpu-reservation-controller/values.yaml` for all options (fetch
+interval, lookahead, on-demand toggle, no-show timing, resources). The
+manual manifests below remain valid for non-Helm deployments.
 
 ### 1 — Create the API-key Secret
 
@@ -378,9 +419,14 @@ gpu-reservation-controller/
 │   ├── reservation_client.py httpx async client for the reservation API
 │   ├── k8s_client.py         Kubernetes client wrapper (watch, patch, count)
 │   └── controller.py         Shared state, queue, matching, window arithmetic
+├── tests/                    pytest suite (controller logic, guards, no-show, on-demand)
+├── helm/gpu-reservation-controller/  Helm chart (Deployment, RBAC, Service)
+├── docs/overview.md          Design & operations plan (stakeholder-facing)
 ├── requirements.txt
 ├── Dockerfile
 ├── RESERVATION-API.md        Reservation management API specification
+│                             (identical copy of API.md in gpu-reservation-app —
+│                             update both together)
 ├── CLAUDE.md                 Architecture reference for AI coding assistants
 ├── AGENTS.md                 Development standards for AI coding agents
 └── README.md                 This file

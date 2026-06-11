@@ -164,14 +164,20 @@ unused:
 
 -   **No-show.** If a reservation window opens and the holder has not
     launched a matching Pod within 15 minutes, the block is converted to
-    on-demand duty. The conversion is irrevocable --- the original
-    holder has forfeited that block for the remainder of the window,
-    which removes any ambiguity about late arrivals reclaiming a slot
-    already in use.
+    on-demand duty. The conversion is irrevocable for the remainder of
+    the window --- the original holder has forfeited that block, which
+    removes any ambiguity about late arrivals reclaiming a slot already
+    in use. (One operational caveat: the controller tracks this state in
+    memory only, so a controller restart re-opens a short grace window
+    --- 30 minutes by default --- during which a late holder could still
+    claim.)
 
 -   **Idle session.** If a holder's session is running but making no use
-    of its GPU, the existing idle-culling process terminates it, and the
-    remaining block is converted to on-demand in the same way.
+    of its GPU, the existing idle-culling process terminates it. The
+    controller notices the vacated window on its next reservation
+    refresh and re-arms a short claim deadline (30 minutes by default);
+    if the holder does not relaunch within it, the remaining block is
+    converted to on-demand in the same way.
 
 5.2 How on-demand Pods are placed (the guards)
 
@@ -187,11 +193,12 @@ on-demand block, all of the following must hold:
     a window shorter than that, so no one is handed a stub of a slot
     that is killed moments later.
 
-3.  **Safety interlock.** No reservation-holder Pod anywhere is Pending
-    for lack of node resources. A stuck reservation Pod should be rare
-    and is treated as an anomaly warranting human investigation; Splunk
-    alerting is configured to surface it, and on-demand placement is
-    held until it is understood.
+3.  **Safety interlock.** No reservation-holder Pod **for the same GPU
+    class** is Pending for lack of node resources; on-demand placement
+    for that class is held until the stuck Pod is resolved, while other
+    GPU classes continue unaffected. A stuck reservation Pod should be
+    rare and is treated as an anomaly warranting human investigation;
+    Splunk alerting is configured to surface it.
 
 5.3 Recycling and transparency
 
@@ -202,9 +209,11 @@ was temporarily serving on-demand --- the specific GPU or MIG instance,
 a portion of the node rather than the whole node --- returns to handling
 reservations; the node itself stays in the reserved pool throughout.
 Because interactive sessions rarely end on their own, idle-culling is
-the main driver of this recycling, not natural completion. Waiting
-on-demand users are shown their position in the queue through events
-surfaced in JupyterHub and on the shell login node.
+the main driver of this recycling, not natural completion. Showing
+waiting on-demand users their position in the queue --- through events
+surfaced in JupyterHub and on the shell login node --- is planned but
+not yet implemented; today the controller emits events only when it
+caps a session's runtime.
 
 6\. Fairness and the student experience
 
@@ -226,8 +235,9 @@ reservations without full administrative access.
 -   **Anomaly alerting.** Splunk alerts fire on stuck reservation-holder
     Pods, which also gate on-demand placement (Section 5.2).
 
--   **Queue visibility.** On-demand queue position is emitted as events
-    visible in JupyterHub and on the login node.
+-   **Queue visibility (planned).** On-demand queue position will be
+    emitted as events visible in JupyterHub and on the login node; not
+    yet implemented in the controller.
 
 -   **Per-student namespaces.** JupyterHub (via KubeSpawner) places each
     student in their own Kubernetes namespace, which the controller

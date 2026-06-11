@@ -42,6 +42,14 @@ config:
   # Enable on-demand pod placement (set to false to disable).
   ondemandPlacementEnabled: true
 
+  # Minutes after a reservation window opens before the holder is declared a
+  # no-show and the block is opened to on-demand pods.
+  noshownTimeoutMinutes: 15
+
+  # Grace period (minutes) after controller startup before no-shows are
+  # declared for windows already in progress.
+  noshownGraceMinutes: 30
+
   # IANA timezone for reservation window arithmetic.
   # Leave empty to use the container's system default.
   # Example: America/Los_Angeles

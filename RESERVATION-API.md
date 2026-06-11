@@ -40,9 +40,12 @@ Service keys are **scoped** (never admin-equivalent). Each key has a `scope` of
 - **`read_write`** keys may additionally call the write endpoints (create user,
   manage group membership).
 
-Neither scope grants administrator privileges. Admin-only surfaces (GPU classes,
-timeslot plans, site settings, email settings, key management) are unreachable
-by any service key.
+Neither scope grants administrator privileges. Admin-only **write** surfaces
+(creating or modifying GPU classes, timeslot plans, site settings, email
+settings, key management) are unreachable by any service key. Read access to
+GPU classes (`GET /api/gpu-classes`, `GET /api/gpu-classes/{class_id}`) is
+available to both scopes — the Kubernetes controller uses it to resolve
+node-label values (§4).
 
 Keys are separate from user accounts, do not expire, but can be revoked
 instantly (§3).
@@ -297,10 +300,43 @@ slot_end   = 720 + 240     = 960 min  →  2026-09-01 16:00
 ### Kubernetes node targeting
 
 `gpu_class.name` names the hardware tier.  Each GPU class may also carry a
-`label_value` field (see [GpuClassBrief](#gpuclassbriefextended) note) — this
-is the Kubernetes node-label value for the tier (e.g. `h100`, `a100-80gb`).
-Retrieve it with `GET /api/gpu-classes/{id}` if needed; it is not embedded in
-reservation responses.
+`label_value` field — the Kubernetes node-label value for the tier (e.g.
+`h100`, `a100-80gb`).  It is not embedded in reservation responses; retrieve
+it with the endpoint below.
+
+### `GET /api/gpu-classes/{class_id}`
+
+Fetch a single GPU class, including its `label_value`.  Accessible with
+either service-key scope.
+
+**Path parameter:** `class_id` — integer (from `reservation.gpu_class_id`)
+
+**Response** `200`
+
+```json
+{
+  "id": 1,
+  "name": "H100",
+  "description": "NVIDIA H100 80 GB SXM5",
+  "total_gpus": 8,
+  "label_value": "h100",
+  "is_active": true,
+  "created_at": "2026-01-15T09:00:00"
+}
+```
+
+`label_value` is `null` when the class has no Kubernetes mapping; the
+controller skips reservations for such classes.
+
+**Errors**
+
+| Code | Condition |
+|------|-----------|
+| 404 | GPU class not found |
+
+`GET /api/gpu-classes` (the full list) is service-key accessible as well.
+All gpu-class **write** endpoints (`POST`/`PUT`/`DELETE` and the
+`/overrides` sub-resource) require an admin JWT.
 
 ---
 
@@ -330,8 +366,10 @@ Create a new user account.
 |-------|------|----------|-------------|-------------|
 | `username` | string | yes | 3–64 chars, unique | Login name |
 | `email` | string | yes | unique | Email address |
-| `password` | string | yes | min 8 chars | Initial password (Argon2id-hashed) |
-| `is_admin` | boolean | no | default `false` | Administrator flag |
+| `password` | string | only for local accounts | min 8 chars | Initial password (Argon2id-hashed). Required when `auth_provider` is `"local"`; **must be omitted** for any other provider. |
+| `is_admin` | boolean | no | default `false` | Administrator flag. **Service keys may not set this** — a key sending `is_admin: true` receives 403. |
+| `auth_provider` | string | no | default `"local"` | `"local"` or `"jupyterhub"`. Use `"jupyterhub"` when pre-provisioning accounts that will log in via OAuth. |
+| `external_id` | string | no | unique | External identity (e.g. the JupyterHub username). Set it for non-local accounts so the OAuth callback matches the pre-created row. |
 
 **Response** `201` — [UserResponse](#userresponse)
 
@@ -341,6 +379,8 @@ Create a new user account.
 |------|-----------|
 | 400 | `username` already exists |
 | 400 | `email` already registered |
+| 400 | `external_id` already registered |
+| 403 | Service key attempted to create an admin user |
 
 **Sync pattern:** query `GET /api/users` first and index by `username` or
 `email` to avoid duplicate-creation errors.
@@ -359,9 +399,13 @@ fields are left unchanged.
 | Field | Type | Description |
 |-------|------|-------------|
 | `email` | string | New email address (must be unique) |
-| `password` | string (min 8 chars) | New password |
-| `is_admin` | boolean | Grant or revoke admin flag |
+| `password` | string (min 8 chars) | New password. **Human callers only** — a service key sending this field receives 403. |
+| `is_admin` | boolean | Grant or revoke admin flag. **Admin JWT only** — a service key sending this field receives 403. |
 | `is_active` | boolean | Reactivate (`true`) or deactivate (`false`) a user |
+
+For a service-key caller (the roster-sync case) the usable fields are
+therefore `email` and `is_active` — a leaked key must not be able to take
+over an account by resetting its password or promoting it to admin.
 
 **Response** `200` — [UserResponse](#userresponse)
 
@@ -370,6 +414,8 @@ fields are left unchanged.
 | Code | Condition |
 |------|-----------|
 | 400 | New email already in use by another account |
+| 400 | Change would demote/deactivate the last active administrator |
+| 403 | Service key attempted to set `password` or `is_admin` |
 | 404 | User not found |
 
 **Deactivation note:** prefer `DELETE /api/users/{user_id}` for departing
@@ -543,12 +589,14 @@ both new additions and role corrections without a separate `PATCH` call.
 
 ```json
 {
-  "id":         7,
-  "username":   "jsmith",
-  "email":      "jsmith@example.edu",
-  "is_admin":   false,
-  "is_active":  true,
-  "created_at": "2026-01-15T09:00:00"
+  "id":            7,
+  "username":      "jsmith",
+  "email":         "jsmith@example.edu",
+  "is_admin":      false,
+  "is_active":     true,
+  "auth_provider": "local",
+  "external_id":   null,
+  "created_at":    "2026-01-15T09:00:00"
 }
 ```
 
@@ -559,6 +607,8 @@ both new additions and role corrections without a separate `PATCH` call.
 | `email` | string | Unique |
 | `is_admin` | boolean | |
 | `is_active` | boolean | `false` = soft-deleted |
+| `auth_provider` | string | `"local"` or `"jupyterhub"` |
+| `external_id` | string \| null | External identity (JupyterHub username) for OAuth accounts |
 | `created_at` | datetime | UTC |
 
 ---
@@ -576,6 +626,8 @@ both new additions and role corrections without a separate `PATCH` call.
   "max_days_ahead": 14,
   "max_reservations_per_user": null,
   "max_reservations_total": null,
+  "max_reservation_hours": null,
+  "sync_with_sicad": false,
   "is_active": true,
   "created_at": "2026-06-01T10:00:00",
   "members": [
@@ -597,6 +649,8 @@ both new additions and role corrections without a separate `PATCH` call.
 | `max_days_ahead` | integer \| null | Members cannot book more than N days out (ignored for admins and group managers) |
 | `max_reservations_per_user` | integer \| null | Per-user simultaneous cap |
 | `max_reservations_total` | integer \| null | Group-wide simultaneous cap |
+| `max_reservation_hours` | number \| null | Per-member cap on total *open* reservation hours (ignored for admins and group managers) |
+| `sync_with_sicad` | boolean | When `true`, the app's built-in SICAD roster sync keeps this group's membership in sync with the course roster (add-only) |
 | `is_active` | boolean | Inactive groups cannot accept new reservations |
 | `created_at` | datetime | UTC |
 | `members` | array of [GroupMemberBrief](#groupmemberbrief) | |
