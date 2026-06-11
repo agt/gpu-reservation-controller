@@ -9,7 +9,7 @@ No Kubernetes or HTTP calls are made.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from app.controller import ControllerState, slot_start
 from app.schemas import GpuClassBrief, PolicyBrief, ReservationResponse, UserBrief
@@ -19,9 +19,23 @@ GPU_CLASS_ID = 10
 GPU_CLASS_LABEL = "h100"
 FIXED_DATE = date(2024, 1, 15)
 USERNAME = "alice"
-NOW = datetime(2024, 1, 15, 9, 0)  # 1 h into res #1's 08:00–10:00 window
+NOW = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)  # 1 h into res #1's 08:00–10:00 UTC window
 TIMEOUT = 15
 GRACE = 30
+
+
+def _compute_window(
+    date_val: date,
+    start_time: str,
+    slot_index: int,
+    duration_minutes: int,
+) -> tuple[datetime, datetime]:
+    """Return (start_utc, end_utc) from policy fields, tagged as UTC."""
+    parts = start_time.split(":")
+    minutes = int(parts[0]) * 60 + int(parts[1]) + slot_index * duration_minutes
+    midnight = datetime.combine(date_val, datetime.min.time()).replace(tzinfo=timezone.utc)
+    start = midnight + timedelta(minutes=minutes)
+    return start, start + timedelta(minutes=duration_minutes)
 
 
 def _user_reservation(
@@ -32,6 +46,7 @@ def _user_reservation(
     slot_index: int = 0,
     duration_minutes: int = 120,
 ) -> ReservationResponse:
+    start_utc, end_utc = _compute_window(FIXED_DATE, "08:00:00", slot_index, duration_minutes)
     return ReservationResponse(
         id=res_id,
         user_id=1,
@@ -50,6 +65,8 @@ def _user_reservation(
             repeat_count=1,
         ),
         date=FIXED_DATE,
+        start_utc=start_utc,
+        end_utc=end_utc,
         gpu_count=gpu_count,
         status="active",
         kind="user",
@@ -65,18 +82,26 @@ def _ondemand_reservation(res_id: int, slot_index: int = 0) -> ReservationRespon
 
 
 def _open_chain_pair() -> tuple[ReservationResponse, ReservationResponse]:
-    """Two back-to-back user reservations whose chain is active at wall-clock now.
+    """Two back-to-back user reservations whose chain is active at wall-clock now (UTC).
 
     res #1 spans [now-30m, now+30m]; res #2 (slot_index=1) spans [now+30m,
     now+90m].  Used where the code under test computes the chain against
-    ``datetime.now()`` (e.g. mark_pod_seen_for_noshow), which would filter out
-    past-dated fixtures.
+    ``datetime.now(timezone.utc)`` (e.g. mark_pod_seen_for_noshow), which would
+    filter out past-dated fixtures.
     """
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     start = now - timedelta(minutes=30)
     start_time = f"{start.hour:02d}:{start.minute:02d}:00"
+    slot_duration = 60
+
+    # Compute start_utc/end_utc from the policy fields the same way _compute_window does.
+    parts = start_time.split(":")
+    base_minutes = int(parts[0]) * 60 + int(parts[1])
+    midnight = datetime.combine(start.date(), datetime.min.time()).replace(tzinfo=timezone.utc)
 
     def _res(res_id: int, slot_index: int) -> ReservationResponse:
+        s_utc = midnight + timedelta(minutes=base_minutes + slot_index * slot_duration)
+        e_utc = s_utc + timedelta(minutes=slot_duration)
         return ReservationResponse(
             id=res_id,
             user_id=1,
@@ -91,10 +116,12 @@ def _open_chain_pair() -> tuple[ReservationResponse, ReservationResponse]:
                 id=1,
                 name="Test policy",
                 start_time=start_time,
-                duration_minutes=60,
+                duration_minutes=slot_duration,
                 repeat_count=1,
             ),
             date=start.date(),
+            start_utc=s_utc,
+            end_utc=e_utc,
             gpu_count=2,
             status="active",
             kind="user",
@@ -137,8 +164,8 @@ class TestRefreshClaimedReservations:
             _user_reservation(1, slot_index=0),
             _user_reservation(2, slot_index=1),
         )
-        state.noshow_deadlines[1] = datetime(2099, 1, 1)
-        state.noshow_deadlines[2] = datetime(2099, 1, 1)
+        state.noshow_deadlines[1] = datetime(2099, 1, 1, tzinfo=timezone.utc)
+        state.noshow_deadlines[2] = datetime(2099, 1, 1, tzinfo=timezone.utc)
         state.refresh_claimed_reservations([1], NOW)
         assert 1 not in state.noshow_deadlines
         assert 2 not in state.noshow_deadlines  # chained window also cleared
@@ -163,7 +190,7 @@ class TestRefreshClaimedReservations:
 class TestCheckNoshowDeadlinesRespectsClaimed:
     def test_claimed_not_declared_even_if_expired(self):
         state = _state(_user_reservation(1))
-        state.noshow_deadlines[1] = datetime(2024, 1, 1)  # long expired
+        state.noshow_deadlines[1] = datetime(2024, 1, 1, tzinfo=timezone.utc)  # long expired
         state.claimed_reservation_ids = {1}
         state.check_noshow_deadlines(NOW)
         assert 1 not in state.noshow_reservation_ids
@@ -171,7 +198,7 @@ class TestCheckNoshowDeadlinesRespectsClaimed:
 
     def test_unclaimed_expired_still_declared(self):
         state = _state(_user_reservation(1))
-        state.noshow_deadlines[1] = datetime(2024, 1, 1)
+        state.noshow_deadlines[1] = datetime(2024, 1, 1, tzinfo=timezone.utc)
         state.check_noshow_deadlines(NOW)
         assert 1 in state.noshow_reservation_ids
 
@@ -226,19 +253,19 @@ class TestFindOndemandBlockExcludesClaimed:
 
 class TestMarkPodSeenChainAware:
     def test_holder_clears_full_chain(self):
-        # mark_pod_seen_for_noshow walks the chain against wall-clock now, so use
-        # a pair whose windows are open now.
+        # mark_pod_seen_for_noshow walks the chain against wall-clock now (UTC),
+        # so use a pair whose windows are open now.
         r1, r2 = _open_chain_pair()
         state = _state(r1, r2)
-        state.noshow_deadlines[1] = datetime(2099, 1, 1)
-        state.noshow_deadlines[2] = datetime(2099, 1, 1)
+        state.noshow_deadlines[1] = datetime(2099, 1, 1, tzinfo=timezone.utc)
+        state.noshow_deadlines[2] = datetime(2099, 1, 1, tzinfo=timezone.utc)
         state.mark_pod_seen_for_noshow(USERNAME, GPU_CLASS_LABEL, booking_reservation_id=1)
         assert 1 not in state.noshow_deadlines
         assert 2 not in state.noshow_deadlines
 
     def test_ondemand_booking_clears_nothing(self):
         state = _state(_ondemand_reservation(1))
-        state.noshow_deadlines[1] = datetime(2099, 1, 1)
+        state.noshow_deadlines[1] = datetime(2099, 1, 1, tzinfo=timezone.utc)
         state.mark_pod_seen_for_noshow(USERNAME, GPU_CLASS_LABEL, booking_reservation_id=1)
         assert 1 in state.noshow_deadlines  # squatter vouches for nothing
 
@@ -248,8 +275,8 @@ class TestMarkPodSeenChainAware:
             _user_reservation(1, slot_index=0),
             _user_reservation(2, slot_index=1),
         )
-        state.noshow_deadlines[1] = datetime(2099, 1, 1)
-        state.noshow_deadlines[2] = datetime(2099, 1, 2)
+        state.noshow_deadlines[1] = datetime(2099, 1, 1, tzinfo=timezone.utc)
+        state.noshow_deadlines[2] = datetime(2099, 1, 2, tzinfo=timezone.utc)
         state.mark_pod_seen_for_noshow(USERNAME, GPU_CLASS_LABEL)
         assert 1 not in state.noshow_deadlines  # soonest cleared
         assert 2 in state.noshow_deadlines
@@ -270,7 +297,7 @@ class TestChainedHolderBlocksNoshowConversion:
             _user_reservation(1, slot_index=0, gpu_count=2),
             _user_reservation(2, slot_index=1, gpu_count=2),
         )
-        state.noshow_deadlines[2] = datetime(2024, 1, 1)  # already past
+        state.noshow_deadlines[2] = datetime(2024, 1, 1, tzinfo=timezone.utc)  # already past
 
         # Per-tick refresh sees the live res-1 holder.
         state.refresh_claimed_reservations([1], NOW)
@@ -285,7 +312,7 @@ class TestChainedHolderBlocksNoshowConversion:
             _user_reservation(1, slot_index=0, gpu_count=2),
             _user_reservation(2, slot_index=1, gpu_count=2),
         )
-        state.noshow_deadlines[2] = datetime(2024, 1, 1)
+        state.noshow_deadlines[2] = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
         # Holder vanished — no holder ids this tick.
         state.refresh_claimed_reservations([], NOW)

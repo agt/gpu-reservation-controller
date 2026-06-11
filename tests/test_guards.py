@@ -219,7 +219,7 @@ def test_stuck_holder_gpu_classes_can_be_set():
 def _make_main_module_and_state(monkeypatch):
     """Import app.main with required env vars and return (main_module, state, block)."""
     import asyncio
-    from datetime import date, datetime
+    from datetime import date, datetime, timedelta, timezone
 
     monkeypatch.setenv("RESERVATION_API_URL", "http://localhost:9999")
     monkeypatch.setenv("RESERVATION_API_KEY", "test-key-guards")
@@ -227,6 +227,8 @@ def _make_main_module_and_state(monkeypatch):
     from app.controller import ControllerState
     from app.schemas import GpuClassBrief, PolicyBrief, ReservationResponse
 
+    today = date.today()
+    midnight = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
     state = ControllerState()
     block = ReservationResponse(
         id=99,
@@ -237,9 +239,11 @@ def _make_main_module_and_state(monkeypatch):
         slot_index=0,
         policy=PolicyBrief(id=1, name="p", start_time="00:00:00",
                            duration_minutes=1440, repeat_count=1),
-        date=date.today(),
+        date=today,
+        start_utc=midnight,
+        end_utc=midnight + timedelta(days=1),
         gpu_count=4, status="active", kind="ondemand",
-        created_at=datetime.now(), updated_at=datetime.now(),
+        created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
     )
     state.reservations = [block]
     state.gpu_class_labels = {1: "h100"}
@@ -249,7 +253,7 @@ def _make_main_module_and_state(monkeypatch):
 def test_guard3_blocks_matching_gpu_class(monkeypatch):
     """When the stuck set contains the candidate's class, placement is held."""
     import asyncio
-    from datetime import datetime
+    from datetime import datetime, timezone
     from app.controller import OnDemandCandidate
 
     main_module, state = _make_main_module_and_state(monkeypatch)
@@ -258,7 +262,7 @@ def test_guard3_blocks_matching_gpu_class(monkeypatch):
     candidate = OnDemandCandidate(
         pod_uid="uid-1", pod_name="pod-1", pod_namespace="ns-1",
         gpu_class_label="h100", gpu_requested=1, min_runtime_seconds=60,
-        pod_created_at=datetime.now(), next_attempt_at=datetime.now(),
+        pod_created_at=datetime.now(timezone.utc), next_attempt_at=datetime.now(timezone.utc),
     )
 
     called = []
@@ -278,13 +282,15 @@ def test_guard3_blocks_matching_gpu_class(monkeypatch):
 def test_guard3_does_not_block_other_gpu_class(monkeypatch):
     """When the stuck set contains h100, an a100 candidate is not blocked."""
     import asyncio
-    from datetime import date, datetime
+    from datetime import date, datetime, timedelta, timezone
     from app.controller import OnDemandCandidate
     from app.schemas import GpuClassBrief, PolicyBrief, ReservationResponse
 
     main_module, state = _make_main_module_and_state(monkeypatch)
 
     # Add an a100 on-demand block so find_ondemand_block can succeed.
+    today = date.today()
+    midnight = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
     a100_block = ReservationResponse(
         id=100,
         user_id=None, user=None, group_id=None, group=None,
@@ -293,9 +299,11 @@ def test_guard3_does_not_block_other_gpu_class(monkeypatch):
         policy_id=1, slot_index=0,
         policy=PolicyBrief(id=1, name="p", start_time="00:00:00",
                            duration_minutes=1440, repeat_count=1),
-        date=date.today(),
+        date=today,
+        start_utc=midnight,
+        end_utc=midnight + timedelta(days=1),
         gpu_count=4, status="active", kind="ondemand",
-        created_at=datetime.now(), updated_at=datetime.now(),
+        created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
     )
     state.reservations.append(a100_block)
     state.gpu_class_labels[2] = "a100"
@@ -306,7 +314,7 @@ def test_guard3_does_not_block_other_gpu_class(monkeypatch):
     candidate = OnDemandCandidate(
         pod_uid="uid-2", pod_name="pod-2", pod_namespace="ns-2",
         gpu_class_label="a100", gpu_requested=1, min_runtime_seconds=60,
-        pod_created_at=datetime.now(), next_attempt_at=datetime.now(),
+        pod_created_at=datetime.now(timezone.utc), next_attempt_at=datetime.now(timezone.utc),
     )
 
     # Guard 3 should NOT fire; the function will proceed to read_pod.

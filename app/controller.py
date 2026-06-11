@@ -6,7 +6,7 @@ This module owns the in-memory state shared by the three background loops:
                          on-demand candidates, on-demand occupancy map
 ``QueueEntry``         — one pod waiting for its reservation window (reserved path)
 ``OnDemandCandidate``  — one pod searching for an on-demand block (on-demand path)
-``slot_start / slot_end`` — reservation time-window arithmetic
+``slot_start / slot_end`` — UTC time-window accessors
 ``TOLERATION_KEY``     — the taint/toleration key used by the reservation system
 
 No Kubernetes or HTTP I/O is done here; those live in k8s_client.py and
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from .schemas import ReservationResponse
@@ -34,31 +34,14 @@ TOLERATION_KEY = "gpu-class-reservation"
 # ---------------------------------------------------------------------------
 
 
-def _time_to_minutes(time_str: str) -> int:
-    """Convert "HH:MM:SS" to total minutes from midnight."""
-    parts = time_str.split(":")
-    return int(parts[0]) * 60 + int(parts[1])
-
-
 def slot_start(r: ReservationResponse) -> datetime:
-    """Compute the (naive, local-time) start of *r*'s reserved window.
-
-    Formula from RESERVATION-API.md §4:
-        slot_start = policy.start_time + slot_index × policy.duration_minutes
-    """
-    midnight = datetime.combine(r.date, datetime.min.time())
-    offset = timedelta(
-        minutes=(
-            _time_to_minutes(r.policy.start_time)
-            + r.slot_index * r.policy.duration_minutes
-        )
-    )
-    return midnight + offset
+    """Return the UTC start of *r*'s reserved window."""
+    return r.start_utc
 
 
 def slot_end(r: ReservationResponse) -> datetime:
-    """Compute the (naive, local-time) end of *r*'s reserved window."""
-    return slot_start(r) + timedelta(minutes=r.policy.duration_minutes)
+    """Return the UTC end of *r*'s reserved window."""
+    return r.end_utc
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +345,7 @@ class ControllerState:
 
         Called each queue-processor tick, before ``check_noshow_deadlines``.
         """
-        now = now or datetime.now()
+        now = now or datetime.now(timezone.utc)
         claimed: set[int] = set()
         for rid in holder_reservation_ids:
             claimed |= self.reservations_claimed_by(rid, now)
@@ -386,7 +369,7 @@ class ControllerState:
 
         When multiple matches exist, return the one whose window starts soonest.
         """
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         candidates = [
             r
             for r in self.reservations
@@ -437,7 +420,7 @@ class ControllerState:
             gpu_class_label=gpu_class_label,
             gpu_requested=gpu_requested,
             reservation=reservation,
-            next_attempt_at=datetime.now(),
+            next_attempt_at=datetime.now(timezone.utc),
         )
         self.task_queue[pod_uid] = entry
         log.info(
@@ -551,7 +534,7 @@ class ControllerState:
         declared a no-show or lent out as on-demand capacity, closing the
         booked-id-vs-occupied-id gap.
         """
-        now = now or datetime.now()
+        now = now or datetime.now(timezone.utc)
         res = next((r for r in self.reservations if r.id == reservation_id), None)
         claimed = {reservation_id}
         if res is not None and res.kind == "user" and res.user is not None:
@@ -584,7 +567,7 @@ class ControllerState:
                     gpu_class_label=entry.gpu_class_label,
                     gpu_requested=entry.gpu_requested,
                     reservation=new_res,
-                    next_attempt_at=datetime.now(),
+                    next_attempt_at=datetime.now(timezone.utc),
                 )
                 log.info(
                     "Pod %s/%s re-queued: reservation #%d cancelled, "
@@ -639,7 +622,7 @@ class ControllerState:
             gpu_requested=gpu_requested,
             min_runtime_seconds=min_runtime_seconds,
             pod_created_at=pod_created_at,
-            next_attempt_at=datetime.now(),
+            next_attempt_at=datetime.now(timezone.utc),
         )
         self.ondemand_candidates[pod_uid] = candidate
         log.info(

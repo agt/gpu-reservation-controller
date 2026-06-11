@@ -8,7 +8,7 @@ No Kubernetes or HTTP calls are made.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -22,8 +22,22 @@ GPU_CLASS_LABEL = "h100"
 OTHER_CLASS_ID = 20
 FIXED_DATE = date(2024, 1, 15)
 USERNAME = "alice"
-# 1 h into res #1's 08:00–10:00 window — used as the chain anchor "now".
-NOW = datetime(2024, 1, 15, 9, 0)
+# 1 h into res #1's 08:00–10:00 UTC window — used as the chain anchor "now".
+NOW = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)
+
+
+def _compute_window(
+    date_val: date,
+    start_time: str,
+    slot_index: int,
+    duration_minutes: int,
+) -> tuple[datetime, datetime]:
+    """Return (start_utc, end_utc) from policy fields, tagged as UTC."""
+    parts = start_time.split(":")
+    minutes = int(parts[0]) * 60 + int(parts[1]) + slot_index * duration_minutes
+    midnight = datetime.combine(date_val, datetime.min.time()).replace(tzinfo=timezone.utc)
+    start = midnight + timedelta(minutes=minutes)
+    return start, start + timedelta(minutes=duration_minutes)
 
 
 def _user_reservation(
@@ -37,6 +51,7 @@ def _user_reservation(
     duration_minutes: int = 120,
     reservation_date: date = FIXED_DATE,
 ) -> ReservationResponse:
+    start_utc, end_utc = _compute_window(reservation_date, start_time, slot_index, duration_minutes)
     return ReservationResponse(
         id=res_id,
         user_id=1,
@@ -55,6 +70,8 @@ def _user_reservation(
             repeat_count=1,
         ),
         date=reservation_date,
+        start_utc=start_utc,
+        end_utc=end_utc,
         gpu_count=gpu_count,
         status="active",
         kind="user",
@@ -109,15 +126,15 @@ class TestChainFor:
         assert state._chain_for(r1, NOW) == []
 
     def test_single_backtoback(self):
-        r1 = _user_reservation(1, slot_index=0)            # 08:00–10:00
-        r2 = _user_reservation(2, slot_index=1)            # 10:00–12:00
+        r1 = _user_reservation(1, slot_index=0)            # 08:00–10:00 UTC
+        r2 = _user_reservation(2, slot_index=1)            # 10:00–12:00 UTC
         state = _state(r1, r2)
         assert [r.id for r in state._chain_for(r1, NOW)] == [2]
 
     def test_multi_link_in_window_order(self):
-        r1 = _user_reservation(1, slot_index=0)            # 08:00–10:00
-        r2 = _user_reservation(2, slot_index=1)            # 10:00–12:00
-        r3 = _user_reservation(3, slot_index=2)            # 12:00–14:00
+        r1 = _user_reservation(1, slot_index=0)            # 08:00–10:00 UTC
+        r2 = _user_reservation(2, slot_index=1)            # 10:00–12:00 UTC
+        r3 = _user_reservation(3, slot_index=2)            # 12:00–14:00 UTC
         state = _state(r3, r1, r2)  # unsorted input
         assert [r.id for r in state._chain_for(r1, NOW)] == [2, 3]
 
@@ -190,7 +207,7 @@ class TestReservationsClaimedBy:
         assert state.reservations_claimed_by(1, NOW) == {1}
 
     def test_defaults_now_to_wall_clock(self):
-        # Far-future reservation so the default now() still sees it as active.
+        # Far-future reservation so the default now(utc) still sees it as active.
         future = date.today() + timedelta(days=3650)
         r1 = _user_reservation(1, slot_index=0, reservation_date=future)
         r2 = _user_reservation(2, slot_index=1, reservation_date=future)

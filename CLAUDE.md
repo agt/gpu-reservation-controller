@@ -132,9 +132,13 @@ addition to the existing pod permissions.
 
 ### Timezone
 
-All reservation window arithmetic uses **local system time** (naive `datetime`).
-Set the `TZ` environment variable on the controller pod to match the timezone
-the reservation server uses (coordinate with the cluster operator).
+All reservation window arithmetic uses **UTC-aware `datetime` objects** (`timezone.utc`).
+`slot_start` and `slot_end` return `r.start_utc` / `r.end_utc` directly from the API
+response; no local-time conversion is performed in the controller.  Every
+`datetime.now()` call in the codebase uses `datetime.now(timezone.utc)`.
+
+The `TZ` environment variable is no longer needed for correctness (it only affects
+log timestamp display).
 
 ### Fast path for mid-window pods
 
@@ -211,7 +215,7 @@ above applies.
 | `RESERVATION_LOOKAHEAD_DAYS` | `7` | Calendar days ahead to fetch reservations |
 | `KUBECONFIG` | *(absent = in-cluster)* | Path to kubeconfig file for out-of-cluster use |
 | `HEALTH_PORT` | `8000` | Port for `GET /health` |
-| `TZ` | system default | Timezone for reservation window arithmetic |
+| `TZ` | system default | Affects log timestamp display only; no longer required for window arithmetic |
 | `ONDEMAND_PLACEMENT_ENABLED` | `true` | Set to `false` to disable on-demand placement entirely |
 | `NOSHOWN_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
 | `NOSHOWN_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared |

@@ -6,7 +6,7 @@ No Kubernetes or HTTP calls are made.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -37,6 +37,20 @@ def _policy(duration_minutes: int = 120) -> PolicyBrief:
     )
 
 
+def _compute_window(
+    date_val: date,
+    start_time: str,
+    slot_index: int,
+    duration_minutes: int,
+) -> tuple[datetime, datetime]:
+    """Return (start_utc, end_utc) from policy fields, tagged as UTC."""
+    parts = start_time.split(":")
+    minutes = int(parts[0]) * 60 + int(parts[1]) + slot_index * duration_minutes
+    midnight = datetime.combine(date_val, datetime.min.time()).replace(tzinfo=timezone.utc)
+    start = midnight + timedelta(minutes=minutes)
+    return start, start + timedelta(minutes=duration_minutes)
+
+
 def _ondemand_block(
     block_id: int,
     gpu_count: int = 2,
@@ -44,10 +58,11 @@ def _ondemand_block(
     duration_minutes: int = 120,
     date_offset_days: int = 0,
 ) -> ReservationResponse:
-    """Return a kind='ondemand' reservation whose window is *today* at 08:00."""
+    """Return a kind='ondemand' reservation whose window is *today* at 08:00 UTC."""
     today = date.today() if date_offset_days == 0 else (
-        datetime.now() + timedelta(days=date_offset_days)
+        datetime.now(timezone.utc) + timedelta(days=date_offset_days)
     ).date()
+    start_utc, end_utc = _compute_window(today, "08:00:00", slot_index, duration_minutes)
     return ReservationResponse(
         id=block_id,
         user_id=None,
@@ -66,11 +81,13 @@ def _ondemand_block(
             repeat_count=1,
         ),
         date=today,
+        start_utc=start_utc,
+        end_utc=end_utc,
         gpu_count=gpu_count,
         status="active",
         kind="ondemand",
-        created_at=datetime.now(),
-        updated_at=datetime.now(),
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
     )
 
 
@@ -85,7 +102,7 @@ def _state_with_block(
 
 
 def _now_inside_block(block: ReservationResponse) -> datetime:
-    """Return a datetime 1 minute after the block's slot_start."""
+    """Return a UTC datetime 1 minute after the block's slot_start."""
     return slot_start(block) + timedelta(minutes=1)
 
 
@@ -94,14 +111,15 @@ def _currently_open_block(
     gpu_count: int = 2,
     duration_minutes: int = 120,
 ) -> ReservationResponse:
-    """Return an on-demand block whose window is open at the real current time.
+    """Return an on-demand block whose window is open at the real current UTC time.
 
     The window started 30 minutes ago and lasts *duration_minutes*, so it will
     not expire for at least (duration_minutes - 30) more minutes.
     """
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     start_dt = now - timedelta(minutes=30)
     start_time = f"{start_dt.hour:02d}:{start_dt.minute:02d}:00"
+    start_utc, end_utc = _compute_window(start_dt.date(), start_time, 0, duration_minutes)
     return ReservationResponse(
         id=block_id,
         user_id=None,
@@ -120,6 +138,8 @@ def _currently_open_block(
             repeat_count=1,
         ),
         date=start_dt.date(),
+        start_utc=start_utc,
+        end_utc=end_utc,
         gpu_count=gpu_count,
         status="active",
         kind="ondemand",
@@ -201,9 +221,11 @@ class TestFindOndemandBlock:
 
     def test_prefers_latest_slot_end(self):
         """When two blocks are available, pick the one that ends latest."""
-        # Block A: 2-hour window starting at 08:00 (slot_index=0)
+        # Block A: 2-hour window starting at 08:00 UTC (slot_index=0)
         block_a = _ondemand_block(1, duration_minutes=120, slot_index=0)
-        # Block B: same class, 4-hour window; use a later slot_index to push its end
+        # Block B: same class, 4-hour window; ends 2 hours after block_a
+        today = date.today()
+        b_start_utc, b_end_utc = _compute_window(today, "08:00:00", 0, 240)
         block_b_policy = PolicyBrief(
             id=2,
             name="Long policy",
@@ -211,7 +233,6 @@ class TestFindOndemandBlock:
             duration_minutes=240,
             repeat_count=1,
         )
-        today = date.today()
         block_b = ReservationResponse(
             id=2,
             user_id=None,
@@ -224,11 +245,13 @@ class TestFindOndemandBlock:
             slot_index=0,
             policy=block_b_policy,
             date=today,
+            start_utc=b_start_utc,
+            end_utc=b_end_utc,
             gpu_count=2,
             status="active",
             kind="ondemand",
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
         )
         state = ControllerState()
         state.reservations = [block_a, block_b]
@@ -353,7 +376,7 @@ class TestReconcileOccupancy:
 class TestCandidateManagement:
     def test_add_candidate(self):
         state = ControllerState()
-        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now())
+        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now(timezone.utc))
         assert "uid-1" in state.ondemand_candidates
         c = state.ondemand_candidates["uid-1"]
         assert c.gpu_class_label == "h100"
@@ -361,19 +384,19 @@ class TestCandidateManagement:
 
     def test_add_is_idempotent(self):
         state = ControllerState()
-        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now())
-        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now())
+        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now(timezone.utc))
+        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now(timezone.utc))
         assert len(state.ondemand_candidates) == 1
 
     def test_already_placed_pod_not_re_added(self):
         state = ControllerState()
         state.occupancy[42] = {"uid-1": 1}
-        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now())
+        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now(timezone.utc))
         assert "uid-1" not in state.ondemand_candidates
 
     def test_remove_candidate(self):
         state = ControllerState()
-        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now())
+        state.add_ondemand_candidate("uid-1", "pod-a", "ns-a", "h100", 1, 600, datetime.now(timezone.utc))
         state.remove_ondemand_candidate("uid-1")
         assert "uid-1" not in state.ondemand_candidates
 

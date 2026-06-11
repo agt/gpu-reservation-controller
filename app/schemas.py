@@ -45,7 +45,9 @@ class ReservationResponse(BaseModel):
     policy_id: int
     slot_index: int          # 0-based; see time-window formula in RESERVATION-API.md §4
     policy: PolicyBrief
-    date: date               # calendar date of the reservation
+    date: date               # calendar date of the reservation (local time, for display)
+    start_utc: datetime      # UTC slot start; use this for all time comparisons
+    end_utc: datetime        # UTC slot end; use this for activeDeadlineSeconds
     gpu_count: int           # number of GPUs reserved
     status: str              # "active" | "cancelled"
     kind: str                # "user" | "ondemand"

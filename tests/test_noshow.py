@@ -11,7 +11,7 @@ No Kubernetes or HTTP calls are made.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from app.controller import ControllerState, slot_end, slot_start
 from app.schemas import GpuClassBrief, PolicyBrief, ReservationResponse, UserBrief
@@ -25,11 +25,25 @@ GPU_CLASS_ID = 10
 GPU_CLASS_LABEL = "h100"
 OTHER_CLASS_ID = 20
 FIXED_DATE = date(2024, 1, 15)   # Past date; window timing controlled via explicit `now`
-FUTURE_DATE = date(2099, 6, 15)  # Far future; slot_end always > datetime.now()
+FUTURE_DATE = date(2099, 6, 15)  # Far future; slot_end always > datetime.now(utc)
 USERNAME = "alice"
 
 TIMEOUT = 15
 GRACE = 30
+
+
+def _compute_window(
+    date_val: date,
+    start_time: str,
+    slot_index: int,
+    duration_minutes: int,
+) -> tuple[datetime, datetime]:
+    """Return (start_utc, end_utc) from policy fields, tagged as UTC."""
+    parts = start_time.split(":")
+    minutes = int(parts[0]) * 60 + int(parts[1]) + slot_index * duration_minutes
+    midnight = datetime.combine(date_val, datetime.min.time()).replace(tzinfo=timezone.utc)
+    start = midnight + timedelta(minutes=minutes)
+    return start, start + timedelta(minutes=duration_minutes)
 
 
 def _user_reservation(
@@ -43,6 +57,7 @@ def _user_reservation(
     duration_minutes: int = 120,
     reservation_date: date = FIXED_DATE,
 ) -> ReservationResponse:
+    start_utc, end_utc = _compute_window(reservation_date, start_time, slot_index, duration_minutes)
     return ReservationResponse(
         id=res_id,
         user_id=1,
@@ -61,6 +76,8 @@ def _user_reservation(
             repeat_count=1,
         ),
         date=reservation_date,
+        start_utc=start_utc,
+        end_utc=end_utc,
         gpu_count=gpu_count,
         status="active",
         kind="user",
@@ -79,6 +96,7 @@ def _ondemand_reservation(
     duration_minutes: int = 120,
     reservation_date: date = FIXED_DATE,
 ) -> ReservationResponse:
+    start_utc, end_utc = _compute_window(reservation_date, start_time, slot_index, duration_minutes)
     return ReservationResponse(
         id=res_id,
         user_id=None,
@@ -97,6 +115,8 @@ def _ondemand_reservation(
             repeat_count=1,
         ),
         date=reservation_date,
+        start_utc=start_utc,
+        end_utc=end_utc,
         gpu_count=gpu_count,
         status="active",
         kind="ondemand",
@@ -114,9 +134,8 @@ def _state(*reservations: ReservationResponse) -> ControllerState:
 
 def _window_start_dt(start_time: str = "08:00:00", reservation_date: date = FIXED_DATE) -> datetime:
     h, m, _ = start_time.split(":")
-    return datetime.combine(reservation_date, datetime.min.time()) + timedelta(
-        hours=int(h), minutes=int(m)
-    )
+    midnight = datetime.combine(reservation_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+    return midnight + timedelta(hours=int(h), minutes=int(m))
 
 
 def _window_open_now(
@@ -124,7 +143,7 @@ def _window_open_now(
     duration_minutes: int = 120,
     reservation_date: date = FIXED_DATE,
 ) -> datetime:
-    """Return a datetime that falls inside the given window (at the midpoint)."""
+    """Return a UTC datetime that falls inside the given window (at the midpoint)."""
     return _window_start_dt(start_time, reservation_date) + timedelta(
         minutes=duration_minutes // 2
     )
@@ -139,13 +158,13 @@ class TestInitializeNoshowTracking:
     def test_future_reservation_deadline_is_slot_start_plus_timeout(self):
         r = _user_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
-        now = datetime(2024, 1, 1, 0, 0)
+        now = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
         state.initialize_noshow_tracking(now, TIMEOUT, GRACE)
         assert state.noshow_deadlines[1] == slot_start(r) + timedelta(minutes=TIMEOUT)
 
     def test_midwindow_deadline_is_now_plus_grace(self):
-        r = _user_reservation(1)  # window: FIXED_DATE 08:00–10:00
-        now = _window_open_now()   # 09:00 — inside the window
+        r = _user_reservation(1)  # window: FIXED_DATE 08:00–10:00 UTC
+        now = _window_open_now()   # 09:00 UTC — inside the window
         state = _state(r)
         state.initialize_noshow_tracking(now, TIMEOUT, GRACE)
         assert state.noshow_deadlines[1] == now + timedelta(minutes=GRACE)
@@ -160,7 +179,7 @@ class TestInitializeNoshowTracking:
     def test_ondemand_reservation_not_tracked(self):
         r = _ondemand_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
-        now = datetime(2024, 1, 1, 0, 0)
+        now = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
         state.initialize_noshow_tracking(now, TIMEOUT, GRACE)
         assert 1 not in state.noshow_deadlines
 
@@ -170,7 +189,7 @@ class TestInitializeNoshowTracking:
         state.reservations[0] = ReservationResponse(
             **{**r.model_dump(), "user": None, "user_id": None}
         )
-        now = datetime(2024, 1, 1, 0, 0)
+        now = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
         state.initialize_noshow_tracking(now, TIMEOUT, GRACE)
         assert 1 not in state.noshow_deadlines
 
@@ -178,7 +197,7 @@ class TestInitializeNoshowTracking:
         r1 = _user_reservation(1, reservation_date=FUTURE_DATE, slot_index=0)
         r2 = _user_reservation(2, reservation_date=FUTURE_DATE, slot_index=1)
         state = _state(r1, r2)
-        now = datetime(2024, 1, 1, 0, 0)
+        now = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
         state.initialize_noshow_tracking(now, TIMEOUT, GRACE)
         assert 1 in state.noshow_deadlines
         assert 2 in state.noshow_deadlines
@@ -186,9 +205,9 @@ class TestInitializeNoshowTracking:
     def test_does_not_overwrite_existing_deadline(self):
         r = _user_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
-        sentinel = datetime(2099, 1, 1)
+        sentinel = datetime(2099, 1, 1, tzinfo=timezone.utc)
         state.noshow_deadlines[1] = sentinel
-        now = datetime(2024, 1, 1, 0, 0)
+        now = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
         state.initialize_noshow_tracking(now, TIMEOUT, GRACE)
         assert state.noshow_deadlines[1] == sentinel
 
@@ -202,16 +221,16 @@ class TestUpdateNoshowTracking:
     def test_new_reservation_gets_deadline(self):
         r = _user_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
-        now = datetime(2024, 1, 1, 0, 0)
+        now = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
         state.update_noshow_tracking(now, TIMEOUT, GRACE)
         assert 1 in state.noshow_deadlines
 
     def test_existing_deadline_not_overwritten(self):
         r = _user_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
-        sentinel = datetime(2099, 1, 1)
+        sentinel = datetime(2099, 1, 1, tzinfo=timezone.utc)
         state.noshow_deadlines[1] = sentinel
-        now = datetime(2024, 1, 1, 0, 0)
+        now = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
         state.update_noshow_tracking(now, TIMEOUT, GRACE)
         assert state.noshow_deadlines[1] == sentinel
 
@@ -219,7 +238,7 @@ class TestUpdateNoshowTracking:
         r = _user_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
         state.noshow_reservation_ids.add(1)
-        now = datetime(2024, 1, 1, 0, 0)
+        now = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
         state.update_noshow_tracking(now, TIMEOUT, GRACE)
         assert 1 not in state.noshow_deadlines
 
@@ -246,7 +265,7 @@ class TestUpdateNoshowTracking:
 class TestReconcileNoshow:
     def test_deadline_pruned_for_missing_reservation(self):
         state = _state()
-        state.noshow_deadlines[99] = datetime(2099, 1, 1)
+        state.noshow_deadlines[99] = datetime(2099, 1, 1, tzinfo=timezone.utc)
         state.reconcile_noshow()
         assert 99 not in state.noshow_deadlines
 
@@ -259,7 +278,7 @@ class TestReconcileNoshow:
     def test_active_reservation_deadline_preserved(self):
         r = _user_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
-        deadline = datetime(2099, 6, 1)
+        deadline = datetime(2099, 6, 1, tzinfo=timezone.utc)
         state.noshow_deadlines[1] = deadline
         state.reconcile_noshow()
         assert state.noshow_deadlines[1] == deadline
@@ -281,7 +300,7 @@ class TestCheckNoshowDeadlines:
     def test_expired_deadline_moves_to_noshow_ids(self):
         r = _user_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
-        deadline = datetime(2024, 6, 1, 9, 0)
+        deadline = datetime(2024, 6, 1, 9, 0, tzinfo=timezone.utc)
         state.noshow_deadlines[1] = deadline
         state.check_noshow_deadlines(deadline + timedelta(seconds=1))
         assert 1 in state.noshow_reservation_ids
@@ -290,7 +309,7 @@ class TestCheckNoshowDeadlines:
     def test_future_deadline_not_moved(self):
         r = _user_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
-        deadline = datetime(2099, 6, 1, 9, 0)
+        deadline = datetime(2099, 6, 1, 9, 0, tzinfo=timezone.utc)
         state.noshow_deadlines[1] = deadline
         state.check_noshow_deadlines(deadline - timedelta(seconds=1))
         assert 1 not in state.noshow_reservation_ids
@@ -299,7 +318,7 @@ class TestCheckNoshowDeadlines:
     def test_exactly_at_deadline_is_noshow(self):
         r = _user_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
-        deadline = datetime(2024, 6, 1, 9, 0)
+        deadline = datetime(2024, 6, 1, 9, 0, tzinfo=timezone.utc)
         state.noshow_deadlines[1] = deadline
         state.check_noshow_deadlines(deadline)
         assert 1 in state.noshow_reservation_ids
@@ -309,9 +328,9 @@ class TestCheckNoshowDeadlines:
         r1 = _user_reservation(1, reservation_date=FUTURE_DATE, slot_index=0)
         r2 = _user_reservation(2, reservation_date=FUTURE_DATE, slot_index=1)
         state = _state(r1, r2)
-        now = datetime(2024, 6, 1, 9, 30)
-        state.noshow_deadlines[1] = datetime(2024, 6, 1, 9, 0)   # expired
-        state.noshow_deadlines[2] = datetime(2024, 6, 1, 10, 0)  # future
+        now = datetime(2024, 6, 1, 9, 30, tzinfo=timezone.utc)
+        state.noshow_deadlines[1] = datetime(2024, 6, 1, 9, 0, tzinfo=timezone.utc)   # expired
+        state.noshow_deadlines[2] = datetime(2024, 6, 1, 10, 0, tzinfo=timezone.utc)  # future
         state.check_noshow_deadlines(now)
         assert 1 in state.noshow_reservation_ids
         assert 2 not in state.noshow_reservation_ids
@@ -319,7 +338,7 @@ class TestCheckNoshowDeadlines:
 
     def test_empty_deadlines_is_noop(self):
         state = _state()
-        state.check_noshow_deadlines(datetime.now())  # must not raise
+        state.check_noshow_deadlines(datetime.now(timezone.utc))  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -331,14 +350,14 @@ class TestMarkPodSeenForNoshow:
     def test_clears_deadline_for_matching_reservation(self):
         r = _user_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
-        state.noshow_deadlines[1] = datetime(2099, 1, 1)
+        state.noshow_deadlines[1] = datetime(2099, 1, 1, tzinfo=timezone.utc)
         state.mark_pod_seen_for_noshow(USERNAME, GPU_CLASS_LABEL)
         assert 1 not in state.noshow_deadlines
 
     def test_wrong_namespace_leaves_deadline(self):
         r = _user_reservation(1, username="bob", reservation_date=FUTURE_DATE)
         state = _state(r)
-        state.noshow_deadlines[1] = datetime(2099, 1, 1)
+        state.noshow_deadlines[1] = datetime(2099, 1, 1, tzinfo=timezone.utc)
         state.mark_pod_seen_for_noshow("alice", GPU_CLASS_LABEL)
         assert 1 in state.noshow_deadlines
 
@@ -346,7 +365,7 @@ class TestMarkPodSeenForNoshow:
         r = _user_reservation(1, gpu_class_id=OTHER_CLASS_ID, reservation_date=FUTURE_DATE)
         state = _state(r)
         state.gpu_class_labels[OTHER_CLASS_ID] = "a100"
-        state.noshow_deadlines[1] = datetime(2099, 1, 1)
+        state.noshow_deadlines[1] = datetime(2099, 1, 1, tzinfo=timezone.utc)
         state.mark_pod_seen_for_noshow(USERNAME, GPU_CLASS_LABEL)
         assert 1 in state.noshow_deadlines
 
@@ -358,12 +377,12 @@ class TestMarkPodSeenForNoshow:
         assert 1 not in state.noshow_deadlines
 
     def test_picks_soonest_slot_start_when_multiple(self):
-        # r1 slot_index=0 → 08:00, r2 slot_index=1 → 10:00
+        # r1 slot_index=0 → 08:00 UTC, r2 slot_index=1 → 10:00 UTC
         r1 = _user_reservation(1, reservation_date=FUTURE_DATE, slot_index=0)
         r2 = _user_reservation(2, reservation_date=FUTURE_DATE, slot_index=1)
         state = _state(r1, r2)
-        state.noshow_deadlines[1] = datetime(2099, 1, 1)
-        state.noshow_deadlines[2] = datetime(2099, 1, 2)
+        state.noshow_deadlines[1] = datetime(2099, 1, 1, tzinfo=timezone.utc)
+        state.noshow_deadlines[2] = datetime(2099, 1, 2, tzinfo=timezone.utc)
         state.mark_pod_seen_for_noshow(USERNAME, GPU_CLASS_LABEL)
         assert 1 not in state.noshow_deadlines  # soonest cleared
         assert 2 in state.noshow_deadlines       # later one untouched
@@ -382,14 +401,14 @@ class TestEnqueuePodClearsDeadline:
     def test_enqueue_clears_noshow_deadline(self):
         r = _user_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
-        state.noshow_deadlines[1] = datetime(2099, 1, 1)
+        state.noshow_deadlines[1] = datetime(2099, 1, 1, tzinfo=timezone.utc)
         state.enqueue_pod("uid-1", "pod-1", USERNAME, GPU_CLASS_LABEL, 1)
         assert 1 not in state.noshow_deadlines
 
     def test_enqueue_no_match_leaves_deadlines_unchanged(self):
         r = _user_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
-        state.noshow_deadlines[1] = datetime(2099, 1, 1)
+        state.noshow_deadlines[1] = datetime(2099, 1, 1, tzinfo=timezone.utc)
         # Wrong namespace — find_best_reservation returns None
         state.enqueue_pod("uid-1", "pod-1", "nobody", GPU_CLASS_LABEL, 1)
         assert 1 in state.noshow_deadlines
@@ -466,14 +485,14 @@ class TestFindOndemandBlockIncludesNoshow:
     def test_prefers_latest_slot_end(self):
         # noshow:   09:00–12:00 (start=09:00, dur=180) — ends later
         # ondemand: 08:00–10:00 (start=08:00, dur=120) — ends sooner
-        # Both are open at 09:30
+        # Both are open at 09:30 UTC
         r_noshow = _user_reservation(
             1, slot_index=0, start_time="09:00:00", duration_minutes=180
         )
         r_ondemand = _ondemand_reservation(
             2, slot_index=0, start_time="08:00:00", duration_minutes=120
         )
-        now = _window_start_dt("09:00:00") + timedelta(minutes=30)  # 09:30
+        now = _window_start_dt("09:00:00") + timedelta(minutes=30)  # 09:30 UTC
         state = _state(r_noshow, r_ondemand)
         state.noshow_reservation_ids.add(1)
         result = state.find_ondemand_block(GPU_CLASS_LABEL, now, 1, 1)
@@ -513,7 +532,7 @@ class TestReconcileOccupancyNoshow:
 
 class TestComputeMaxDeadlineSkipsNoshow:
     def test_noshow_back_to_back_not_chained(self):
-        # r1: 08:00–10:00, r2: 10:00–12:00 (directly back-to-back)
+        # r1: 08:00–10:00 UTC, r2: 10:00–12:00 UTC (directly back-to-back)
         r1 = _user_reservation(1, slot_index=0, duration_minutes=120, reservation_date=FUTURE_DATE)
         r2 = _user_reservation(2, slot_index=1, duration_minutes=120, reservation_date=FUTURE_DATE)
         state = _state(r1, r2)
