@@ -48,7 +48,9 @@ from .k8s_client import (
     get_pod_phase,
     init_k8s,
     is_gpu_only_pending,
+    list_reservation_holder_pods,
     list_stuck_reservation_holder_pods,
+    parse_booking_reference,
     pod_has_toleration,
     read_pod,
     set_active_deadline,
@@ -480,7 +482,10 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                 # Pod already admitted — remove from whichever queue it may be in.
                 state.dequeue_pod(uid)
                 state.remove_ondemand_candidate(uid)
-                state.mark_pod_seen_for_noshow(namespace, gpu_class_label)
+                # A reserved-path holder vouches for every window its chained
+                # session spans; pass its booking id so all are cleared at once.
+                booking_id = parse_booking_reference(get_pod_booking_reference(pod))
+                state.mark_pod_seen_for_noshow(namespace, gpu_class_label, booking_id)
                 # Reconstruct on-demand occupancy from the annotation stamped at
                 # placement time so that capacity accounting survives a restart.
                 block_id = get_pod_ondemand_block_id(pod)
@@ -574,6 +579,18 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
     while True:
         await asyncio.sleep(30)
         now = datetime.now()
+
+        # Refresh the claimed-reservation set from live holder pods *before*
+        # declaring any no-shows, so a reservation a holder is chained through is
+        # never converted to on-demand capacity while the holder is still running
+        # (closes the res-/noshow- double-count).  On failure, keep the previous
+        # set rather than dropping protection.
+        try:
+            holder_ids = await list_reservation_holder_pods(TOLERATION_KEY)
+            state.refresh_claimed_reservations(holder_ids, now)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to refresh claimed reservations: %s", exc)
+
         state.check_noshow_deadlines(now)
 
         # Guard 3: refresh safety interlock once per tick.

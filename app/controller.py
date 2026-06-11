@@ -220,6 +220,8 @@ class ControllerState:
                 continue
             if r.id in self.noshow_reservation_ids:
                 continue
+            if r.id in self.claimed_reservation_ids:
+                continue  # a live chained holder is occupying this window
             end = slot_end(r)
             start = slot_start(r)
             if end <= now:
@@ -254,10 +256,15 @@ class ControllerState:
         """Declare no-shows for any reservation whose deadline has passed.
 
         Called at the start of each queue_processor_loop tick.  Moves expired
-        entries from noshow_deadlines into noshow_reservation_ids.
+        entries from noshow_deadlines into noshow_reservation_ids.  A reservation
+        currently claimed by a live chained holder is never declared a no-show —
+        ``refresh_claimed_reservations`` clears its deadline, and this guard is a
+        belt-and-suspenders check against tick ordering.
         """
         expired = [
-            rid for rid, deadline in self.noshow_deadlines.items() if now >= deadline
+            rid
+            for rid, deadline in self.noshow_deadlines.items()
+            if now >= deadline and rid not in self.claimed_reservation_ids
         ]
         for rid in expired:
             del self.noshow_deadlines[rid]
@@ -275,16 +282,46 @@ class ControllerState:
             )
 
     def mark_pod_seen_for_noshow(
-        self, namespace: str, gpu_class_label: str
+        self,
+        namespace: str,
+        gpu_class_label: str,
+        booking_reservation_id: Optional[int] = None,
     ) -> None:
-        """Clear the no-show deadline for the soonest matching reservation.
+        """Clear the no-show deadline(s) vouched for by an already-admitted pod.
 
-        Called when a pod with an existing toleration is detected (already
-        admitted), so we have no booking-reference to look up the exact
-        reservation.  Clears the deadline for the soonest active user
-        reservation matching namespace + gpu_class_label that still has a
-        pending deadline, mirroring find_best_reservation's selection logic.
+        Called when a pod carrying the toleration is detected.  Only a
+        reserved-path holder (booking ``res-<id>``) vouches for a reservation;
+        when *booking_reservation_id* is that holder's id we clear the deadline
+        for **every** window the holder's chained session spans
+        (``reservations_claimed_by``), closing the booked-id-vs-occupied-id gap.
+        On-demand / no-show squatters (other prefixes) vouch for nothing.
+
+        Falls back — when no booking id is available (e.g. a pod tolerated by
+        something other than this controller) — to clearing the soonest matching
+        user reservation by ``slot_start``, the historical behaviour.
         """
+        if booking_reservation_id is not None:
+            res = next(
+                (r for r in self.reservations if r.id == booking_reservation_id),
+                None,
+            )
+            if res is None or res.kind != "user" or res.user is None:
+                return  # on-demand / no-show booking — not a holder
+            cleared = [
+                rid
+                for rid in self.reservations_claimed_by(booking_reservation_id)
+                if self.noshow_deadlines.pop(rid, None) is not None
+            ]
+            if cleared:
+                log.debug(
+                    "No-show deadline(s) cleared for reservation(s) %s: holder pod "
+                    "admitted (namespace=%s, gpu-class=%s)",
+                    sorted(cleared),
+                    namespace,
+                    gpu_class_label,
+                )
+            return
+
         candidates = [
             r
             for r in self.reservations
@@ -305,6 +342,33 @@ class ControllerState:
             namespace,
             gpu_class_label,
         )
+
+    def refresh_claimed_reservations(
+        self,
+        holder_reservation_ids: list[int],
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Recompute ``claimed_reservation_ids`` from live reserved-path holders.
+
+        *holder_reservation_ids* are the booking ids (``res-<id>``) of the
+        Running/Pending holder pods currently in the cluster.  Each expands to
+        its back-to-back chain, so every window a holder occupies — directly or
+        via a chained deadline — is marked claimed.  Claimed reservations also
+        have their no-show deadline cleared: a chained holder is actively using
+        the window, so it must not count down toward no-show.  When the holder
+        later vacates, the reservation drops out of the claimed set and the next
+        ``update_noshow_tracking`` re-arms it with the grace timeout (the same
+        path that recycles any vacated window).
+
+        Called each queue-processor tick, before ``check_noshow_deadlines``.
+        """
+        now = now or datetime.now()
+        claimed: set[int] = set()
+        for rid in holder_reservation_ids:
+            claimed |= self.reservations_claimed_by(rid, now)
+        self.claimed_reservation_ids = claimed
+        for rid in claimed:
+            self.noshow_deadlines.pop(rid, None)
 
     # ------------------------------------------------------------------
     # Reservation matching
@@ -630,6 +694,7 @@ class ControllerState:
             r
             for r in self.reservations
             if (r.kind == "ondemand" or r.id in self.noshow_reservation_ids)
+            and r.id not in self.claimed_reservation_ids
             and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
             and slot_start(r) <= now < slot_end(r)
             and self.ondemand_available(r) >= gpu_requested

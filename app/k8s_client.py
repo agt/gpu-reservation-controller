@@ -327,6 +327,42 @@ async def list_stuck_reservation_holder_pods(
     return stuck
 
 
+async def list_reservation_holder_pods(toleration_key: str) -> list[int]:
+    """Return the booking reservation ids of live reserved-path holder pods.
+
+    A holder pod (a) carries a toleration with key == *toleration_key*, (b) is in
+    Running or Pending phase, and (c) has a ``dsmlp/booking-reference`` with the
+    ``res-`` prefix.  The ids feed ``refresh_claimed_reservations`` so that every
+    window a holder occupies — including back-to-back chained windows it never
+    booked a pod directly under — is protected from no-show conversion.
+
+    Uses ``list_pod_for_all_namespaces`` with ``label_selector="gpu-class"``, the
+    same selector as ``PodWatcher`` — no new RBAC permission required.  Returns
+    raw ids (duplicates possible when a holder runs several pods); the caller
+    de-duplicates via set union.
+    """
+    loop = asyncio.get_running_loop()
+    log.debug("k8s: list_pod_for_all_namespaces selector=gpu-class (holder scan)")
+    pod_list = await loop.run_in_executor(
+        None,
+        lambda: _core_v1.list_pod_for_all_namespaces(label_selector="gpu-class"),
+    )
+    ids: list[int] = []
+    for pod in pod_list.items:
+        if get_pod_phase(pod) not in ("Running", "Pending"):
+            continue
+        if not _pod_has_any_reservation_toleration(pod, toleration_key):
+            continue
+        ref = get_pod_booking_reference(pod)
+        if not ref or not ref.startswith("res-"):
+            continue
+        rid = parse_booking_reference(ref)
+        if rid is not None:
+            ids.append(rid)
+    log.debug("k8s: holder scan found %d reserved-path holder pod(s)", len(ids))
+    return ids
+
+
 async def apply_toleration(
     pod_name: str,
     namespace: str,
