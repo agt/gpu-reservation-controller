@@ -95,10 +95,11 @@ when; the controller enforces those entitlements inside Kubernetes.
   ------------------- ---------------------------------------------------
   **Component**       **Role**
 
-  Reservation web app Students book time blocks by course/group, GPU
-                      class and slot; staff define groups, policies, GPU
-                      ceilings and capacity. Serves a read-only API to
-                      the controller.
+  Reservation web app Students book an arbitrary whole-hour time range
+                      by course/group and GPU class, each carrying a
+                      Service-Unit (SU) cost; staff define groups, SU
+                      budgets, GPU ceilings and capacity. Serves a
+                      read-only API to the controller.
 
   Kubernetes          Reads active reservations and grants reserved Pods
   controller          access to reserved nodes; caps runtime to the
@@ -110,7 +111,17 @@ when; the controller enforces those entitlements inside Kubernetes.
                       cannot affect a neighbour.
   ------------------- ---------------------------------------------------
 
-4.2 Reserved and on-demand capacity
+4.2 Booking model
+
+A reservation is an arbitrary time range at whole-hour granularity --- a
+student picks a start and end hour rather than a fixed slot from a fixed
+plan. A range may cross midnight (for example 22:00 to 06:00). Ordinary
+members are capped at a 48-hour maximum length; group managers and admins
+are exempt. Every booking is priced in **Service Units (SU)** --- a single
+currency that meters consumption per GPU-hour and underpins the per-member
+budgets described in Section 6.
+
+4.3 Reserved and on-demand capacity
 
 A configurable share of GPU nodes is marked ("tainted") so that ordinary
 Pods cannot schedule on them. These form the reserved pool; the
@@ -122,16 +133,16 @@ reservation. On-demand Pods never receive this permission on their own
 Section 5. This keeps the controller in full control of who reaches
 reserved hardware.
 
-4.3 Runtime caps and in-session warnings
+4.4 Runtime caps and in-session warnings
 
 When the controller admits a Pod to a reserved block it also caps the
 session's maximum runtime to the end of the reserved window (extended
 automatically across directly back-to-back blocks held by the same
-student for the same GPU class). The student is warned of their
+student for the same GPU class and GPU count). The student is warned of their
 current-session maximum runtime inside both Jupyter and VS Code, so the
 end of a window is never a surprise.
 
-4.4 GPU isolation with MIG
+4.5 GPU isolation with MIG
 
 Physical GPUs are divided into isolated MIG instances wherever the
 hardware allows. This isolation is a requirement rather than a
@@ -156,11 +167,15 @@ On-demand users are served from three sources --- one designated as
 on-demand from the outset, and two reclaimed from reservations that go
 unused:
 
--   **Scheduled on-demand blocks.** Staff can set a slot's capacity
-    aside as on-demand from the start, either by scheduling a block
-    manually or via auto-fill, which turns a slot's still-unbooked
-    capacity into on-demand blocks as the slot nears. These carry no
-    reservation holder and serve on-demand users for the whole block.
+-   **Reclaim capacity holds.** The reservation app can set capacity
+    aside as on-demand from the start: an admin schedules a hold
+    manually, or the app's GPU-recovery loop fills otherwise-unbooked
+    hours as they near. These appear in the API as `kind="reclaim"`
+    reservations --- admin-only holds with no user or group --- and carry
+    no reservation holder, so the controller serves on-demand users from
+    them for the whole block. (Reclaim is the current name for what were
+    previously called on-demand/ad-hoc blocks; the GPU-recovery loop
+    replaces the earlier auto-fill sweep.)
 
 -   **No-show.** If a reservation window opens and the holder has not
     launched a matching Pod within 15 minutes, the block is converted to
@@ -217,20 +232,49 @@ caps a session's runtime.
 
 6\. Fairness and the student experience
 
-Booking limits in the reservation app --- per-user caps, per-group
-simultaneous-reservation caps, and per-GPU-class ceilings --- prevent
-monopolization and let course staff shape access for deadline weeks. To
-discourage speculative booking (reserving "just in case" and not showing
-up, which manufactures the very scarcity we are trying to relieve), we
-are considering a soft no-show penalty, such as a temporary reduction in
-booking priority after an unclaimed reservation. Group managers (course
-staff) can book on behalf of students and manage their group's
-reservations without full administrative access.
+Booking limits in the reservation app prevent monopolization and let
+course staff shape access for deadline weeks. The primary lever is a
+per-member **Service Unit (SU) budget** set on each group: every booking
+costs SU (priced per GPU-hour by the GPU class, discounted during
+off-peak windows), and a member cannot exceed their group's budget. The
+budget window is configurable --- a renewable ceiling that frees SU as
+reservations end, or a depleting weekly/monthly/quarterly/cumulative
+quota --- so staff can choose between "as much as fits at once" and "this
+much for the term." Alongside the SU budget, per-group and per-GPU-class
+GPU ceilings (with date-span boosts for deadline weeks) bound concurrent
+hardware use. A **management buffer** holds back a slice of each GPU
+class's capacity that is invisible to ordinary members, giving staff
+headroom for maintenance or last-minute student accommodations even when
+the cluster otherwise looks full.
+
+To discourage speculative booking (reserving "just in case" and not
+showing up, which manufactures the very scarcity we are trying to
+relieve), the app charges a **late-cancellation SU penalty**: cancelling
+within 24 hours of the window keeps part of the booking's SU cost against
+the member's budget, while cancelling earlier is fully waived. A further
+soft no-show penalty --- a temporary reduction in booking priority after
+an unclaimed reservation --- is still under consideration.
+
+Group managers (course staff) can manage their groups' reservations
+without full administrative access: they book on behalf of students (the
+reservation is owned by the student, with the manager recorded as the
+submitter), and they are exempt from the booking-window, SU-budget, and
+management-buffer limits, get a ±90-day grace window around their group's
+active dates, and can waive late-cancellation penalties.
 
 7\. Operations and monitoring
 
--   **Least privilege.** The controller uses a read-only API key; it
-    only reads reservation data and never modifies it.
+-   **Least privilege.** The controller authenticates to the reservation
+    app with a `read_only`-scoped service key (the app issues scoped keys,
+    `read_only` or `read_write`); it only reads reservation data and never
+    modifies it.
+
+-   **Reclaim-hold integration.** Reclaim capacity holds (Section 5.1) are
+    integral to operation, not an add-on: they are how the reservation app
+    hands idle, unbooked capacity to the controller, and together with the
+    controller's no-show and idle-cull reclamation they form the single
+    on-demand management system that keeps reserved hardware from sitting
+    idle.
 
 -   **Anomaly alerting.** Splunk alerts fire on stuck reservation-holder
     Pods, which also gate on-demand placement (Section 5.2).
@@ -257,8 +301,12 @@ reservations without full administrative access.
 
 -   **Capacity sizing.** The reserved share of nodes is set by hand and
     is not yet linked to the reservation app's view of capacity, and MIG
-    fixes the number of instances per GPU. Reserved-pool sizing and MIG
-    profiles should be reviewed against observed demand.
+    fixes the number of instances per GPU. The reservation app's
+    per-GPU-class **management buffer** is a related hand-set lever ---
+    capacity held back from ordinary members for maintenance and
+    accommodations --- that likewise has to be sized by judgement.
+    Reserved-pool sizing, management buffers, and MIG profiles should be
+    reviewed against observed demand.
 
 -   **On-demand remains best-effort.** Students without a reservation
     still depend on available and recycled capacity; the predictability
@@ -293,9 +341,9 @@ The state machine below tracks a single reservation block as the
 controller moves it through its life. Reserved-phase states are shown in
 blue, on-demand-phase states in green; the two red transitions are the
 irrevocable conversions of unused reserved capacity into on-demand
-capacity. Explicitly scheduled on-demand blocks (Section 5.1) have no
-reserved phase and enter the diagram directly at the On-Demand ---
-Available state.
+capacity. Reclaim capacity holds (Section 5.1) --- the renamed scheduled
+on-demand blocks --- have no reserved phase and enter the diagram directly
+at the On-Demand --- Available state.
 
 ![States from Scheduled through Awaiting Claim, Reserved In Use,
 On-Demand Available/In Use, to Window Ended, with no-show and idle-cull
