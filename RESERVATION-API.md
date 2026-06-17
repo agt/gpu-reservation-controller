@@ -85,8 +85,9 @@ Responses are always JSON.
 |------|--------|---------|-------|
 | Date | `YYYY-MM-DD` | `2026-09-01` | Calendar date; no timezone |
 | Datetime (audit) | ISO 8601, `Z` suffix | `2026-09-01T08:00:00Z` | `created_at`, `updated_at`, `cancelled_at` — always UTC |
-| Datetime (slot) | ISO 8601, `Z` suffix | `2026-09-12T03:00:00Z` | `start_utc`, `end_utc` — slot boundaries converted to UTC by the server |
-| Time-of-day | `HH:MM:SS` | `08:00:00` | `policy.start_time` — local wall-clock, no timezone |
+| Datetime (UTC bounds) | ISO 8601, `Z` suffix | `2026-09-12T03:00:00Z` | `start_utc`, `end_utc` — reservation boundaries converted to UTC by the server |
+| Datetime (local) | ISO 8601, no suffix | `2026-09-01T08:00:00` | `start_dt`, `end_dt` — site-local wall-clock, no timezone |
+| Time-of-day | `HH:MM:SS` | `08:00:00` | discount-schedule `start_time`/`end_time` — local wall-clock, no timezone |
 
 ### Pagination
 
@@ -239,53 +240,39 @@ X-API-Key: gpures_...
     "group_id": 2,
     "group": { "id": 2, "name": "CS151B-FA26" },
     "gpu_class_id": 1,
-    "gpu_class": { "id": 1, "name": "H100" },
-    "policy_id": 3,
-    "slot_index": 0,
-    "policy": {
-      "id": 3,
-      "name": "H100 Morning (8h)",
-      "start_time": "08:00:00",
-      "duration_minutes": 480,
-      "repeat_count": 1
-    },
+    "gpu_class": { "id": 1, "name": "H100", "label_value": "h100" },
+    "start_dt": "2026-09-01T08:00:00",
+    "end_dt": "2026-09-01T16:00:00",
     "date": "2026-09-01",
     "start_utc": "2026-09-01T15:00:00Z",
     "end_utc": "2026-09-01T23:00:00Z",
     "gpu_count": 4,
+    "su_cost": 32,
     "status": "active",
-    "kind": "user",
     "notes": null,
     "created_at": "2026-08-20T10:15:00Z",
     "updated_at": "2026-08-20T10:15:00Z",
     "cancelled_at": null,
-    "cancelled_by_id": null,
-    "created_by_id": null
+    "cancelled_by_id": null
   }
 ]
 ```
 
-**On-demand / ad-hoc blocks.** A reservation with `"kind": "ondemand"` is a userless
-capacity block (admin-scheduled or auto-filled). For these rows `user_id`, `user`,
-`group_id`, and `group` are all `null`, but `gpu_class`, `policy`, `slot_index`, `date`,
-and `gpu_count` are populated, so the block occupies a real slot and consumes capacity
-exactly like a booking. Consumers must therefore tolerate a `null` `user`/`group` and
-should branch on `kind` (`"user"` vs `"ondemand"`). `created_by_id` is the admin who
-scheduled the block, or `null` when the auto-fill sweep created it.
-
-For the Kubernetes controller this means an `"ondemand"` row has **no user pod to admit** —
-treat it purely as reserved capacity (it occupies the slot's GPUs for its window) rather than
-mapping it to a user. A typical controller skips `"ondemand"` rows when reconciling per-user
-pods, while still counting them against the slot's GPU usage.
+`start_dt` / `end_dt` are the booking's site-local wall-clock interval (naive, no
+timezone). A reservation is an arbitrary whole-hour range that **may cross midnight**
+(`end_dt` on the next calendar day) and is capped at 24 hours. `date` mirrors
+`start_dt`'s date and is provided for convenience filtering. `su_cost` is the total
+Service Units the booking consumes, computed at creation from the GPU class base rate
+(`su_rate_per_hour`) and the active discount schedules.
 
 ### Reading the reservation time window
 
-Every `ReservationResponse` now includes pre-computed UTC timestamps:
+Every `ReservationResponse` includes pre-computed UTC timestamps:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `start_utc` | string (ISO 8601, `Z`) | Slot start in UTC |
-| `end_utc` | string (ISO 8601, `Z`) | Slot end in UTC |
+| `start_utc` | string (ISO 8601, `Z`) | Reservation start in UTC |
+| `end_utc` | string (ISO 8601, `Z`) | Reservation end in UTC |
 
 Use these directly — no timezone knowledge required:
 
@@ -297,26 +284,20 @@ end = datetime.strptime(reservation["end_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tz
 active_deadline_seconds = max(0, int((end - datetime.now(timezone.utc)).total_seconds()))
 ```
 
-**How they are computed.** The server derives these from the stored local-time fields
-(`date`, `policy.start_time`, `slot_index`, `policy.duration_minutes`) using the
-`TIMEZONE` environment variable configured at deployment time.  The raw fields remain
-in the response for backward compatibility and human display:
+**How they are computed.** The server converts the stored local-time `start_dt` /
+`end_dt` to UTC using the `TIMEZONE` environment variable configured at deployment time:
 
 ```
-slot_start_local = policy.start_time  +  slot_index × policy.duration_minutes
-slot_end_local   = slot_start_local   +  policy.duration_minutes
-start_utc        = slot_start_local converted to UTC via TIMEZONE
-end_utc          = slot_end_local   converted to UTC via TIMEZONE
+start_utc = start_dt converted to UTC via TIMEZONE
+end_utc   = end_dt   converted to UTC via TIMEZONE
 ```
 
-**Example** — server configured with `TIMEZONE=America/Los_Angeles` (PDT, UTC−7):
-`start_time = "20:00:00"`, `duration_minutes = 120`, `slot_index = 0`,
-`date = "2026-06-11"`:
+**Example** — server configured with `TIMEZONE=America/Los_Angeles` (PDT, UTC−7),
+`start_dt = "2026-06-11T20:00:00"`, `end_dt = "2026-06-11T22:00:00"`:
 
 ```
-slot_start_local = 2026-06-11 20:00 PDT
-start_utc        = "2026-06-12T03:00:00Z"
-end_utc          = "2026-06-12T05:00:00Z"
+start_utc = "2026-06-12T03:00:00Z"
+end_utc   = "2026-06-12T05:00:00Z"
 ```
 
 ### Kubernetes node targeting
@@ -342,10 +323,18 @@ either service-key scope.
   "description": "NVIDIA H100 80 GB SXM5",
   "total_gpus": 8,
   "label_value": "h100",
+  "su_rate_per_hour": 4,
+  "max_gpus_per_reservation": 2,
+  "attach_all_groups": false,
   "is_active": true,
   "created_at": "2026-01-15T09:00:00"
 }
 ```
+
+`su_rate_per_hour` is the base Service Units charged per GPU per hour (before
+discount-schedule multipliers). `max_gpus_per_reservation` caps a single booking's
+GPU count (`null` = no cap). `attach_all_groups` makes the class bookable by every
+group without an explicit attachment.
 
 `label_value` is `null` when the class has no Kubernetes mapping; the
 controller skips reservations for such classes.
@@ -390,8 +379,8 @@ Create a new user account.
 | `email` | string | yes | unique | Email address |
 | `password` | string | only for local accounts | min 8 chars | Initial password (Argon2id-hashed). Required when `auth_provider` is `"local"`; **must be omitted** for any other provider. |
 | `is_admin` | boolean | no | default `false` | Administrator flag. **Service keys may not set this** — a key sending `is_admin: true` receives 403. |
-| `auth_provider` | string | no | default `"local"` | `"local"` or `"jupyterhub"`. Use `"jupyterhub"` when pre-provisioning accounts that will log in via OAuth. |
-| `external_id` | string | no | unique | External identity (e.g. the JupyterHub username). Set it for non-local accounts so the OAuth callback matches the pre-created row. |
+| `auth_provider` | string | no | default `"local"` | `"local"` or an OAuth provider name (`"jupyterhub"`, `"google"`, `"oidc"`). Set the matching provider name when pre-provisioning accounts that will log in via OAuth. |
+| `external_id` | string | no | unique | External identity for the provider (JupyterHub username, Google email, or OIDC subject). Set it for non-local accounts so the OAuth callback matches the pre-created row. |
 
 **Response** `201` — [UserResponse](#userresponse)
 
@@ -467,7 +456,7 @@ reservation history are preserved. Deactivated users cannot log in.
 
 #### `GET /api/groups`
 
-List all usage groups with full member and policy details, ordered by name.
+List all usage groups with full member and attached-GPU-class details, ordered by name.
 
 **Response** `200` — array of [GroupResponse](#groupresponse)
 
@@ -629,8 +618,8 @@ both new additions and role corrections without a separate `PATCH` call.
 | `email` | string | Unique |
 | `is_admin` | boolean | |
 | `is_active` | boolean | `false` = soft-deleted |
-| `auth_provider` | string | `"local"` or `"jupyterhub"` |
-| `external_id` | string \| null | External identity (JupyterHub username) for OAuth accounts |
+| `auth_provider` | string | `"local"` or an OAuth provider name (`"jupyterhub"`, `"google"`, `"oidc"`) |
+| `external_id` | string \| null | External identity (JupyterHub username / Google email / OIDC subject) for OAuth accounts |
 | `created_at` | datetime | UTC |
 
 ---
@@ -646,9 +635,7 @@ both new additions and role corrections without a separate `PATCH` call.
   "valid_until": "2026-12-12",
   "min_days_ahead": 0,
   "max_days_ahead": 14,
-  "max_reservations_per_user": null,
-  "max_reservations_total": null,
-  "max_reservation_hours": null,
+  "su_budget": null,
   "sync_with_sicad": false,
   "is_active": true,
   "created_at": "2026-06-01T10:00:00",
@@ -656,9 +643,13 @@ both new additions and role corrections without a separate `PATCH` call.
     { "id": 7, "username": "jsmith", "role": "manager" },
     { "id": 9, "username": "bwang",  "role": "member"  }
   ],
-  "policies": [ ... ]
+  "gpu_classes": [ ... ]
 }
 ```
+
+`gpu_classes` lists the GPU classes the group may book — explicit
+`UsageGroupGpuClass` attachments plus any class flagged `attach_all_groups`. Each
+entry is a full GpuClassResponse.
 
 | Field | Type | Notes |
 |-------|------|-------|
@@ -669,9 +660,7 @@ both new additions and role corrections without a separate `PATCH` call.
 | `valid_until` | date \| null | Group bookable on or before this date; admins and group managers get a 90-day grace window after this date |
 | `min_days_ahead` | integer \| null | Members must book at least N days in advance (ignored for admins and group managers) |
 | `max_days_ahead` | integer \| null | Members cannot book more than N days out (ignored for admins and group managers) |
-| `max_reservations_per_user` | integer \| null | Per-user simultaneous cap |
-| `max_reservations_total` | integer \| null | Group-wide simultaneous cap |
-| `max_reservation_hours` | number \| null | Per-member cap on total *open* reservation hours (ignored for admins and group managers) |
+| `su_budget` | number \| null | Per-member Service Unit budget: the sum of stored `su_cost` over a member's *open* reservations may not exceed this (ignored for admins and group managers). `null` = unlimited |
 | `sync_with_sicad` | boolean | When `true`, the app's built-in SICAD roster sync keeps this group's membership in sync with the course roster (add-only) |
 | `is_active` | boolean | Inactive groups cannot accept new reservations |
 | `created_at` | datetime | UTC |
@@ -713,55 +702,45 @@ Returned by `GET /api/groups/{group_id}/members`.
   "group_id": 2,
   "group": { "id": 2, "name": "CS151B-FA26" },
   "gpu_class_id": 1,
-  "gpu_class": { "id": 1, "name": "H100" },
-  "policy_id": 3,
-  "slot_index": 0,
-  "policy": {
-    "id": 3,
-    "name": "H100 Morning (8h)",
-    "start_time": "08:00:00",
-    "duration_minutes": 480,
-    "repeat_count": 1
-  },
+  "gpu_class": { "id": 1, "name": "H100", "label_value": "h100" },
+  "start_dt": "2026-09-01T08:00:00",
+  "end_dt": "2026-09-01T16:00:00",
   "date": "2026-09-01",
   "start_utc": "2026-09-01T15:00:00Z",
   "end_utc": "2026-09-01T23:00:00Z",
   "gpu_count": 4,
+  "su_cost": 32,
   "status": "active",
-  "kind": "user",
   "notes": null,
   "created_at": "2026-08-20T10:15:00Z",
   "updated_at": "2026-08-20T10:15:00Z",
   "cancelled_at": null,
-  "cancelled_by_id": null,
-  "created_by_id": null
+  "cancelled_by_id": null
 }
 ```
 
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | integer | |
-| `user_id` | integer \| null | `null` for on-demand blocks (`kind="ondemand"`) |
-| `user` | UserBrief \| null | `null` for on-demand blocks |
+| `user_id` | integer | Booking user |
+| `user` | UserBrief | |
 | `group_id` | integer \| null | |
 | `group` | GroupBrief \| null | |
 | `gpu_class_id` | integer | |
-| `gpu_class` | `{id, name}` | |
-| `policy_id` | integer | |
-| `slot_index` | integer | 0-based index into repeating slots |
-| `policy` | PolicyBrief | Embedded; raw local-time fields for display |
-| `date` | date | Calendar date of the reservation (local time) |
-| `start_utc` | string (ISO 8601, `Z`) | Slot start converted to UTC; use this for time comparisons |
-| `end_utc` | string (ISO 8601, `Z`) | Slot end converted to UTC; use this for `activeDeadlineSeconds` |
+| `gpu_class` | `{id, name, label_value}` | |
+| `start_dt` | datetime (local, no suffix) | Reservation start in site-local wall-clock; may cross midnight |
+| `end_dt` | datetime (local, no suffix) | Reservation end; ≤ 24h after `start_dt` |
+| `date` | date | Calendar date of `start_dt` (convenience for filtering) |
+| `start_utc` | string (ISO 8601, `Z`) | Reservation start converted to UTC; use this for time comparisons |
+| `end_utc` | string (ISO 8601, `Z`) | Reservation end converted to UTC; use this for `activeDeadlineSeconds` |
 | `gpu_count` | integer | Number of GPUs reserved |
+| `su_cost` | number | Total Service Units consumed (stored at creation) |
 | `status` | `"active"` \| `"cancelled"` | |
-| `kind` | `"user"` \| `"ondemand"` | `"ondemand"` = userless ad-hoc capacity block |
 | `notes` | string \| null | Free-text note from the user |
 | `created_at` | datetime (UTC, `Z`) | |
 | `updated_at` | datetime (UTC, `Z`) | |
 | `cancelled_at` | datetime \| null (UTC, `Z`) | |
 | `cancelled_by_id` | integer \| null | User ID of whoever cancelled |
-| `created_by_id` | integer \| null | Admin who scheduled an on-demand block; `null` if auto-filled |
 
 ---
 
