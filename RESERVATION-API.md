@@ -41,7 +41,7 @@ Service keys are **scoped** (never admin-equivalent). Each key has a `scope` of
   manage group membership).
 
 Neither scope grants administrator privileges. Admin-only **write** surfaces
-(creating or modifying GPU classes, timeslot plans, site settings, email
+(creating or modifying GPU classes, site settings, email
 settings, key management) are unreachable by any service key. Read access to
 GPU classes (`GET /api/gpu-classes`, `GET /api/gpu-classes/{class_id}`) is
 available to both scopes — the Kubernetes controller uses it to resolve
@@ -248,8 +248,11 @@ X-API-Key: gpures_...
     "end_utc": "2026-09-01T23:00:00Z",
     "gpu_count": 4,
     "su_cost": 32,
+    "kind": "booking",
     "status": "active",
     "notes": null,
+    "submitted_by_id": 7,
+    "submitted_by": { "id": 7, "username": "jsmith" },
     "created_at": "2026-08-20T10:15:00Z",
     "updated_at": "2026-08-20T10:15:00Z",
     "cancelled_at": null,
@@ -260,10 +263,32 @@ X-API-Key: gpures_...
 
 `start_dt` / `end_dt` are the booking's site-local wall-clock interval (naive, no
 timezone). A reservation is an arbitrary whole-hour range that **may cross midnight**
-(`end_dt` on the next calendar day) and is capped at 24 hours. `date` mirrors
-`start_dt`'s date and is provided for convenience filtering. `su_cost` is the total
-Service Units the booking consumes, computed at creation from the GPU class base rate
+(`end_dt` on the next calendar day). Non-privileged members are limited to 48 hours;
+admins and group managers have no server-side cap. `date` mirrors `start_dt`'s date
+and is provided for convenience filtering. `su_cost` is the total Service Units the
+booking consumes, computed at creation from the GPU class base rate
 (`su_rate_per_hour`) and the active discount schedules.
+
+### Reservation kinds and the reclaim filter
+
+Every reservation has a `kind` field: `"booking"` (a normal user reservation) or
+`"reclaim"` (an admin-only capacity hold created by the GPU recovery task or
+manually by an admin). Reclaim reservations have `user_id = null` and
+`group_id = null` — they carry no user or group attribution.
+
+By default `GET /api/reservations` **excludes** reclaim reservations for all
+`status` values except `"all"`:
+
+| `status` query param | booking rows | reclaim rows |
+|----------------------|-------------|--------------|
+| `active` (default)   | ✓           | ✗            |
+| `cancelled`          | ✓           | ✗            |
+| `all`                | ✓           | ✓            |
+
+The Kubernetes controller can use reclaim reservations to detect idle capacity
+that the recovery task has claimed for opportunistic scheduling. To see them,
+add `status=all` to the query; then filter on `kind == "reclaim"` to separate
+them from cancelled user bookings.
 
 ### Reading the reservation time window
 
@@ -322,19 +347,24 @@ either service-key scope.
   "name": "H100",
   "description": "NVIDIA H100 80 GB SXM5",
   "total_gpus": 8,
+  "management_buffer": 1,
   "label_value": "h100",
   "su_rate_per_hour": 4,
+  "min_su_per_gpu_hour": 1.0,
   "max_gpus_per_reservation": 2,
   "attach_all_groups": false,
   "is_active": true,
-  "created_at": "2026-01-15T09:00:00"
+  "created_at": "2026-01-15T09:00:00Z"
 }
 ```
 
 `su_rate_per_hour` is the base Service Units charged per GPU per hour (before
-discount-schedule multipliers). `max_gpus_per_reservation` caps a single booking's
-GPU count (`null` = no cap). `attach_all_groups` makes the class bookable by every
-group without an explicit attachment.
+discount-schedule multipliers). `min_su_per_gpu_hour` is a hard floor on the
+effective rate regardless of which discount schedule applies (`null` = no floor).
+`max_gpus_per_reservation` caps a single booking's GPU count (`null` = no cap).
+`attach_all_groups` makes the class bookable by every group without an explicit
+attachment. `management_buffer` is the number of GPUs within `total_gpus`
+reserved for admin/manager use and invisible to regular members.
 
 `label_value` is `null` when the class has no Kubernetes mapping; the
 controller skips reservations for such classes.
@@ -607,7 +637,7 @@ both new additions and role corrections without a separate `PATCH` call.
   "is_active":     true,
   "auth_provider": "local",
   "external_id":   null,
-  "created_at":    "2026-01-15T09:00:00"
+  "created_at":    "2026-01-15T09:00:00Z"
 }
 ```
 
@@ -635,10 +665,11 @@ both new additions and role corrections without a separate `PATCH` call.
   "valid_until": "2026-12-12",
   "min_days_ahead": 0,
   "max_days_ahead": 14,
-  "su_budget": null,
+  "su_budget": 200,
+  "su_anchor_mode": "open",
   "sync_with_sicad": false,
   "is_active": true,
-  "created_at": "2026-06-01T10:00:00",
+  "created_at": "2026-06-01T10:00:00Z",
   "members": [
     { "id": 7, "username": "jsmith", "role": "manager" },
     { "id": 9, "username": "bwang",  "role": "member"  }
@@ -660,12 +691,12 @@ entry is a full GpuClassResponse.
 | `valid_until` | date \| null | Group bookable on or before this date; admins and group managers get a 90-day grace window after this date |
 | `min_days_ahead` | integer \| null | Members must book at least N days in advance (ignored for admins and group managers) |
 | `max_days_ahead` | integer \| null | Members cannot book more than N days out (ignored for admins and group managers) |
-| `su_budget` | number \| null | Per-member Service Unit budget: the sum of stored `su_cost` over a member's *open* reservations may not exceed this (ignored for admins and group managers). `null` = unlimited |
+| `su_budget` | number \| null | Per-member Service Unit budget: the sum of stored `su_cost` over a member's open reservations (within the window set by `su_anchor_mode`) may not exceed this (ignored for admins and group managers). `null` = unlimited |
+| `su_anchor_mode` | string | How far back the SU budget window reaches: `"open"` (only currently-open reservations; renewable ceiling), `"weekly"`, `"monthly"`, `"quarterly"`, or `"since_creation"` (cumulative, never resets). See SCHEDULING.md §5 for full semantics. |
 | `sync_with_sicad` | boolean | When `true`, the app's built-in SICAD roster sync keeps this group's membership in sync with the course roster (add-only) |
 | `is_active` | boolean | Inactive groups cannot accept new reservations |
 | `created_at` | datetime | UTC |
 | `members` | array of [GroupMemberBrief](#groupmemberbrief) | |
-| `policies` | array of PolicyWithClass | Booking time-window definitions |
 
 ---
 
@@ -710,8 +741,11 @@ Returned by `GET /api/groups/{group_id}/members`.
   "end_utc": "2026-09-01T23:00:00Z",
   "gpu_count": 4,
   "su_cost": 32,
+  "kind": "booking",
   "status": "active",
   "notes": null,
+  "submitted_by_id": 7,
+  "submitted_by": { "id": 7, "username": "jsmith" },
   "created_at": "2026-08-20T10:15:00Z",
   "updated_at": "2026-08-20T10:15:00Z",
   "cancelled_at": null,
@@ -722,21 +756,24 @@ Returned by `GET /api/groups/{group_id}/members`.
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | integer | |
-| `user_id` | integer | Booking user |
-| `user` | UserBrief | |
-| `group_id` | integer \| null | |
-| `group` | GroupBrief \| null | |
+| `user_id` | integer \| null | Booking user; `null` for `kind="reclaim"` |
+| `user` | UserBrief \| null | `null` for `kind="reclaim"` |
+| `group_id` | integer \| null | `null` for `kind="reclaim"` |
+| `group` | GroupBrief \| null | `null` for `kind="reclaim"` |
 | `gpu_class_id` | integer | |
 | `gpu_class` | `{id, name, label_value}` | |
 | `start_dt` | datetime (local, no suffix) | Reservation start in site-local wall-clock; may cross midnight |
-| `end_dt` | datetime (local, no suffix) | Reservation end; ≤ 24h after `start_dt` |
+| `end_dt` | datetime (local, no suffix) | Reservation end; ≤ 48h after `start_dt` for non-privileged members; no server-side cap for admins/managers |
 | `date` | date | Calendar date of `start_dt` (convenience for filtering) |
 | `start_utc` | string (ISO 8601, `Z`) | Reservation start converted to UTC; use this for time comparisons |
 | `end_utc` | string (ISO 8601, `Z`) | Reservation end converted to UTC; use this for `activeDeadlineSeconds` |
 | `gpu_count` | integer | Number of GPUs reserved |
 | `su_cost` | number | Total Service Units consumed (stored at creation) |
+| `kind` | `"booking"` \| `"reclaim"` | `"booking"` = normal user reservation; `"reclaim"` = admin-only capacity hold |
 | `status` | `"active"` \| `"cancelled"` | |
 | `notes` | string \| null | Free-text note from the user |
+| `submitted_by_id` | integer \| null | User ID of the authenticated caller (differs from `user_id` when a manager books on behalf of a member) |
+| `submitted_by` | UserBrief \| null | Brief info for the submitter |
 | `created_at` | datetime (UTC, `Z`) | |
 | `updated_at` | datetime (UTC, `Z`) | |
 | `cancelled_at` | datetime \| null (UTC, `Z`) | |
