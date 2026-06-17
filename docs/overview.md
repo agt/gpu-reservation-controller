@@ -18,46 +18,44 @@ Design and Operations Plan
 >
 > 6\. Fairness and the student experience
 >
-> 7\. Operations and monitoring
->
-> 8\. Risks and open items
->
-> 9\. How this compares with peer institutions
+> 7\. How this compares with peer institutions
 >
 > Appendix A. Reservation-block lifecycle
 
 1\. Executive summary
 
-The instructional cluster gives each student exclusive, interactive
-access to a GPU --- typically a Jupyter notebook or a VS Code session
+The DSMLP cluster provides usersw with exclusive, interactive
+access to a GPU --- most typically via a Jupyter notebook or a VS Code session
 connected to the cluster. With courses of 300 or more students sharing
 150 GPUs, demand spikes sharply around assignment deadlines. When two
 courses recently shared a deadline, first-come, first-served (FCFS) wait
-times for an interactive session exceeded five hours.
+times for an interactive session measure in hours.
 
 This plan introduces a **calendar-based reservation system** so that a
 student can hold a known, time-bound block of GPU access instead of
-submitting a job and waiting an indeterminate time. The aim is
-**predictability** for the student without sacrificing overall
+submitting a job and waiting an indeterminate time.   During this time block,
+and subject to existing quotas (often 1 GPU), the student's job would jump to the head of the cluster scheduling queue.
+
+The aim is **predictability** for the student without sacrificing overall
 utilization: any capacity a reservation does not actually use ---
-because the holder never shows up, or leaves the GPU idle --- is
-returned to the FCFS pool within minutes.
+because the holder never shows up, or later becomes idle for an extended period --- is
+returned back to the FCFS pool.
 
 The system has two parts: a **web application** where students book
 blocks and staff manage policy, and a **Kubernetes controller** that
-grants reserved access and recycles unused capacity. Physical GPUs are
-partitioned with NVIDIA Multi-Instance GPU (MIG) so that one student's
-memory use or a crashed CUDA kernel cannot disrupt a neighbour.
+grants reserved access and recycles unused capacity. 
 
-2\. The problem we are solving
+2\. The problems we are solving include
 
--   **Interactive, exclusive workloads.** Almost all usage is
+-   **Interactive, exclusive workloads.** Almost all usage is through
     interactive sessions, each holding a GPU for the duration of a
-    working session rather than a short batch job.
+    working session.  Traditional batch-oriented scheduling systems
+    excel at efficiently organizing jobs, but they can't ensure the
+    human operator is present at job launch.
 
 -   **Structural scarcity at deadlines.** 150 GPUs cannot simultaneously
     serve the 300-plus students in a single large course, let alone
-    several courses at once.
+    several courses at once. 
 
 -   **Synchronized bursts.** Demand is concentrated in the evenings
     before deadlines, and worsens sharply when multiple courses share a
@@ -78,12 +76,6 @@ memory use or a crashed CUDA kernel cannot disrupt a neighbour.
 
 3.  **Fairness.** Per-user and per-group limits prevent any one student
     or course from monopolizing the cluster.
-
-4.  **Isolation.** Students are protected from each other's crashes and
-    memory contention.
-
-5.  **Transparency.** On-demand users can see their position in the
-    queue rather than waiting blind.
 
 4\. How the system works
 
@@ -106,9 +98,6 @@ when; the controller enforces those entitlements inside Kubernetes.
                       reserved window; converts unused reserved capacity
                       to on-demand and recycles it.
 
-  MIG partitioning    Splits physical GPUs into isolated instances so a
-                      student\'s memory use or a crashed CUDA kernel
-                      cannot affect a neighbour.
   ------------------- ---------------------------------------------------
 
 4.2 Booking model
@@ -116,8 +105,10 @@ when; the controller enforces those entitlements inside Kubernetes.
 A reservation is an arbitrary time range at whole-hour granularity --- a
 student picks a start and end hour rather than a fixed slot from a fixed
 plan. A range may cross midnight (for example 22:00 to 06:00). Ordinary
-members are capped at a 48-hour maximum length; group managers and admins
-are exempt. Every booking is priced in **Service Units (SU)** --- a single
+members are capped at a 48-hour maximum length; group managers (instructors, TAs) and admins
+are exempt and may book longer sessions on behalf of their students.
+
+Every booking is priced in **Service Units (SU)** --- a single
 currency that meters consumption per GPU-hour and underpins the per-member
 budgets described in Section 6.
 
@@ -142,16 +133,6 @@ student for the same GPU class and GPU count). The student is warned of their
 current-session maximum runtime inside both Jupyter and VS Code, so the
 end of a window is never a surprise.
 
-4.5 GPU isolation with MIG
-
-Physical GPUs are divided into isolated MIG instances wherever the
-hardware allows. This isolation is a requirement rather than a
-convenience for this workload: many frameworks do not share GPU memory
-reliably, and students frequently test CUDA code that can crash the
-device. MIG ensures one student's failure cannot take down another's
-session. The trade-off is that isolation, unlike time-slicing, fixes the
-number of shareable instances per GPU; capacity planning (Section 8)
-accounts for this.
 
 5\. Keeping reserved capacity from sitting idle
 
@@ -167,32 +148,21 @@ On-demand users are served from three sources --- one designated as
 on-demand from the outset, and two reclaimed from reservations that go
 unused:
 
--   **Reclaim capacity holds.** The reservation app can set capacity
-    aside as on-demand from the start: an admin schedules a hold
-    manually, or the app's GPU-recovery loop fills otherwise-unbooked
-    hours as they near. These appear in the API as `kind="reclaim"`
-    reservations --- admin-only holds with no user or group --- and carry
-    no reservation holder, so the controller serves on-demand users from
-    them for the whole block. (Reclaim is the current name for what were
-    previously called on-demand/ad-hoc blocks; the GPU-recovery loop
-    replaces the earlier auto-fill sweep.)
+-   **Reclaim capacity holds.** The reservation app periodically marks
+    unused short-term capacity (<~6hrs) as available for on-demand use.
 
--   **No-show.** If a reservation window opens and the holder has not
+-   **No-shows.** If a reservation window opens and the holder has not
     launched a matching Pod within 15 minutes, the block is converted to
     on-demand duty. The conversion is irrevocable for the remainder of
     the window --- the original holder has forfeited that block, which
     removes any ambiguity about late arrivals reclaiming a slot already
-    in use. (One operational caveat: the controller tracks this state in
-    memory only, so a controller restart re-opens a short grace window
-    --- 30 minutes by default --- during which a late holder could still
-    claim.)
+    in use. 
 
--   **Idle session.** If a holder's session is running but making no use
-    of its GPU, the existing idle-culling process terminates it. The
-    controller notices the vacated window on its next reservation
-    refresh and re-arms a short claim deadline (30 minutes by default);
-    if the holder does not relaunch within it, the remaining block is
-    converted to on-demand in the same way.
+-   **Idle sessions.**  If a holder's session is running but making no use
+    of its GPU for an extended period, the existing idle-culling process terminates it
+    with a notification to the the controller. The controller then re-arms a short claim
+    deadline (15 minutes by default); if the holder does not relaunch within it, the remaining block is
+    converted to on-demand as above.
 
 5.2 How on-demand Pods are placed (the guards)
 
@@ -215,45 +185,32 @@ on-demand block, all of the following must hold:
     rare and is treated as an anomaly warranting human investigation;
     Splunk alerting is configured to surface it.
 
-5.3 Recycling and transparency
+5.3 Recycling on-demand slots
 
 When an on-demand Pod on such a block finishes or is idle-culled, the
 block returns to the on-demand pool for the next eligible Pending Pod,
-and so on until the window ends. At that point only the capacity that
-was temporarily serving on-demand --- the specific GPU or MIG instance,
-a portion of the node rather than the whole node --- returns to handling
-reservations; the node itself stays in the reserved pool throughout.
-Because interactive sessions rarely end on their own, idle-culling is
-the main driver of this recycling, not natural completion. Showing
-waiting on-demand users their position in the queue --- through events
-surfaced in JupyterHub and on the shell login node --- is planned but
-not yet implemented; today the controller emits events only when it
-caps a session's runtime.
+and so on until the window ends. 
 
 6\. Fairness and the student experience
 
 Booking limits in the reservation app prevent monopolization and let
-course staff shape access for deadline weeks. The primary lever is a
+course and computing staff shape access for deadline weeks. The primary lever is a
 per-member **Service Unit (SU) budget** set on each group: every booking
 costs SU (priced per GPU-hour by the GPU class, discounted during
-off-peak windows), and a member cannot exceed their group's budget. The
-budget window is configurable --- a renewable ceiling that frees SU as
-reservations end, or a depleting weekly/monthly/quarterly/cumulative
-quota --- so staff can choose between "as much as fits at once" and "this
-much for the term." Alongside the SU budget, per-group and per-GPU-class
-GPU ceilings (with date-span boosts for deadline weeks) bound concurrent
-hardware use. A **management buffer** holds back a slice of each GPU
-class's capacity that is invisible to ordinary members, giving staff
-headroom for maintenance or last-minute student accommodations even when
-the cluster otherwise looks full.
+off-peak windows), and a member cannot exceed that set budget. 
+
+By default the budget window refreshes weekly on Mondays: the SU budget must cover
+all of the student's SU consumption for that week as well as any future reservations in place.
+
+Alongside the SU budget, course-wide limits on GPU usage ensure that resources are fairly
+divided between courses. A limited **management buffer** holds back a slice of GPU capacity that is invisible to students, giving staff
+headroom for maintenance or last-minute student accommodations even when the cluster otherwise looks full.  Instructors and TAs may book within this buffer, students may not.
 
 To discourage speculative booking (reserving "just in case" and not
 showing up, which manufactures the very scarcity we are trying to
 relieve), the app charges a **late-cancellation SU penalty**: cancelling
 within 24 hours of the window keeps part of the booking's SU cost against
-the member's budget, while cancelling earlier is fully waived. A further
-soft no-show penalty --- a temporary reduction in booking priority after
-an unclaimed reservation --- is still under consideration.
+the member's budget, while cancelling earlier is fully waived. 
 
 Group managers (course staff) can manage their groups' reservations
 without full administrative access: they book on behalf of students (the
@@ -262,58 +219,7 @@ submitter), and they are exempt from the booking-window, SU-budget, and
 management-buffer limits, get a ±90-day grace window around their group's
 active dates, and can waive late-cancellation penalties.
 
-7\. Operations and monitoring
-
--   **Least privilege.** The controller authenticates to the reservation
-    app with a `read_only`-scoped service key (the app issues scoped keys,
-    `read_only` or `read_write`); it only reads reservation data and never
-    modifies it.
-
--   **Reclaim-hold integration.** Reclaim capacity holds (Section 5.1) are
-    integral to operation, not an add-on: they are how the reservation app
-    hands idle, unbooked capacity to the controller, and together with the
-    controller's no-show and idle-cull reclamation they form the single
-    on-demand management system that keeps reserved hardware from sitting
-    idle.
-
--   **Anomaly alerting.** Splunk alerts fire on stuck reservation-holder
-    Pods, which also gate on-demand placement (Section 5.2).
-
--   **Queue visibility (planned).** On-demand queue position will be
-    emitted as events visible in JupyterHub and on the login node; not
-    yet implemented in the controller.
-
--   **Per-student namespaces.** JupyterHub (via KubeSpawner) places each
-    student in their own Kubernetes namespace, which the controller
-    relies on to match Pods to reservations.
-
-8\. Risks and open items
-
--   **Booking-time integrity.** When reservations open, hundreds of
-    students may book at once. The booking path must check capacity and
-    record the reservation atomically so the last available slot cannot
-    be double-booked, and the datastore must tolerate the write burst.
-
--   **Controller availability.** A single controller is a single point
-    of failure; while it is down, new reserved Pods cannot be admitted.
-    Production hardening (fast restart, and eventually a standby) is
-    planned.
-
--   **Capacity sizing.** The reserved share of nodes is set by hand and
-    is not yet linked to the reservation app's view of capacity, and MIG
-    fixes the number of instances per GPU. The reservation app's
-    per-GPU-class **management buffer** is a related hand-set lever ---
-    capacity held back from ordinary members for maintenance and
-    accommodations --- that likewise has to be sized by judgement.
-    Reserved-pool sizing, management buffers, and MIG profiles should be
-    reviewed against observed demand.
-
--   **On-demand remains best-effort.** Students without a reservation
-    still depend on available and recycled capacity; the predictability
-    guarantee applies to reservation holders. Oversubscription and queue
-    transparency mitigate, but do not eliminate, on-demand waits.
-
-9\. How this compares with peer institutions
+7\. How this compares with peer institutions
 
 Most instructional clusters do not hand-build reservation logic; they
 lean on a scheduler that already provides queueing, quotas and fair
@@ -331,9 +237,8 @@ auto-terminating sessions, and an in-UI countdown.
 What none of these provide cleanly is a student-facing, calendar-style
 guarantee of a specific time --- which is precisely the predictability
 goal here. That justifies the custom layer, while we deliberately reuse
-proven ideas from the field: idle-culling and runtime caps for
-utilization, MIG for isolation, and queue transparency for the on-demand
-cohort.
+proven ideas from the field e.g. idle-culling and runtime caps for
+utilization.
 
 Appendix A --- Reservation-block lifecycle
 
