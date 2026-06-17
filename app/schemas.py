@@ -24,6 +24,7 @@ class GroupBrief(BaseModel):
 class GpuClassBrief(BaseModel):
     id: int
     name: str
+    label_value: Optional[str] = None
 
 
 class PolicyBrief(BaseModel):
@@ -52,10 +53,13 @@ class ReservationResponse(BaseModel):
     status: str              # "active" | "cancelled"
     kind: str                # "user" | "ondemand"
     notes: Optional[str] = None
+    submitted_by_id: Optional[int] = None
+    submitted_by: Optional[UserBrief] = None
     created_at: datetime
     updated_at: datetime
     cancelled_at: Optional[datetime] = None
     cancelled_by_id: Optional[int] = None
+    cancelled_by: Optional[UserBrief] = None
     created_by_id: Optional[int] = None  # admin who created an ondemand block; null if auto-filled
 
 

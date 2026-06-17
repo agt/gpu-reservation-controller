@@ -6,12 +6,13 @@ metadata:
     {{- include "gpu-reservation-controller.labels" . | nindent 4 }}
 rules:
   # The controller lists and watches pods across all namespaces to detect
-  # reservation candidates, and patches pods in any user namespace to apply
-  # tolerations and set activeDeadlineSeconds.
+  # reservation candidates, patches pods to apply tolerations and set
+  # activeDeadlineSeconds, and deletes pods when a reservation is cancelled.
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "patch"]
-  # emit_runtime_capped_event creates a Normal event on each admitted pod.
+    verbs: ["get", "list", "watch", "patch", "delete"]
+  # emit_runtime_capped_event and emit_reservation_cancelled_event create
+  # Normal events on admitted pods.
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create"]

@@ -412,6 +412,75 @@ async def emit_runtime_capped_event(
     )
 
 
+async def delete_pod(name: str, namespace: str) -> None:
+    """Delete a pod by name and namespace.
+
+    A 404 response is silently ignored — the pod may have already been removed
+    by the time the controller processes the cancellation.
+    """
+    log.debug("k8s: delete_namespaced_pod %s/%s", namespace, name)
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: _core_v1.delete_namespaced_pod(name, namespace),
+        )
+        log.info("Deleted pod %s/%s", namespace, name)
+    except Exception as exc:
+        if getattr(getattr(exc, "status", None), "__class__", None) is not None:
+            status = getattr(exc, "status", None)
+            if status == 404:
+                log.debug("Pod %s/%s already gone (404)", namespace, name)
+                return
+        raise
+
+
+async def emit_reservation_cancelled_event(
+    pod,
+    pod_name: str,
+    namespace: str,
+    cancelled_by_desc: str,
+) -> None:
+    """Create a Kubernetes Event linked to *pod* with reason='ReservationCancelled'."""
+    now = datetime.now(timezone.utc)
+    event = k8s_client.CoreV1Event(
+        metadata=k8s_client.V1ObjectMeta(
+            name=f"gpu-rescancel-{pod.metadata.uid}",
+            namespace=namespace,
+        ),
+        involved_object=k8s_client.V1ObjectReference(
+            api_version="v1",
+            kind="Pod",
+            name=pod_name,
+            namespace=namespace,
+            uid=pod.metadata.uid,
+        ),
+        reason="ReservationCancelled",
+        message=f"Pod evicted: GPU reservation cancelled {cancelled_by_desc}.",
+        type="Normal",
+        first_timestamp=now,
+        last_timestamp=now,
+        count=1,
+        reporting_component="gpu-reservation-controller",
+        action="EvictPod",
+    )
+    log.debug(
+        "k8s: create_namespaced_event %s (pod=%s, reason=ReservationCancelled)",
+        namespace,
+        pod_name,
+    )
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: _core_v1.create_namespaced_event(namespace, event),
+    )
+    log.info(
+        "Emitted ReservationCancelled event for pod %s/%s",
+        namespace,
+        pod_name,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pod event stream
 # ---------------------------------------------------------------------------

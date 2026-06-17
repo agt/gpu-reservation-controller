@@ -8,7 +8,7 @@ Implements only the endpoints the controller needs:
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import httpx
@@ -67,6 +67,39 @@ class ReservationClient:
             len(results),
             self._lookahead_days,
         )
+        return results
+
+    async def fetch_cancelled_reservations(
+        self, date_start: date, date_end: date
+    ) -> list[ReservationResponse]:
+        """Return cancelled reservations in the given date range.
+
+        Used to retrieve ``cancelled_by`` info for reservations that disappeared
+        from the active list mid-window.
+        """
+        results: list[ReservationResponse] = []
+        offset = 0
+        limit = 200
+
+        while True:
+            resp = await self._client.get(
+                "/api/reservations",
+                params={
+                    "status": "cancelled",
+                    "date_start": date_start.isoformat(),
+                    "date_end": date_end.isoformat(),
+                    "limit": limit,
+                    "offset": offset,
+                },
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            page = [ReservationResponse.model_validate(r) for r in resp.json()]
+            results.extend(page)
+            if len(page) < limit:
+                break
+            offset += limit
+
         return results
 
     async def fetch_gpu_class(self, gpu_class_id: int) -> Optional[GpuClassDetail]:
