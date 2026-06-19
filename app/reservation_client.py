@@ -1,7 +1,7 @@
 """Async HTTP client for the GPU Reservation management API.
 
 Implements only the endpoints the controller needs:
-  - GET /api/reservations  — paginated list of active reservations
+  - GET /api/reservations  — paginated list of all (active + cancelled) reservations
   - GET /api/gpu-classes/{id}  — per-class detail including label_value
 """
 
@@ -36,7 +36,7 @@ class ReservationClient:
     # ------------------------------------------------------------------
 
     async def fetch_reservations(self) -> list[ReservationResponse]:
-        """Return all active reservations from today through lookahead window."""
+        """Return all reservations (active and cancelled) from today through lookahead window."""
         today = date.today()
         end = today + timedelta(days=self._lookahead_days)
         results: list[ReservationResponse] = []
@@ -47,7 +47,7 @@ class ReservationClient:
             resp = await self._client.get(
                 "/api/reservations",
                 params={
-                    "status": "active",
+                    "status": "all",
                     "date_start": today.isoformat(),
                     "date_end": end.isoformat(),
                     "limit": limit,
@@ -62,44 +62,14 @@ class ReservationClient:
                 break
             offset += limit
 
+        active = sum(1 for r in results if r.status == "active")
         log.info(
-            "Fetched %d active reservations (today + %d days)",
+            "Fetched %d reservations (%d active, %d cancelled) (today + %d days)",
             len(results),
+            active,
+            len(results) - active,
             self._lookahead_days,
         )
-        return results
-
-    async def fetch_cancelled_reservations(
-        self, date_start: date, date_end: date
-    ) -> list[ReservationResponse]:
-        """Return cancelled reservations in the given date range.
-
-        Used to retrieve ``cancelled_by`` info for reservations that disappeared
-        from the active list mid-window.
-        """
-        results: list[ReservationResponse] = []
-        offset = 0
-        limit = 200
-
-        while True:
-            resp = await self._client.get(
-                "/api/reservations",
-                params={
-                    "status": "cancelled",
-                    "date_start": date_start.isoformat(),
-                    "date_end": date_end.isoformat(),
-                    "limit": limit,
-                    "offset": offset,
-                },
-                timeout=15.0,
-            )
-            resp.raise_for_status()
-            page = [ReservationResponse.model_validate(r) for r in resp.json()]
-            results.extend(page)
-            if len(page) < limit:
-                break
-            offset += limit
-
         return results
 
     async def fetch_gpu_class(self, gpu_class_id: int) -> Optional[GpuClassDetail]:

@@ -95,59 +95,50 @@ def _state_with_label() -> ControllerState:
 class TestDetectCancelledInWindow:
     def test_detects_mid_window_cancellation(self):
         state = _state_with_label()
-        res = _user_res(1, start_offset=0, duration=120)
-        # Seed previous cycle with res
-        state._prev_reservations = {1: res}
-        # New fetch has no reservations
+        res = _user_res(1, start_offset=0, duration=120, cancelled_by_id=99)
         mid_window = res.start_utc + timedelta(minutes=30)
-        result = state.detect_cancelled_in_window([], mid_window)
+        result = state.detect_cancelled_in_window([res], mid_window)
         assert [r.id for r in result] == [1]
 
     def test_ignores_naturally_expired(self):
         state = _state_with_label()
-        res = _user_res(1, start_offset=0, duration=60)
-        state._prev_reservations = {1: res}
-        # now is after the window ended
+        res = _user_res(1, start_offset=0, duration=60, cancelled_by_id=99)
         after_end = slot_end(res) + timedelta(minutes=1)
-        result = state.detect_cancelled_in_window([], after_end)
+        result = state.detect_cancelled_in_window([res], after_end)
         assert result == []
 
-    def test_ignores_still_active(self):
+    def test_ignores_active_status(self):
         state = _state_with_label()
-        res = _user_res(1, start_offset=0, duration=120)
-        state._prev_reservations = {1: res}
+        res = _user_res(1, start_offset=0, duration=120)  # status="active"
         mid_window = res.start_utc + timedelta(minutes=30)
-        # Same reservation still in the new list
         result = state.detect_cancelled_in_window([res], mid_window)
         assert result == []
 
     def test_ignores_already_noshow(self):
         state = _state_with_label()
-        res = _user_res(1, start_offset=0, duration=120)
-        state._prev_reservations = {1: res}
+        res = _user_res(1, start_offset=0, duration=120, cancelled_by_id=99)
         state.noshow_reservation_ids.add(1)
         mid_window = res.start_utc + timedelta(minutes=30)
-        result = state.detect_cancelled_in_window([], mid_window)
+        result = state.detect_cancelled_in_window([res], mid_window)
         assert result == []
 
     def test_ignores_already_recorded_cancellation(self):
         state = _state_with_label()
-        res = _user_res(1, start_offset=0, duration=120)
-        state._prev_reservations = {1: res}
+        res = _user_res(1, start_offset=0, duration=120, cancelled_by_id=99)
         state.cancelled_reservations = {1: res}
         mid_window = res.start_utc + timedelta(minutes=30)
-        result = state.detect_cancelled_in_window([], mid_window)
+        result = state.detect_cancelled_in_window([res], mid_window)
         assert result == []
 
-    def test_updates_prev_reservations(self):
+    def test_mixed_list_returns_only_cancelled_in_window(self):
         state = _state_with_label()
-        res_old = _user_res(1, start_offset=0, duration=120)
-        res_new = _user_res(2, start_offset=0, duration=120)
-        state._prev_reservations = {1: res_old}
-        state.detect_cancelled_in_window([res_new], res_new.start_utc + timedelta(minutes=10))
-        assert set(state._prev_reservations.keys()) == {2}
+        active_res = _user_res(1, start_offset=0, duration=120)
+        cancelled_res = _user_res(2, start_offset=0, duration=120, cancelled_by_id=99)
+        mid_window = active_res.start_utc + timedelta(minutes=30)
+        result = state.detect_cancelled_in_window([active_res, cancelled_res], mid_window)
+        assert [r.id for r in result] == [2]
 
-    def test_empty_prev_no_detections(self):
+    def test_empty_list_no_detections(self):
         state = _state_with_label()
         res = _user_res(1, start_offset=0, duration=120)
         mid_window = res.start_utc + timedelta(minutes=30)

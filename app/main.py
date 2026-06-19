@@ -79,14 +79,15 @@ async def _refresh_reservations(
     cache is rebuilt from scratch each cycle so stale entries don't linger).
     After updating the reservations, reconciles the task queue.
     """
-    reservations = await client.fetch_reservations()
+    all_reservations = await client.fetch_reservations()
+    active_reservations = [r for r in all_reservations if r.status == "active"]
 
     # Detect reservations cancelled mid-window before overwriting the state.
     now = datetime.now(timezone.utc)
-    cancelled_in_window = state.detect_cancelled_in_window(reservations, now)
+    cancelled_in_window = state.detect_cancelled_in_window(all_reservations, now)
 
-    # Resolve label_value for each unique GPU class in this batch.
-    class_ids = {r.gpu_class_id for r in reservations}
+    # Resolve label_value for each unique GPU class in active reservations.
+    class_ids = {r.gpu_class_id for r in active_reservations}
     new_labels: dict[int, str] = {}
     for cid in class_ids:
         # Re-use cached value if we already know it.
@@ -105,7 +106,7 @@ async def _refresh_reservations(
                 cid,
             )
 
-    state.reservations = reservations
+    state.reservations = active_reservations
     state.gpu_class_labels = new_labels
 
     # Drop / re-match queue entries whose reservation was cancelled.
@@ -115,7 +116,7 @@ async def _refresh_reservations(
 
     # Handle mid-window cancellations: evict pods and reclaim capacity.
     if cancelled_in_window:
-        await _handle_cancelled_reservations(state, client, cancelled_in_window, now)
+        await _handle_cancelled_reservations(state, cancelled_in_window, now)
 
 
 # ---------------------------------------------------------------------------
@@ -125,34 +126,18 @@ async def _refresh_reservations(
 
 async def _handle_cancelled_reservations(
     state: ControllerState,
-    client: ReservationClient,
     cancelled_in_window: list,
     now: datetime,
 ) -> None:
     """Evict pods admitted under cancelled reservations and reclaim capacity.
 
-    For each reservation that disappeared from the active list while its window
-    was still open:
-    1. Fetch the cancelled reservation from the API to obtain ``cancelled_by`` info.
-    2. Snapshot live tolerated pods and filter those admitted under this reservation.
-    3. Emit a ReservationCancelled event on each pod, then delete it.
-    4. Record the reservation in ``state.cancelled_reservations`` so its freed
+    For each in-window cancelled reservation (already carrying ``cancelled_by``
+    info from the ``status=all`` fetch):
+    1. Snapshot live tolerated pods and filter those admitted under this reservation.
+    2. Emit a ReservationCancelled event on each pod, then delete it.
+    3. Record the reservation in ``state.cancelled_reservations`` so its freed
        GPU capacity is immediately available for on-demand placement.
     """
-    # Fetch cancelled reservations in the date range of detected cancellations.
-    date_min = min(r.date for r in cancelled_in_window)
-    date_max = max(r.date for r in cancelled_in_window)
-    cancelled_map: dict[int, object] = {}
-    try:
-        fetched = await client.fetch_cancelled_reservations(date_min, date_max)
-        cancelled_map = {r.id: r for r in fetched}
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "Could not fetch cancelled-reservation details (%s); "
-            "canceller info will be omitted from pod events",
-            exc,
-        )
-
     # One pod snapshot serves the whole batch.
     pod_snapshot = []
     try:
@@ -160,17 +145,15 @@ async def _handle_cancelled_reservations(
     except Exception as exc:  # noqa: BLE001
         log.warning("Could not snapshot pods for cancellation eviction: %s", exc)
 
-    for prev_res in cancelled_in_window:
-        # Prefer the freshly-fetched version (has cancelled_by); fall back to prev.
-        full_res = cancelled_map.get(prev_res.id, prev_res)
-        cancelled_by_desc = canceller_description(full_res)
+    for cancelled_res in cancelled_in_window:
+        cancelled_by_desc = canceller_description(cancelled_res)
 
-        pods_for_res = [p for p in pod_snapshot if p.reservation_id == prev_res.id]
+        pods_for_res = [p for p in pod_snapshot if p.reservation_id == cancelled_res.id]
         if pods_for_res:
             log.info(
                 "Evicting %d pod(s) for cancelled reservation #%d (%s)",
                 len(pods_for_res),
-                prev_res.id,
+                cancelled_res.id,
                 cancelled_by_desc,
             )
         for pod_info in pods_for_res:
@@ -199,7 +182,7 @@ async def _handle_cancelled_reservations(
                 )
 
         # Record immediately so on-demand candidates can use the freed capacity.
-        state.record_cancelled_reservation(full_res)
+        state.record_cancelled_reservation(cancelled_res)
 
 
 # ---------------------------------------------------------------------------

@@ -161,11 +161,6 @@ class ControllerState:
         # Recomputed from the live pod snapshot each queue-processor tick.
         self.claimed_reservation_ids: set[int] = set()
 
-        # Snapshot of the previous fetch cycle's reservations, keyed by id.
-        # Used to detect mid-window cancellations (reservations that disappeared
-        # while their window was still open).
-        self._prev_reservations: dict[int, ReservationResponse] = {}
-
         # Cancelled in-window user reservations retained until their window ends
         # so their freed GPU capacity can be offered for on-demand placement.
         # Keyed by reservation id; values are the last-known ReservationResponse
@@ -816,40 +811,30 @@ class ControllerState:
 
     def detect_cancelled_in_window(
         self,
-        new_reservations: list[ReservationResponse],
+        all_reservations: list[ReservationResponse],
         now: datetime,
     ) -> list[ReservationResponse]:
         """Identify user reservations that were cancelled while their window was open.
 
-        Compares the incoming *new_reservations* list against the snapshot from the
-        previous fetch cycle.  A reservation is considered cancelled mid-window when:
-        - it was present in the previous snapshot, AND
-        - it is absent from the new list (API no longer returns it as active), AND
-        - its window had not yet ended (``slot_end > now``), AND
-        - it was not already declared a no-show (no action needed — the freed
-          capacity was already lent to on-demand use), AND
+        Scans *all_reservations* (the full ``status=all`` API response) for records
+        with ``status == "cancelled"`` whose window has not yet closed.  A cancelled
+        reservation is returned when:
+        - its ``status`` is ``"cancelled"``, AND
+        - its window has not yet ended (``slot_end > now``), AND
+        - it was not already declared a no-show (freed capacity already lent to
+          on-demand use), AND
         - it was not already recorded in ``cancelled_reservations`` (idempotent).
 
-        Updates ``_prev_reservations`` to the new snapshot before returning.
-
-        Returns the list of (previous-cycle) ``ReservationResponse`` objects for
-        every reservation that meets all criteria.
+        Returns the list of ``ReservationResponse`` objects (with ``cancelled_by``
+        already populated from the API) for every reservation that meets all criteria.
         """
-        new_ids = {r.id for r in new_reservations}
-        cancelled: list[ReservationResponse] = []
-        for rid, prev in self._prev_reservations.items():
-            if rid in new_ids:
-                continue  # still active
-            if slot_end(prev) <= now:
-                continue  # expired naturally — not a mid-window cancellation
-            if rid in self.noshow_reservation_ids:
-                continue  # already reclaimed for on-demand; nothing to do
-            if rid in self.cancelled_reservations:
-                continue  # already processed in a previous cycle
-            cancelled.append(prev)
-
-        self._prev_reservations = {r.id: r for r in new_reservations}
-        return cancelled
+        return [
+            r for r in all_reservations
+            if r.status == "cancelled"
+            and slot_end(r) > now
+            and r.id not in self.noshow_reservation_ids
+            and r.id not in self.cancelled_reservations
+        ]
 
     def record_cancelled_reservation(self, r: ReservationResponse) -> None:
         """Register *r* as a cancelled in-window reservation for on-demand use.
