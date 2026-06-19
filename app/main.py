@@ -33,12 +33,15 @@ from .controller import (
     ControllerState,
     OnDemandCandidate,
     QueueEntry,
+    canceller_description,
     slot_end,
     slot_start,
 )
 from .k8s_client import (
     PodWatcher,
     apply_toleration,
+    delete_pod,
+    emit_reservation_cancelled_event,
     emit_runtime_capped_event,
     get_pod_booking_reference,
     get_pod_gpu_count,
@@ -78,6 +81,10 @@ async def _refresh_reservations(
     """
     reservations = await client.fetch_reservations()
 
+    # Detect reservations cancelled mid-window before overwriting the state.
+    now = datetime.now(timezone.utc)
+    cancelled_in_window = state.detect_cancelled_in_window(reservations, now)
+
     # Resolve label_value for each unique GPU class in this batch.
     class_ids = {r.gpu_class_id for r in reservations}
     new_labels: dict[int, str] = {}
@@ -105,6 +112,94 @@ async def _refresh_reservations(
     state.reconcile_queue()
     # Occupancy is rebuilt from a live cluster snapshot each queue-processor
     # tick (reconcile_occupancy), so no reservation-driven prune is needed here.
+
+    # Handle mid-window cancellations: evict pods and reclaim capacity.
+    if cancelled_in_window:
+        await _handle_cancelled_reservations(state, client, cancelled_in_window, now)
+
+
+# ---------------------------------------------------------------------------
+# Cancellation handler
+# ---------------------------------------------------------------------------
+
+
+async def _handle_cancelled_reservations(
+    state: ControllerState,
+    client: ReservationClient,
+    cancelled_in_window: list,
+    now: datetime,
+) -> None:
+    """Evict pods admitted under cancelled reservations and reclaim capacity.
+
+    For each reservation that disappeared from the active list while its window
+    was still open:
+    1. Fetch the cancelled reservation from the API to obtain ``cancelled_by`` info.
+    2. Snapshot live tolerated pods and filter those admitted under this reservation.
+    3. Emit a ReservationCancelled event on each pod, then delete it.
+    4. Record the reservation in ``state.cancelled_reservations`` so its freed
+       GPU capacity is immediately available for on-demand placement.
+    """
+    # Fetch cancelled reservations in the date range of detected cancellations.
+    date_min = min(r.date for r in cancelled_in_window)
+    date_max = max(r.date for r in cancelled_in_window)
+    cancelled_map: dict[int, object] = {}
+    try:
+        fetched = await client.fetch_cancelled_reservations(date_min, date_max)
+        cancelled_map = {r.id: r for r in fetched}
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Could not fetch cancelled-reservation details (%s); "
+            "canceller info will be omitted from pod events",
+            exc,
+        )
+
+    # One pod snapshot serves the whole batch.
+    pod_snapshot = []
+    try:
+        pod_snapshot = await snapshot_tolerated_pods(TOLERATION_KEY)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not snapshot pods for cancellation eviction: %s", exc)
+
+    for prev_res in cancelled_in_window:
+        # Prefer the freshly-fetched version (has cancelled_by); fall back to prev.
+        full_res = cancelled_map.get(prev_res.id, prev_res)
+        cancelled_by_desc = canceller_description(full_res)
+
+        pods_for_res = [p for p in pod_snapshot if p.reservation_id == prev_res.id]
+        if pods_for_res:
+            log.info(
+                "Evicting %d pod(s) for cancelled reservation #%d (%s)",
+                len(pods_for_res),
+                prev_res.id,
+                cancelled_by_desc,
+            )
+        for pod_info in pods_for_res:
+            # Emit event before deletion so the event record survives.
+            try:
+                pod_obj = await read_pod(pod_info.name, pod_info.namespace)
+                await emit_reservation_cancelled_event(
+                    pod_obj, pod_info.name, pod_info.namespace, cancelled_by_desc
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Could not emit ReservationCancelled event for pod %s/%s: %s",
+                    pod_info.namespace,
+                    pod_info.name,
+                    exc,
+                )
+            try:
+                await delete_pod(pod_info.name, pod_info.namespace)
+                state.release_pod(pod_info.uid)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Could not delete pod %s/%s: %s",
+                    pod_info.namespace,
+                    pod_info.name,
+                    exc,
+                )
+
+        # Record immediately so on-demand candidates can use the freed capacity.
+        state.record_cancelled_reservation(full_res)
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +705,7 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
             state.refresh_claimed_reservations(holder_ids, now)
 
         state.check_noshow_deadlines(now)
+        state.cleanup_cancelled_reservations(now)
 
         # Guard 3: refresh safety interlock from the same snapshot.
         if config.ondemand_placement_enabled and snapshot is not None:

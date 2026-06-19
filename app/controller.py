@@ -24,6 +24,23 @@ from .schemas import ReservationResponse
 
 log = logging.getLogger(__name__)
 
+
+def canceller_description(r: ReservationResponse) -> str:
+    """Return the 'by X' fragment for a ReservationCancelled event message.
+
+    Priority:
+    1. ``cancelled_by`` UserBrief present and is a different user → "by <username>"
+    2. ``cancelled_by_id`` set, differs from owner, no name available → "by another user"
+    3. Fallback → "by user" (self-cancellation or unknown canceller)
+    """
+    if r.cancelled_by is not None:
+        if r.user_id is None or r.cancelled_by.id != r.user_id:
+            return f"by {r.cancelled_by.username}"
+    elif r.cancelled_by_id is not None:
+        if r.user_id is None or r.cancelled_by_id != r.user_id:
+            return "by another user"
+    return "by user"
+
 # Toleration key applied by the controller.  The full toleration is:
 #   gpu-class-reservation=<gpu-class-label>:NoSchedule
 TOLERATION_KEY = "gpu-class-reservation"
@@ -143,6 +160,17 @@ class ControllerState:
         # chained deadline even though no pod is booked directly under it.
         # Recomputed from the live pod snapshot each queue-processor tick.
         self.claimed_reservation_ids: set[int] = set()
+
+        # Snapshot of the previous fetch cycle's reservations, keyed by id.
+        # Used to detect mid-window cancellations (reservations that disappeared
+        # while their window was still open).
+        self._prev_reservations: dict[int, ReservationResponse] = {}
+
+        # Cancelled in-window user reservations retained until their window ends
+        # so their freed GPU capacity can be offered for on-demand placement.
+        # Keyed by reservation id; values are the last-known ReservationResponse
+        # (from the cycle before cancellation was detected).
+        self.cancelled_reservations: dict[int, ReservationResponse] = {}
 
     # ------------------------------------------------------------------
     # No-show tracking
@@ -687,16 +715,37 @@ class ControllerState:
         Selection: prefer the block with the **latest** ``slot_end`` (maximises the
         pod's effective runtime); break ties by most available capacity.
         """
-        candidates = [
+        def _label_matches(r: ReservationResponse) -> bool:
+            cached = self.gpu_class_labels.get(r.gpu_class_id)
+            if cached is not None:
+                return cached == gpu_class_label
+            # Fall back to the label_value embedded in the reservation response
+            # (populated from GpuClassBrief) for cancelled reservations whose
+            # GPU class may have dropped out of the active-reservation cache.
+            return (r.gpu_class.label_value if r.gpu_class else None) == gpu_class_label
+
+        # Active on-demand / no-show blocks from the live reservation list.
+        from_active = [
             r
             for r in self.reservations
             if (r.kind == "ondemand" or r.id in self.noshow_reservation_ids)
             and r.id not in self.claimed_reservation_ids
-            and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
+            and _label_matches(r)
             and slot_start(r) <= now < slot_end(r)
             and self.available(r) >= gpu_requested
             and (slot_end(r) - now).total_seconds() >= min_runtime_seconds
         ]
+        # Freed capacity from cancelled user reservations (not in self.reservations).
+        from_cancelled = [
+            r
+            for r in self.cancelled_reservations.values()
+            if r.id not in self.claimed_reservation_ids
+            and _label_matches(r)
+            and slot_start(r) <= now < slot_end(r)
+            and self.available(r) >= gpu_requested
+            and (slot_end(r) - now).total_seconds() >= min_runtime_seconds
+        ]
+        candidates = from_active + from_cancelled
         if not candidates:
             return None
         # Latest slot_end first; break ties by most available capacity (desc).
@@ -760,6 +809,80 @@ class ControllerState:
             if r.id == reservation_id:
                 return r.gpu_count
         return 0
+
+    # ------------------------------------------------------------------
+    # Cancellation detection and freed-capacity tracking
+    # ------------------------------------------------------------------
+
+    def detect_cancelled_in_window(
+        self,
+        new_reservations: list[ReservationResponse],
+        now: datetime,
+    ) -> list[ReservationResponse]:
+        """Identify user reservations that were cancelled while their window was open.
+
+        Compares the incoming *new_reservations* list against the snapshot from the
+        previous fetch cycle.  A reservation is considered cancelled mid-window when:
+        - it was present in the previous snapshot, AND
+        - it is absent from the new list (API no longer returns it as active), AND
+        - its window had not yet ended (``slot_end > now``), AND
+        - it was not already declared a no-show (no action needed — the freed
+          capacity was already lent to on-demand use), AND
+        - it was not already recorded in ``cancelled_reservations`` (idempotent).
+
+        Updates ``_prev_reservations`` to the new snapshot before returning.
+
+        Returns the list of (previous-cycle) ``ReservationResponse`` objects for
+        every reservation that meets all criteria.
+        """
+        new_ids = {r.id for r in new_reservations}
+        cancelled: list[ReservationResponse] = []
+        for rid, prev in self._prev_reservations.items():
+            if rid in new_ids:
+                continue  # still active
+            if slot_end(prev) <= now:
+                continue  # expired naturally — not a mid-window cancellation
+            if rid in self.noshow_reservation_ids:
+                continue  # already reclaimed for on-demand; nothing to do
+            if rid in self.cancelled_reservations:
+                continue  # already processed in a previous cycle
+            cancelled.append(prev)
+
+        self._prev_reservations = {r.id: r for r in new_reservations}
+        return cancelled
+
+    def record_cancelled_reservation(self, r: ReservationResponse) -> None:
+        """Register *r* as a cancelled in-window reservation for on-demand use.
+
+        The freed GPU capacity becomes available to on-demand candidates via
+        ``find_ondemand_block`` until the reservation's window ends.
+        """
+        self.cancelled_reservations[r.id] = r
+        gpu_class_label = (
+            self.gpu_class_labels.get(r.gpu_class_id)
+            or (r.gpu_class.label_value if r.gpu_class else None)
+            or "unknown"
+        )
+        user = r.user.username if r.user else "?"
+        log.info(
+            "Reservation #%d (user=%s, gpu-class=%s, %d GPU(s)) cancelled mid-window; "
+            "freed capacity available for on-demand placement until %s",
+            r.id,
+            user,
+            gpu_class_label,
+            r.gpu_count,
+            slot_end(r).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+
+    def cleanup_cancelled_reservations(self, now: datetime) -> None:
+        """Remove expired entries from ``cancelled_reservations``.
+
+        Called each queue-processor tick so stale entries don't accumulate.
+        """
+        expired = [rid for rid, r in self.cancelled_reservations.items() if slot_end(r) <= now]
+        for rid in expired:
+            del self.cancelled_reservations[rid]
+            log.debug("Cancelled reservation #%d window ended; removed from on-demand pool", rid)
 
     def reconcile_occupancy(self, placements: list[tuple[int, str, int]]) -> None:
         """Rebuild the occupancy map from a live cluster snapshot.
