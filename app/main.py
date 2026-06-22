@@ -114,6 +114,9 @@ async def _refresh_reservations(
 
     state.reservations = active_reservations
     state.gpu_class_labels = new_labels
+    # Stamp the freshness of this data; the reclaim-merge commitment test anchors
+    # its guard horizon here, not on the between-fetch tick clock.
+    state.last_reservation_fetch_at = now
 
     # Drop / re-match queue entries whose reservation was cancelled.
     state.reconcile_queue()

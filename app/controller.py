@@ -188,6 +188,15 @@ class ControllerState:
         # reclaim-block merging is skipped while unknown.
         self.reclaim_preempt_guard_minutes: Optional[int] = None
 
+        # Wall-clock time of the most recent successful reservation fetch.  The
+        # commitment ("within guard") test for a merge candidate is judged against
+        # THIS instant, not the current tick clock: a reclaim block is only safe to
+        # merge if it was already inside the guard in the data we actually hold.
+        # Judging against an advancing between-fetch clock would let a block that
+        # was still preemptible at fetch time drift into the guard and be merged,
+        # racing a last-minute front-end booking the controller has not yet seen.
+        self.last_reservation_fetch_at: Optional[datetime] = None
+
         # Persistent reclaim-block merges, keyed by subject reservation id.  Each
         # records the future reclaim block(s) folded into the subject and the
         # extended end the subject window is stretched to.  Re-applied to freshly
@@ -728,12 +737,21 @@ class ControllerState:
         A "subject block" is any currently-open on-demand window — a reclaim
         hold, a declared no-show, or a cancelled-in-window reservation.  When a
         subject abuts a future ``kind == "reclaim"`` block of the same GPU class
-        and equal ``gpu_count`` whose start is inside
-        ``reclaim_preempt_guard_minutes`` of *now* (the app has committed it and
-        will not preempt it), the two are merged: the subject's window is
-        stretched to the future block's end and that block is recorded as a stub
-        (excluded from independent on-demand placement).  This maximises the
-        runtime of an on-demand job beginning in the subject block.
+        and equal ``gpu_count`` that was already inside
+        ``reclaim_preempt_guard_minutes`` **at the last reservation fetch** (the
+        app has committed it and will not preempt it), the two are merged: the
+        subject's window is stretched to the future block's end and that block is
+        recorded as a stub (excluded from independent on-demand placement).  This
+        maximises the runtime of an on-demand job beginning in the subject block.
+
+        The commitment test uses ``last_reservation_fetch_at + guard`` as the
+        horizon, **not** ``now``: a block must have been within the guard in the
+        data we actually hold.  Judging against the advancing between-fetch tick
+        clock would let a block that was still preemptible at fetch time drift
+        into the guard and be merged, racing a last-minute front-end booking the
+        controller has not yet fetched.  Because the guard is sized to exceed the
+        poll interval, a block legitimately entering the guard is always seen by a
+        fresh fetch (still present, or gone if preempted) before it is merged.
 
         Re-applying surviving records first — before the freshly loaded
         reservation objects are consulted by the placement logic — is what makes
@@ -777,7 +795,13 @@ class ControllerState:
         self.reclaim_merges = surviving
 
         # --- 2. Discover new merges (and extend existing ones transitively) ---
-        horizon = now + timedelta(minutes=guard)
+        # Commitment is judged against the data we hold: a candidate is eligible
+        # only if its start was within the guard at the last reservation fetch.
+        # Without a fetch timestamp we cannot make that judgement safely, so we
+        # re-apply surviving merges but discover none.
+        if self.last_reservation_fetch_at is None:
+            return
+        horizon = self.last_reservation_fetch_at + timedelta(minutes=guard)
         reclaim_blocks = [r for r in self.reservations if r.kind == "reclaim"]
 
         subjects: list[ReservationResponse] = [

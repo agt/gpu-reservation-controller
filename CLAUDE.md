@@ -165,10 +165,17 @@ block** — any currently-open on-demand window (a `kind="reclaim"` hold, a decl
 no-show, or a cancelled-in-window reservation) — with a directly **abutting future
 reclaim block** when that future block is **committed**.
 
-A future block is committed when its `start_utc` is within
-`reclaim_preempt_guard_minutes` of *now* (fetched from `GET /api/settings`): inside
-the guard the reservation app will not preempt the hold with a new booking, so it
-is safe to schedule onto.  The future block must be `kind="reclaim"`, share the
+A future block is committed when its `start_utc` was within
+`reclaim_preempt_guard_minutes` (fetched from `GET /api/settings`) **at the last
+reservation fetch** (`last_reservation_fetch_at`) — not merely by the between-fetch
+tick clock drifting it into the guard.  Anchoring to fetch time is essential:
+judging against the advancing tick clock would let a block that was still
+preemptible when we last fetched drift into the guard and get merged, racing a
+last-minute front-end booking the controller has not yet seen.  Because the guard
+is sized to exceed the poll interval, a block legitimately entering the guard is
+always re-seen by a fresh fetch (still present, or gone if preempted) before it is
+merged.  Inside the guard the reservation app will not preempt the hold with a new
+booking, so it is safe to schedule onto.  The future block must be `kind="reclaim"`, share the
 subject's GPU class label, and have an **equal `gpu_count`** (capacity is uniform
 across the merged span, mirroring the reserved back-to-back chaining rule
 `slot_start(next) == slot_end(prev)`).  If several abut, the longest (latest
