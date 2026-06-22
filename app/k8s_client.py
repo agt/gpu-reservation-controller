@@ -7,7 +7,7 @@ Public surface
 --------------
 init_k8s(kubeconfig_path)                    — load credentials once at startup
 get_pod_gpu_count(pod)                       — sum nvidia.com/gpu requests
-get_pod_booking_reference(pod)               — read horai/booking-reference annotation
+get_pod_booking_reference(pod)               — read horae/booking-reference annotation
 parse_booking_reference(ref)                 — reservation id from a booking-reference
 pod_has_toleration(pod, ...)                 — check for a specific toleration
 is_gpu_only_pending(pod, toleration_key)     — guard 1: GPU-only scheduling failure check
@@ -66,13 +66,13 @@ def get_pod_phase(pod) -> str:
 
 
 def get_pod_min_runtime_seconds(pod) -> Optional[int]:
-    """Read the ``horai/minimum-runtime-seconds`` annotation from *pod*.
+    """Read the ``horae/minimum-runtime-seconds`` annotation from *pod*.
 
     Returns the integer value if the annotation is present and parseable as a
     positive integer, or ``None`` otherwise.
     """
     annotations: dict = pod.metadata.annotations or {}
-    raw = annotations.get("horai/minimum-runtime-seconds")
+    raw = annotations.get("horae/minimum-runtime-seconds")
     if raw is None:
         return None
     try:
@@ -80,7 +80,7 @@ def get_pod_min_runtime_seconds(pod) -> Optional[int]:
         return value if value > 0 else None
     except (ValueError, TypeError):
         log.warning(
-            "Pod %s/%s has non-integer horai/minimum-runtime-seconds=%r; ignoring",
+            "Pod %s/%s has non-integer horae/minimum-runtime-seconds=%r; ignoring",
             pod.metadata.namespace,
             pod.metadata.name,
             raw,
@@ -103,19 +103,19 @@ def get_pod_gpu_count(pod) -> int:
 
 
 def get_pod_booking_reference(pod) -> Optional[str]:
-    """Return the ``horai/booking-reference`` annotation value, or ``None``."""
+    """Return the ``horae/booking-reference`` annotation value, or ``None``."""
     annotations: dict = pod.metadata.annotations or {}
-    return annotations.get("horai/booking-reference")
+    return annotations.get("horae/booking-reference")
 
 
-# Prefixes used in horai/booking-reference values.  All three embed the
+# Prefixes used in horae/booking-reference values.  All three embed the
 # reservation id that the pod was admitted under; the prefix records which path
 # admitted it (reserved / on-demand / no-show) and is otherwise cosmetic.
 _BOOKING_REFERENCE_PREFIXES = ("res-", "ondemand-", "noshow-")
 
 
 def parse_booking_reference(reference: Optional[str]) -> Optional[int]:
-    """Extract the reservation id embedded in a ``horai/booking-reference`` value.
+    """Extract the reservation id embedded in a ``horae/booking-reference`` value.
 
     ``"res-42"`` / ``"ondemand-42"`` / ``"noshow-42"`` all return ``42``.
     Returns ``None`` for an unrecognised prefix, a non-integer suffix, or
@@ -282,7 +282,7 @@ async def apply_toleration(
     booking_reference: str,
 ) -> None:
     """Patch *pod* to add toleration ``tol_key=tol_value:NoSchedule`` and set
-    the ``horai/booking-reference`` annotation.
+    the ``horae/booking-reference`` annotation.
 
     The booking-reference is the single key from which occupancy is later
     reconstructed (see parse_booking_reference).  The patch preserves all
@@ -311,7 +311,7 @@ async def apply_toleration(
         existing.append(entry)
 
     patch = {
-        "metadata": {"annotations": {"horai/booking-reference": booking_reference}},
+        "metadata": {"annotations": {"horae/booking-reference": booking_reference}},
         "spec": {"tolerations": existing + [new_tol]},
     }
     log.debug(
@@ -335,14 +335,14 @@ async def apply_toleration(
 
 async def set_active_deadline(pod_name: str, namespace: str, seconds: int) -> None:
     """Patch pod's spec.activeDeadlineSeconds to *seconds* and record the limit
-    in the ``horai/pod-runtime-limit-seconds`` annotation."""
+    in the ``horae/pod-runtime-limit-seconds`` annotation."""
     log.debug(
         "k8s: patch_namespaced_pod %s/%s (activeDeadlineSeconds=%d)",
         namespace, pod_name, seconds,
     )
     loop = asyncio.get_running_loop()
     patch = {
-        "metadata": {"annotations": {"horai/pod-runtime-limit-seconds": str(seconds)}},
+        "metadata": {"annotations": {"horae/pod-runtime-limit-seconds": str(seconds)}},
         "spec": {"activeDeadlineSeconds": seconds},
     }
     await loop.run_in_executor(

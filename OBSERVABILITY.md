@@ -219,4 +219,4 @@ Source: `app/k8s_client.py` (`get_pod_min_runtime_seconds`).
 
 | Level | Message | Description |
 |-------|---------|-------------|
-| WARNING | `Pod ns/name has non-integer horai/minimum-runtime-seconds='value'; ignoring` | The `horai/minimum-runtime-seconds` annotation is not a positive integer; the pod will not be treated as an on-demand candidate. |
+| WARNING | `Pod ns/name has non-integer horae/minimum-runtime-seconds='value'; ignoring` | The `horae/minimum-runtime-seconds` annotation is not a positive integer; the pod will not be treated as an on-demand candidate. |

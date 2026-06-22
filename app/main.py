@@ -533,7 +533,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
     - ADDED inside open window → fast-path immediate toleration attempt
 
     On-demand path (places onto kind="reclaim" blocks, when ``config.ondemand_placement_enabled``):
-    - ADDED, Pending, has ``horai/minimum-runtime-seconds`` annotation,
+    - ADDED, Pending, has ``horae/minimum-runtime-seconds`` annotation,
       no matching user reservation → add as on-demand candidate
     - DELETED or terminal (Succeeded/Failed) → release any held on-demand slot
       and attempt immediate placement of a waiting candidate of the same class

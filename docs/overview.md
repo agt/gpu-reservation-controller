@@ -24,7 +24,7 @@ Design and Operations Plan
 
 1\. Executive summary
 
-The Horai cluster provides usersw with exclusive, interactive
+The Horae cluster provides usersw with exclusive, interactive
 access to a GPU --- most typically via a Jupyter notebook or a VS Code session
 connected to the cluster. With courses of 300 or more students sharing
 150 GPUs, demand spikes sharply around assignment deadlines. When two

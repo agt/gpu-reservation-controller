@@ -5,7 +5,7 @@
 
 > **As built.** The two parallel capacity-tracking systems were merged into one
 > occupancy map keyed by reservation id, the res-/noshow- double-count (#3) was
-> closed, and the redundant `horai/ondemand-block-id` annotation (#2) was retired.
+> closed, and the redundant `horae/ondemand-block-id` annotation (#2) was retired.
 > Landed as four small commits on `main` (no PR — early development); the test
 > suite went 153 → 197 passing. Two deliberate divergences from the original plan
 > are flagged inline in §5 and §3.4. Symbol names below are current; code
@@ -19,9 +19,9 @@ mechanisms** that never saw each other:
 
 | | Reserved path | On-demand / no-show path |
 |---|---|---|
-| Mechanism | `count_tolerated_gpu_usage` — live namespaced pod LIST, counted pods whose `horai/booking-reference == "res-<id>"` | `ControllerState.ondemand_occupancy` — in-memory `{block_id: {pod_uid: gpu_count}}` |
+| Mechanism | `count_tolerated_gpu_usage` — live namespaced pod LIST, counted pods whose `horae/booking-reference == "res-<id>"` | `ControllerState.ondemand_occupancy` — in-memory `{block_id: {pod_uid: gpu_count}}` |
 | Source of truth | the cluster (recomputed each attempt) | the controller's own bookkeeping |
-| Restart recovery | nothing to rebuild; re-counted live | reconstructed from `horai/ondemand-block-id` |
+| Restart recovery | nothing to rebuild; re-counted live | reconstructed from `horae/ondemand-block-id` |
 | Scope | one namespace (the holder's) | cross-namespace |
 | Race safety | **none** — TOCTOU between count and patch | optimistic reservation before `await` |
 
@@ -39,8 +39,8 @@ both cost us:
   no-show and lend its full `gpu_count` to `noshow-(X+1)` pods *on top of* the
   still-running holder. Latent with default timings; live when
   `NOSHOWN_TIMEOUT_MINUTES` is small.
-- **Annotation redundancy (#2).** `horai/ondemand-block-id` re-encoded the id
-  already embedded in `horai/booking-reference`. Two sources of truth for one
+- **Annotation redundancy (#2).** `horae/ondemand-block-id` re-encoded the id
+  already embedded in `horae/booking-reference`. Two sources of truth for one
   value.
 - **Two mental models, two reconciliation paths, an un-self-healing on-demand
   map, and a racy reserved path.**
@@ -54,8 +54,8 @@ both cost us:
    policy, and the (cosmetic) booking-reference prefix.
 2. Structurally close **#3**: a reservation a live holder is chained through is
    never lent out as on-demand/no-show capacity.
-3. Retire **`horai/ondemand-block-id`** (#2): reconstruct occupancy from
-   `horai/booking-reference`.
+3. Retire **`horae/ondemand-block-id`** (#2): reconstruct occupancy from
+   `horae/booking-reference`.
 4. Preserve the on-demand map's race-free optimistic reservation, and recover
    the live count's self-healing for *all* paths.
 
@@ -63,7 +63,7 @@ both cost us:
 
 - No change to matching rules, the three guards, runtime-cap arithmetic, or the
   no-show timeout/grace semantics (beyond the chain-awareness in goal 2).
-- `horai/pod-runtime-limit-seconds` stays (consumed by in-pod notification
+- `horae/pod-runtime-limit-seconds` stays (consumed by in-pod notification
   widgets).
 - No persistent store — still fully in-memory, rebuilt from the cluster + API.
 
@@ -184,17 +184,17 @@ worst case a ≤30 s transient that self-corrects. (Documented in
 `reconcile_occupancy` and CLAUDE.md; hardening option: carry over uids recorded
 within the last few seconds during rebuild.)
 
-### 3.5 Retire `horai/ondemand-block-id` (#2)
+### 3.5 Retire `horae/ondemand-block-id` (#2)
 
 A pure helper `parse_booking_reference(ref) -> Optional[int]` strips the
 `res-` / `ondemand-` / `noshow-` prefix; reconstruction (startup LIST and each
 reconcile) uses it. Then:
 
 - `get_pod_ondemand_block_id` was deleted.
-- The `extra_annotations={"horai/ondemand-block-id": ...}` write was dropped from
+- The `extra_annotations={"horae/ondemand-block-id": ...}` write was dropped from
   on-demand placement, and the now-unused `extra_annotations` parameter was
   removed from `apply_toleration`.
-- `horai/booking-reference` is now load-bearing for reconstruction (it already
+- `horae/booking-reference` is now load-bearing for reconstruction (it already
   was for budget). It is written on every admission by `apply_toleration`, so
   there was **no migration gap** — pods placed by the previous controller already
   carry it (`ondemand-X` / `noshow-X` / `res-X`), and reserved pods the old
