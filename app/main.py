@@ -505,13 +505,13 @@ async def reservation_fetch_loop(
 async def pod_watch_loop(state: ControllerState, config: Config) -> None:
     """Stream pod events and update the task queue / on-demand candidates.
 
-    Reserved path (kind="user"):
+    Reserved path (kind="booking"):
     - ADDED / MODIFIED, no toleration → enqueue for reservation matching
     - ADDED / MODIFIED, toleration present → dequeue (already admitted)
     - DELETED → dequeue
     - ADDED inside open window → fast-path immediate toleration attempt
 
-    On-demand path (kind="ondemand", when ``config.ondemand_placement_enabled``):
+    On-demand path (places onto kind="reclaim" blocks, when ``config.ondemand_placement_enabled``):
     - ADDED, Pending, has ``dsmlp/minimum-runtime-seconds`` annotation,
       no matching user reservation → add as on-demand candidate
     - DELETED or terminal (Succeeded/Failed) → release any held on-demand slot

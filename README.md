@@ -71,7 +71,7 @@ system is designed to accommodate greater values in the future.)
 │         hold on-demand placement for that class      │
 │      e. For each on-demand candidate whose retry     │
 │         cooldown has passed, find a suitable block:  │
-│           kind="ondemand" (or no-show reclaimed),    │
+│           kind="reclaim" (or no-show reclaimed),     │
 │           matching GPU class, sufficient free GPUs,  │
 │           remaining window >= minimum-runtime-seconds│
 │           PATCH pod → add toleration + block-id      │
@@ -85,7 +85,7 @@ system is designed to accommodate greater values in the future.)
 When `ONDEMAND_PLACEMENT_ENABLED=true` (the default), the controller also
 handles pods that have **no matching user reservation** but carry the
 `dsmlp/minimum-runtime-seconds` annotation.  These pods are treated as
-*on-demand candidates* and are placed onto `kind=ondemand` blocks when
+*on-demand candidates* and are placed onto `kind=reclaim` blocks when
 capacity is available.
 
 **Candidate selection** — a Pending pod becomes an on-demand candidate when:
@@ -94,7 +94,7 @@ capacity is available.
 - Only `ADDED` events create candidates; `MODIFIED` bursts are ignored.
 
 **Block selection** — a block is eligible when:
-- `kind == "ondemand"` (or it has been reclaimed from a no-show reservation).
+- `kind == "reclaim"` (or it has been reclaimed from a no-show reservation).
 - Its GPU class matches the pod's `gpu-class` label.
 - Its window is currently open and has at least `minimum-runtime-seconds` remaining.
 - It has sufficient free GPU capacity for the pod's request.

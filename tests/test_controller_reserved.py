@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 from app.controller import ControllerState, QueueEntry, slot_end, slot_start
-from app.schemas import GpuClassBrief, PolicyBrief, ReservationResponse, UserBrief
+from app.schemas import GpuClassBrief, ReservationResponse, UserBrief
 
 
 # ---------------------------------------------------------------------------
@@ -63,21 +63,12 @@ def _user_reservation(
         group=None,
         gpu_class_id=gpu_class_id,
         gpu_class=GpuClassBrief(id=gpu_class_id, name="H100"),
-        policy_id=1,
-        slot_index=slot_index,
-        policy=PolicyBrief(
-            id=1,
-            name="Test policy",
-            start_time=start_time,
-            duration_minutes=duration_minutes,
-            repeat_count=1,
-        ),
         date=reservation_date,
         start_utc=start_utc,
         end_utc=end_utc,
         gpu_count=gpu_count,
         status="active",
-        kind="user",
+        kind="booking",
         created_at=datetime(2024, 1, 1),
         updated_at=datetime(2024, 1, 1),
     )
@@ -175,16 +166,16 @@ class TestFindBestReservation:
         assert state.find_best_reservation(USERNAME, GPU_CLASS_LABEL) is None
 
     def test_no_match_ondemand_kind(self):
-        """kind='ondemand' reservations are skipped."""
+        """kind='reclaim' reservations are skipped."""
         res = _user_reservation(1, reservation_date=FUTURE_DATE)
-        od = res.model_copy(update={"kind": "ondemand", "user": None, "user_id": None})
+        od = res.model_copy(update={"kind": "reclaim", "user": None, "user_id": None})
         state = ControllerState()
         state.reservations = [od]
         state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
         assert state.find_best_reservation(USERNAME, GPU_CLASS_LABEL) is None
 
     def test_no_match_user_none(self):
-        """Reservation with user=None is excluded even for kind='user'."""
+        """Reservation with user=None is excluded even for kind='booking'."""
         res = _user_reservation(1, reservation_date=FUTURE_DATE)
         no_user = res.model_copy(update={"user": None})
         state = ControllerState()

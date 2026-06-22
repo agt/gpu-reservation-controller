@@ -350,7 +350,6 @@ either service-key scope.
   "management_buffer": 1,
   "label_value": "h100",
   "su_rate_per_hour": 4,
-  "min_su_per_gpu_hour": 1.0,
   "max_gpus_per_reservation": 2,
   "attach_all_groups": false,
   "is_active": true,
@@ -359,9 +358,8 @@ either service-key scope.
 ```
 
 `su_rate_per_hour` is the base Service Units charged per GPU per hour (before
-discount-schedule multipliers). `min_su_per_gpu_hour` is a hard floor on the
-effective rate regardless of which discount schedule applies (`null` = no floor).
-`max_gpus_per_reservation` caps a single booking's GPU count (`null` = no cap).
+discount-schedule multipliers). `max_gpus_per_reservation` caps a single booking's
+GPU count (`null` = no cap).
 `attach_all_groups` makes the class bookable by every group without an explicit
 attachment. `management_buffer` is the number of GPUs within `total_gpus`
 reserved for admin/manager use and invisible to regular members.
@@ -378,6 +376,25 @@ controller skips reservations for such classes.
 `GET /api/gpu-classes` (the full list) is service-key accessible as well.
 All gpu-class **write** endpoints (`POST`/`PUT`/`DELETE` and the
 `/overrides` sub-resource) require an admin JWT.
+
+### `GET /api/settings`
+
+Public (no authentication required). Besides the UI fields, the response carries
+two read-only, env-driven values the controller can use to interpret reclaim
+capacity holds:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `reclaim_window_minutes` | integer | How far ahead (minutes) the app tiles reclaim holds onto idle capacity (`0` = recovery disabled). |
+| `reclaim_preempt_guard_minutes` | integer | Lead time (minutes) before a reclaim hold's start within which the app treats it as **hard** capacity: a hold whose start is inside this guard will not be preempted by a new booking, so it is safe for the controller to schedule onto. A hold further out than the guard may be cancelled (preempted) by a real booking at any time. |
+
+How the controller should read these: a reclaim row (`kind == "reclaim"`, see
+§"Reservation kinds and the reclaim filter") whose `start_utc` is more than
+`reclaim_preempt_guard_minutes` away may still be preempted and should be treated
+as opportunistic/cancellable; once it is within the guard it is committed capacity.
+The guard is sized to comfortably exceed the controller's reservation poll
+interval, so a preempted hold always leaves the controller's view before it would
+be scheduled onto — no explicit coordination is needed.
 
 ---
 

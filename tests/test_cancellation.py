@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 from app.controller import ControllerState, canceller_description, slot_end
-from app.schemas import GpuClassBrief, PolicyBrief, ReservationResponse, UserBrief
+from app.schemas import GpuClassBrief, ReservationResponse, UserBrief
 
 
 # ---------------------------------------------------------------------------
@@ -59,21 +59,12 @@ def _user_res(
         group=None,
         gpu_class_id=GPU_CLASS_ID,
         gpu_class=GpuClassBrief(id=GPU_CLASS_ID, name="H100", label_value=GPU_CLASS_LABEL),
-        policy_id=1,
-        slot_index=0,
-        policy=PolicyBrief(
-            id=1,
-            name="Test",
-            start_time="08:00:00",
-            duration_minutes=duration,
-            repeat_count=1,
-        ),
         date=day,
         start_utc=s,
         end_utc=e,
         gpu_count=gpu_count,
         status="cancelled" if cancelled_by_id else "active",
-        kind="user",
+        kind="booking",
         created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
         updated_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
         cancelled_by_id=cancelled_by_id,
