@@ -85,7 +85,7 @@ When patching, all existing tolerations are preserved (Kubernetes rejects
 patches that remove tolerations from running pods).  The pod is re-fetched
 immediately before patching to avoid working with a stale toleration list.
 
-The patch also stamps the pod with the `dsmlp/booking-reference` annotation:
+The patch also stamps the pod with the `horae/booking-reference` annotation:
 `res-<id>` (reserved path), `ondemand-<id>`, or `noshow-<id>`.  This is the
 controller's single record of which reservation a pod was admitted under.  The
 GPU **budget check** (`ControllerState.available`) counts every pod recorded
@@ -96,7 +96,7 @@ an independent budget; the id parsed from this annotation
 after a restart.  The prefix records the admission path and is otherwise
 cosmetic.
 
-`set_active_deadline` additionally writes `dsmlp/pod-runtime-limit-seconds`
+`set_active_deadline` additionally writes `horae/pod-runtime-limit-seconds`
 (mirroring the `activeDeadlineSeconds` spec patch; consumed by in-pod
 notification widgets).
 
@@ -213,7 +213,7 @@ Kubernetes API and the reservation API within one fetch cycle.  Queue entries
 that were waiting for a window that has already opened will be re-evaluated
 immediately on the next processor tick.
 
-Occupancy is reconstructed from the `dsmlp/booking-reference` annotation: the
+Occupancy is reconstructed from the `horae/booking-reference` annotation: the
 reservation id parsed from each admitted pod's booking-reference is summed into
 the unified occupancy map.  The startup pod LIST seeds this, and every
 queue-processor tick rebuilds the map wholesale from a live cluster snapshot
