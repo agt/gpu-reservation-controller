@@ -555,6 +555,23 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
             # --- reserved path cleanup ---
             state.dequeue_pod(uid)
             # --- on-demand path cleanup ---
+            unplaced = state.ondemand_candidates.get(uid)
+            if unplaced is not None:
+                deletion_time = datetime.now(timezone.utc)
+                waited = int((deletion_time - unplaced.pod_created_at).total_seconds())
+                log.info(
+                    "On-demand candidate %s/%s deleted before placement "
+                    "(gpu-class=%s, gpus=%d, min-runtime=%ds, "
+                    "submitted=%s, deleted=%s, waited=%ds)",
+                    unplaced.pod_namespace,
+                    unplaced.pod_name,
+                    unplaced.gpu_class_label,
+                    unplaced.gpu_requested,
+                    unplaced.min_runtime_seconds,
+                    unplaced.pod_created_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    deletion_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    waited,
+                )
             state.remove_ondemand_candidate(uid)
             if config.ondemand_placement_enabled:
                 block_id = state.release_pod(uid)
