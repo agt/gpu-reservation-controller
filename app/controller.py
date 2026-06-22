@@ -93,7 +93,7 @@ class OnDemandCandidate:
     pod_namespace: str
     gpu_class_label: str   # value of pod label "gpu-class" (e.g. "h100")
     gpu_requested: int     # nvidia.com/gpu units requested by this pod
-    min_runtime_seconds: int  # dsmlp/minimum-runtime-seconds annotation value
+    min_runtime_seconds: int  # horai/minimum-runtime-seconds annotation value
     pod_created_at: datetime  # metadata.creationTimestamp; used for FIFO ordering
     next_attempt_at: datetime  # earliest time to try placement
 
@@ -137,7 +137,7 @@ class ControllerState:
         self.task_queue: dict[str, QueueEntry] = {}
 
         # Pods eligible for on-demand placement, keyed by pod UID.
-        # These have the dsmlp/minimum-runtime-seconds annotation and are
+        # These have the horai/minimum-runtime-seconds annotation and are
         # Pending, but do not match any user reservation.
         self.ondemand_candidates: dict[str, OnDemandCandidate] = {}
 
@@ -149,7 +149,7 @@ class ControllerState:
         # vacate) and rebuilt from a live cluster snapshot each queue-processor
         # tick (reconcile_occupancy), so a missed watch event self-heals within
         # one tick.  Each pod is bucketed by the reservation id parsed from its
-        # dsmlp/booking-reference, so no separate annotation is needed.
+        # horai/booking-reference, so no separate annotation is needed.
         self.occupancy: dict[int, dict[str, int]] = {}
 
         # Safety interlock (guard 3): set of GPU class labels that currently

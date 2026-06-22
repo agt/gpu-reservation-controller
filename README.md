@@ -59,7 +59,7 @@ system is designed to accommodate greater values in the future.)
 │      a. Count nvidia.com/gpu already in use by other │
 │         sibling pods that hold the toleration for    │
 │         the same booking (matched via the            │
-│         dsmlp/booking-reference annotation)          │
+│         horai/booking-reference annotation)          │
 │      b. If pod_gpus + sibling_gpus ≤ reserved_gpus:  │
 │           PATCH pod → add toleration + annotations   │
 │           PATCH pod → set activeDeadlineSeconds      │
@@ -88,14 +88,14 @@ system is designed to accommodate greater values in the future.)
 
 When `ONDEMAND_PLACEMENT_ENABLED=true` (the default), the controller also
 handles pods that have **no matching user reservation** but carry the
-`dsmlp/minimum-runtime-seconds` annotation.  These pods are treated as
+`horai/minimum-runtime-seconds` annotation.  These pods are treated as
 *on-demand candidates* and are placed onto reclaimable capacity when it is
 available (reclaim holds, no-show windows, or cancelled-in-window windows — see
 *On-demand capacity sources* below).
 
 **Candidate selection** — a Pending pod becomes an on-demand candidate when:
 - It has a `gpu-class` label but no matching user reservation.
-- It carries `dsmlp/minimum-runtime-seconds=<N>` (a positive integer).
+- It carries `horai/minimum-runtime-seconds=<N>` (a positive integer).
 - Only `ADDED` events create candidates; `MODIFIED` bursts are ignored.
 
 **Block selection** — a block is eligible when:
@@ -193,7 +193,7 @@ without waiting for the next queue-processor tick.
 **Occupancy tracking across restarts** — capacity for every admitted pod
 (reserved, on-demand, and no-show alike) is tracked in one occupancy map keyed
 by reservation id.  The map is rebuilt from the cluster — the reservation id
-parsed from each pod's `dsmlp/booking-reference` — by the startup pod LIST and,
+parsed from each pod's `horai/booking-reference` — by the startup pod LIST and,
 on every queue-processor tick, from a live snapshot, so a missed event or a
 restart self-heals within one tick.
 
@@ -210,10 +210,10 @@ effect:   NoSchedule
 
 | Annotation | Written when | Purpose |
 |------------|--------------|---------|
-| `dsmlp/booking-reference` | toleration applied | Identifies the reservation the pod was admitted under (`res-<id>`, `ondemand-<id>`, or `noshow-<id>`); the id is the key for the per-reservation GPU budget and for rebuilding occupancy from the cluster |
-| `dsmlp/pod-runtime-limit-seconds` | deadline set | Records the applied `activeDeadlineSeconds` value for operator visibility and in-pod notification widgets |
+| `horai/booking-reference` | toleration applied | Identifies the reservation the pod was admitted under (`res-<id>`, `ondemand-<id>`, or `noshow-<id>`); the id is the key for the per-reservation GPU budget and for rebuilding occupancy from the cluster |
+| `horai/pod-runtime-limit-seconds` | deadline set | Records the applied `activeDeadlineSeconds` value for operator visibility and in-pod notification widgets |
 
-(`dsmlp/minimum-runtime-seconds` is the one annotation **consumed** rather
+(`horai/minimum-runtime-seconds` is the one annotation **consumed** rather
 than written — see On-demand placement above.)
 
 ### Runtime capping
