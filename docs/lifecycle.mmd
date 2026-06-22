@@ -1,0 +1,37 @@
+---
+title: Reservation-block lifecycle
+---
+stateDiagram-v2
+    state "Scheduled" as S
+    state "Awaiting Claim" as AC
+    state "Reserved In Use" as RIU
+    state "On-Demand Available" as ODA
+    state "On-Demand In Use" as ODIU
+    state "Window Ended" as WE
+
+    [*] --> S   : reservation fetched
+    [*] --> ODA : reclaim hold enters directly
+
+    S    --> AC   : window opens
+    AC   --> RIU  : holder pod matched, toleration applied, runtime capped
+    AC   --> ODA  : no-show after 15 min, irrevocable
+    RIU  --> ODA  : idle-cull, 30-min re-arm, irrevocable if holder does not return
+    RIU  --> ODA  : mid-window cancellation, pod evicted, immediately irrevocable
+    ODA  --> ODIU : eligible pending pod placed, runtime capped to block end
+    ODIU --> ODA  : pod finishes or is culled, block recycled
+
+    S    --> WE
+    AC   --> WE
+    RIU  --> WE
+    ODA  --> WE
+    ODIU --> WE   : window closes
+
+    WE --> [*]
+
+    classDef blue  fill:#4472C4,color:#fff,stroke:#2F5496
+    classDef green fill:#70AD47,color:#fff,stroke:#375623
+    classDef grey  fill:#767171,color:#fff,stroke:#595959
+
+    class S,AC,RIU blue
+    class ODA,ODIU green
+    class WE grey
