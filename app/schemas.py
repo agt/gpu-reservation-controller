@@ -54,6 +54,19 @@ class ReservationResponse(BaseModel):
     cancelled_by: Optional[UserBrief] = None
 
 
+class AppSettings(BaseModel):
+    """Subset of GET /api/settings the controller consumes.
+
+    The endpoint returns additional UI-oriented fields which Pydantic ignores.
+    ``reclaim_preempt_guard_minutes`` is the lead time before a reclaim hold's
+    start within which the reservation app treats it as committed (non-preemptible)
+    capacity — safe for the controller to merge/schedule onto.
+    """
+
+    reclaim_window_minutes: int
+    reclaim_preempt_guard_minutes: int
+
+
 class GpuClassDetail(BaseModel):
     """Returned by GET /api/gpu-classes/{id}.
 

@@ -70,7 +70,7 @@ log = logging.getLogger(__name__)
 
 
 async def _refresh_reservations(
-    state: ControllerState, client: ReservationClient
+    state: ControllerState, client: ReservationClient, config: Config
 ) -> None:
     """Fetch the current reservation list and update shared state.
 
@@ -81,6 +81,12 @@ async def _refresh_reservations(
     """
     all_reservations = await client.fetch_reservations()
     active_reservations = [r for r in all_reservations if r.status == "active"]
+
+    # Refresh the reclaim-preempt guard from app settings; keep the previous
+    # value on a failed fetch so merging is not disrupted by a transient error.
+    settings = await client.fetch_settings()
+    if settings is not None:
+        state.reclaim_preempt_guard_minutes = settings.reclaim_preempt_guard_minutes
 
     # Detect reservations cancelled mid-window before overwriting the state.
     now = datetime.now(timezone.utc)
@@ -117,6 +123,12 @@ async def _refresh_reservations(
     # Handle mid-window cancellations: evict pods and reclaim capacity.
     if cancelled_in_window:
         await _handle_cancelled_reservations(state, cancelled_in_window, now)
+
+    # Re-apply persistent reclaim-block merges to the freshly loaded reservation
+    # objects (and discover new ones) so a reload never re-exposes an absorbed
+    # block.  Only meaningful when on-demand placement is enabled.
+    if config.ondemand_placement_enabled:
+        state.reconcile_reclaim_merges(datetime.now(timezone.utc))
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +497,7 @@ async def reservation_fetch_loop(
     while True:
         await asyncio.sleep(config.reservation_fetch_interval)
         try:
-            await _refresh_reservations(state, client)
+            await _refresh_reservations(state, client, config)
             now = datetime.now(timezone.utc)
             state.reconcile_noshow()
             state.update_noshow_tracking(
@@ -690,6 +702,12 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
         state.check_noshow_deadlines(now)
         state.cleanup_cancelled_reservations(now)
 
+        # Re-apply / extend reclaim-block merges now that the claimed, no-show
+        # and cancelled sets are current — picks up future blocks that have
+        # entered the preempt guard since the last reservation reload.
+        if config.ondemand_placement_enabled:
+            state.reconcile_reclaim_merges(now)
+
         # Guard 3: refresh safety interlock from the same snapshot.
         if config.ondemand_placement_enabled and snapshot is not None:
             stuck = [
@@ -775,7 +793,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # loop has data to match against from the moment it starts.
     log.info("Performing initial reservation fetch…")
     try:
-        await _refresh_reservations(state, client)
+        await _refresh_reservations(state, client, config)
         log.info(
             "Initial fetch complete: %d reservation(s), %d GPU class(es) resolved",
             len(state.reservations),
