@@ -98,6 +98,21 @@ class OnDemandCandidate:
     next_attempt_at: datetime  # earliest time to try placement
 
 
+@dataclass
+class ReclaimMerge:
+    """A record of one subject block that has absorbed future reclaim block(s).
+
+    The subject's window is extended to ``extended_end`` so an on-demand job
+    beginning in it can run through the whole merged span; each absorbed reclaim
+    block becomes a stub (excluded from independent placement).  Persisted across
+    reservation reloads and re-applied by ``reconcile_reclaim_merges``.
+    """
+
+    subject_id: int            # block that absorbs (becomes the long block)
+    absorbed_ids: list[int]    # future reclaim ids folded in, in window order
+    extended_end: datetime     # slot_end of the last absorbed block
+
+
 # ---------------------------------------------------------------------------
 # Shared controller state
 # ---------------------------------------------------------------------------
@@ -166,6 +181,32 @@ class ControllerState:
         # Keyed by reservation id; values are the last-known ReservationResponse
         # (from the cycle before cancellation was detected).
         self.cancelled_reservations: dict[int, ReservationResponse] = {}
+
+        # ``reclaim_preempt_guard_minutes`` from GET /api/settings: lead time
+        # before a reclaim hold's start within which the reservation app treats
+        # it as committed (non-preemptible) capacity.  None until first fetched;
+        # reclaim-block merging is skipped while unknown.
+        self.reclaim_preempt_guard_minutes: Optional[int] = None
+
+        # Wall-clock time of the most recent successful reservation fetch.  The
+        # commitment ("within guard") test for a merge candidate is judged against
+        # THIS instant, not the current tick clock: a reclaim block is only safe to
+        # merge if it was already inside the guard in the data we actually hold.
+        # Judging against an advancing between-fetch clock would let a block that
+        # was still preemptible at fetch time drift into the guard and be merged,
+        # racing a last-minute front-end booking the controller has not yet seen.
+        self.last_reservation_fetch_at: Optional[datetime] = None
+
+        # Persistent reclaim-block merges, keyed by subject reservation id.  Each
+        # records the future reclaim block(s) folded into the subject and the
+        # extended end the subject window is stretched to.  Re-applied to freshly
+        # loaded reservations every cycle so a reload never re-exposes an absorbed
+        # block while a deadline-extended job is still running on it.
+        self.reclaim_merges: dict[int, ReclaimMerge] = {}
+
+        # Reclaim block ids absorbed into a subject (stubs).  Excluded from
+        # on-demand placement so they are never independently double-booked.
+        self.merged_stub_ids: set[int] = set()
 
     # ------------------------------------------------------------------
     # No-show tracking
@@ -690,6 +731,142 @@ class ControllerState:
         )
         return max(0, reservation.gpu_count - used)
 
+    def reconcile_reclaim_merges(self, now: datetime) -> None:
+        """Re-apply persistent reclaim merges and discover new ones.
+
+        A "subject block" is any currently-open on-demand window — a reclaim
+        hold, a declared no-show, or a cancelled-in-window reservation.  When a
+        subject abuts a future ``kind == "reclaim"`` block of the same GPU class
+        and equal ``gpu_count`` that was already inside
+        ``reclaim_preempt_guard_minutes`` **at the last reservation fetch** (the
+        app has committed it and will not preempt it), the two are merged: the
+        subject's window is stretched to the future block's end and that block is
+        recorded as a stub (excluded from independent on-demand placement).  This
+        maximises the runtime of an on-demand job beginning in the subject block.
+
+        The commitment test uses ``last_reservation_fetch_at + guard`` as the
+        horizon, **not** ``now``: a block must have been within the guard in the
+        data we actually hold.  Judging against the advancing between-fetch tick
+        clock would let a block that was still preemptible at fetch time drift
+        into the guard and be merged, racing a last-minute front-end booking the
+        controller has not yet fetched.  Because the guard is sized to exceed the
+        poll interval, a block legitimately entering the guard is always seen by a
+        fresh fetch (still present, or gone if preempted) before it is merged.
+
+        Re-applying surviving records first — before the freshly loaded
+        reservation objects are consulted by the placement logic — is what makes
+        merges survive a wholesale reservation reload, so a reload never
+        re-exposes an absorbed block while a deadline-extended job still depends
+        on it.  Idempotent; safe to call every refresh and every queue tick.
+        Does nothing while the guard is unknown.
+        """
+        guard = self.reclaim_preempt_guard_minutes
+        self.merged_stub_ids = set()
+        if guard is None:
+            self.reclaim_merges = {}
+            return
+
+        # Index reservations a merge might reference: live reservations plus
+        # retained cancelled-in-window blocks (which can be subjects).
+        by_id: dict[int, ReservationResponse] = {r.id: r for r in self.reservations}
+        for rid, r in self.cancelled_reservations.items():
+            by_id.setdefault(rid, r)
+
+        def _label(r: ReservationResponse) -> Optional[str]:
+            cached = self.gpu_class_labels.get(r.gpu_class_id)
+            if cached is not None:
+                return cached
+            return r.gpu_class.label_value if r.gpu_class else None
+
+        # --- 1. Re-apply surviving records (persistence across reloads) ---
+        surviving: dict[int, ReclaimMerge] = {}
+        for subject_id, merge in self.reclaim_merges.items():
+            subject = by_id.get(subject_id)
+            if subject is None or now >= merge.extended_end:
+                continue  # subject gone, or whole merged span has ended
+            if subject_id in self.claimed_reservation_ids:
+                continue  # a reserved holder now occupies it — not on-demand
+            absorbed = [by_id.get(aid) for aid in merge.absorbed_ids]
+            if any(a is None or a.kind != "reclaim" for a in absorbed):
+                continue  # an absorbed block vanished (e.g. preempted) — drop
+            subject.end_utc = merge.extended_end
+            self.merged_stub_ids.update(merge.absorbed_ids)
+            surviving[subject_id] = merge
+        self.reclaim_merges = surviving
+
+        # --- 2. Discover new merges (and extend existing ones transitively) ---
+        # Commitment is judged against the data we hold: a candidate is eligible
+        # only if its start was within the guard at the last reservation fetch.
+        # Without a fetch timestamp we cannot make that judgement safely, so we
+        # re-apply surviving merges but discover none.
+        if self.last_reservation_fetch_at is None:
+            return
+        horizon = self.last_reservation_fetch_at + timedelta(minutes=guard)
+        reclaim_blocks = [r for r in self.reservations if r.kind == "reclaim"]
+
+        subjects: list[ReservationResponse] = [
+            r
+            for r in self.reservations
+            if (r.kind == "reclaim" or r.id in self.noshow_reservation_ids)
+            and r.id not in self.claimed_reservation_ids
+            and slot_start(r) <= now < slot_end(r)
+        ]
+        subjects += [
+            r
+            for r in self.cancelled_reservations.values()
+            if r.id not in self.claimed_reservation_ids
+            and slot_start(r) <= now < slot_end(r)
+        ]
+
+        seen: set[int] = set()
+        for subject in subjects:
+            if subject.id in seen or subject.id in self.merged_stub_ids:
+                continue
+            seen.add(subject.id)
+            label = _label(subject)
+            if label is None:
+                continue
+            existing = self.reclaim_merges.get(subject.id)
+            absorbed_ids: list[int] = list(existing.absorbed_ids) if existing else []
+            cur_end = slot_end(subject)  # already extended if a record survived
+            grew = False
+            while True:
+                targets = [
+                    r
+                    for r in reclaim_blocks
+                    if r.id != subject.id
+                    and r.id not in self.merged_stub_ids
+                    and r.id not in absorbed_ids
+                    and r.gpu_count == subject.gpu_count
+                    and _label(r) == label
+                    and slot_start(r) == cur_end
+                    and slot_start(r) <= horizon
+                ]
+                if not targets:
+                    break
+                target = max(targets, key=slot_end)
+                absorbed_ids.append(target.id)
+                self.merged_stub_ids.add(target.id)
+                cur_end = slot_end(target)
+                subject.end_utc = cur_end
+                grew = True
+            if absorbed_ids:
+                self.reclaim_merges[subject.id] = ReclaimMerge(
+                    subject_id=subject.id,
+                    absorbed_ids=absorbed_ids,
+                    extended_end=cur_end,
+                )
+                if grew:
+                    log.info(
+                        "Merged reclaim block(s) %s into subject reservation #%d "
+                        "(gpu-class=%s, gpu_count=%d); window extended to %s",
+                        absorbed_ids,
+                        subject.id,
+                        label,
+                        subject.gpu_count,
+                        cur_end.isoformat(),
+                    )
+
     def find_ondemand_block(
         self,
         gpu_class_label: str,
@@ -725,6 +902,7 @@ class ControllerState:
             for r in self.reservations
             if (r.kind == "reclaim" or r.id in self.noshow_reservation_ids)
             and r.id not in self.claimed_reservation_ids
+            and r.id not in self.merged_stub_ids
             and _label_matches(r)
             and slot_start(r) <= now < slot_end(r)
             and self.available(r) >= gpu_requested
@@ -735,6 +913,7 @@ class ControllerState:
             r
             for r in self.cancelled_reservations.values()
             if r.id not in self.claimed_reservation_ids
+            and r.id not in self.merged_stub_ids
             and _label_matches(r)
             and slot_start(r) <= now < slot_end(r)
             and self.available(r) >= gpu_requested

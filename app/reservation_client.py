@@ -14,7 +14,7 @@ from typing import Optional
 import httpx
 
 from .config import Config
-from .schemas import GpuClassDetail, ReservationResponse
+from .schemas import AppSettings, GpuClassDetail, ReservationResponse
 
 log = logging.getLogger(__name__)
 
@@ -89,4 +89,17 @@ class ReservationClient:
             return None
         except httpx.RequestError as exc:
             log.warning("Could not fetch GPU class %d: %s", gpu_class_id, exc)
+            return None
+
+    async def fetch_settings(self) -> Optional[AppSettings]:
+        """Return the app settings (reclaim window/guard), or None on error."""
+        try:
+            resp = await self._client.get("/api/settings", timeout=10.0)
+            resp.raise_for_status()
+            return AppSettings.model_validate(resp.json())
+        except httpx.HTTPStatusError as exc:
+            log.warning("Could not fetch app settings: HTTP %s", exc.response.status_code)
+            return None
+        except httpx.RequestError as exc:
+            log.warning("Could not fetch app settings: %s", exc)
             return None

@@ -156,6 +156,49 @@ on its normal schedule.
 `_try_apply_toleration` is the single shared coroutine that performs the budget
 check and patch; both the fast path and the queue processor call it.
 
+### Reclaim-block merging (on-demand runtime extension)
+
+On-demand jobs are capped to the end of the single block they land on
+(`slot_end(block)`, no chaining — unlike reserved holders).  To let a job that
+begins near the end of a block run longer, the controller merges a **subject
+block** — any currently-open on-demand window (a `kind="reclaim"` hold, a declared
+no-show, or a cancelled-in-window reservation) — with a directly **abutting future
+reclaim block** when that future block is **committed**.
+
+A future block is committed when its `start_utc` was within
+`reclaim_preempt_guard_minutes` (fetched from `GET /api/settings`) **at the last
+reservation fetch** (`last_reservation_fetch_at`) — not merely by the between-fetch
+tick clock drifting it into the guard.  Anchoring to fetch time is essential:
+judging against the advancing tick clock would let a block that was still
+preemptible when we last fetched drift into the guard and get merged, racing a
+last-minute front-end booking the controller has not yet seen.  Because the guard
+is sized to exceed the poll interval, a block legitimately entering the guard is
+always re-seen by a fresh fetch (still present, or gone if preempted) before it is
+merged.  Inside the guard the reservation app will not preempt the hold with a new
+booking, so it is safe to schedule onto.  The future block must be `kind="reclaim"`, share the
+subject's GPU class label, and have an **equal `gpu_count`** (capacity is uniform
+across the merged span, mirroring the reserved back-to-back chaining rule
+`slot_start(next) == slot_end(prev)`).  If several abut, the longest (latest
+`slot_end`) is chosen; chaining is applied iteratively as further blocks enter the
+guard on later ticks.
+
+The merge (`ControllerState.reconcile_reclaim_merges`, run after each reservation
+refresh and each queue-processor tick) extends the subject's `end_utc` to the
+absorbed block's end and records the absorbed reclaim id in `merged_stub_ids` so it
+is **excluded** from independent on-demand placement.  `find_ondemand_block` then
+naturally returns the longer block (it already prefers the latest `slot_end`), and
+the on-demand deadline cap extends with it — no separate deadline logic.
+
+Merges are **persistent**: `reclaim_merges` (keyed by subject id) is re-applied to
+the freshly loaded reservation objects on every reload — they are otherwise
+replaced wholesale — and is pruned only once `now >= extended_end` (the **whole**
+merged span has ended), not when the subject's original window closes.  This keeps
+the absorbed block stubbed for the full lifetime of any deadline-extended job, so a
+reload never re-exposes it for double-booking.  This is the on-demand analogue of
+how `claimed_reservation_ids` protects chained reserved windows.  Merging is
+skipped entirely when on-demand placement is disabled or the guard is unknown
+(settings fetch failed / recovery disabled).
+
 ### Startup behaviour
 
 On startup, the controller performs an initial reservation fetch and then issues
