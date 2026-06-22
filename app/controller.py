@@ -783,15 +783,35 @@ class ControllerState:
         for subject_id, merge in self.reclaim_merges.items():
             subject = by_id.get(subject_id)
             if subject is None or now >= merge.extended_end:
+                log.info(
+                    "Reclaim merge for subject #%d dropped: reservation no longer active or window ended",
+                    subject_id,
+                )
                 continue  # subject gone, or whole merged span has ended
             if subject_id in self.claimed_reservation_ids:
                 continue  # a reserved holder now occupies it — not on-demand
             absorbed = [by_id.get(aid) for aid in merge.absorbed_ids]
             if any(a is None or a.kind != "reclaim" for a in absorbed):
+                missing = [
+                    aid
+                    for aid, a in zip(merge.absorbed_ids, absorbed)
+                    if a is None or a.kind != "reclaim"
+                ]
+                log.info(
+                    "Reclaim merge for subject #%d: absorbed block(s) %s no longer active; merge dropped",
+                    subject_id,
+                    missing,
+                )
                 continue  # an absorbed block vanished (e.g. preempted) — drop
             subject.end_utc = merge.extended_end
             self.merged_stub_ids.update(merge.absorbed_ids)
             surviving[subject_id] = merge
+            log.debug(
+                "Re-applied reclaim merge: subject #%d extended to %s (absorbed: %s)",
+                subject_id,
+                merge.extended_end.isoformat(),
+                merge.absorbed_ids,
+            )
         self.reclaim_merges = surviving
 
         # --- 2. Discover new merges (and extend existing ones transitively) ---
@@ -923,10 +943,20 @@ class ControllerState:
         if not candidates:
             return None
         # Latest slot_end first; break ties by most available capacity (desc).
-        return max(
+        block = max(
             candidates,
             key=lambda r: (slot_end(r), self.available(r)),
         )
+        log.debug(
+            "Selected on-demand block #%d for gpu-class=%s (window %s–%s, %d/%d free)",
+            block.id,
+            gpu_class_label,
+            slot_start(block).strftime("%Y-%m-%d %H:%M"),
+            slot_end(block).strftime("%H:%M"),
+            self.available(block),
+            block.gpu_count,
+        )
+        return block
 
     def record_placement(
         self, reservation_id: int, pod_uid: str, gpu_count: int
@@ -1062,7 +1092,23 @@ class ControllerState:
         dropped; the placing coroutine has already committed and the next tick
         re-captures it, so the window is bounded by the tick interval.
         """
+        old_total = sum(g for pods in self.occupancy.values() for g in pods.values())
         rebuilt: dict[int, dict[str, int]] = {}
         for reservation_id, pod_uid, gpu_count in placements:
             rebuilt.setdefault(reservation_id, {})[pod_uid] = gpu_count
         self.occupancy = rebuilt
+        new_total = sum(g for pods in rebuilt.values() for g in pods.values())
+        n_res = len(rebuilt)
+        if new_total != old_total:
+            log.info(
+                "Occupancy reconciled: %d reservation(s), %d GPU(s) in use (was %d)",
+                n_res,
+                new_total,
+                old_total,
+            )
+        else:
+            log.debug(
+                "Occupancy reconciled: %d reservation(s), %d GPU(s) in use",
+                n_res,
+                new_total,
+            )
