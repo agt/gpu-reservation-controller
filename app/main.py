@@ -499,6 +499,7 @@ async def reservation_fetch_loop(
     """
     while True:
         await asyncio.sleep(config.reservation_fetch_interval)
+        log.debug("Reservation refresh cycle starting")
         try:
             await _refresh_reservations(state, client, config)
             now = datetime.now(timezone.utc)
@@ -507,6 +508,11 @@ async def reservation_fetch_loop(
                 now,
                 config.noshown_timeout_minutes,
                 config.noshown_grace_minutes,
+            )
+            log.info(
+                "Reservation refresh complete: %d active reservation(s), %d GPU class(es) resolved",
+                len(state.reservations),
+                len(state.gpu_class_labels),
             )
         except Exception as exc:  # noqa: BLE001
             log.error("Reservation refresh failed: %s", exc)
@@ -549,6 +555,23 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
             # --- reserved path cleanup ---
             state.dequeue_pod(uid)
             # --- on-demand path cleanup ---
+            unplaced = state.ondemand_candidates.get(uid)
+            if unplaced is not None:
+                deletion_time = datetime.now(timezone.utc)
+                waited = int((deletion_time - unplaced.pod_created_at).total_seconds())
+                log.info(
+                    "On-demand candidate %s/%s deleted before placement "
+                    "(gpu-class=%s, gpus=%d, min-runtime=%ds, "
+                    "submitted=%s, deleted=%s, waited=%ds)",
+                    unplaced.pod_namespace,
+                    unplaced.pod_name,
+                    unplaced.gpu_class_label,
+                    unplaced.gpu_requested,
+                    unplaced.min_runtime_seconds,
+                    unplaced.pod_created_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    deletion_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    waited,
+                )
             state.remove_ondemand_candidate(uid)
             if config.ondemand_placement_enabled:
                 block_id = state.release_pod(uid)
@@ -613,6 +636,13 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                         if min_rt is not None:
                             ts = pod.metadata.creation_timestamp
                             pod_created_at = ts if ts is not None else datetime.now(timezone.utc)
+                            log.debug(
+                                "Pod %s/%s ADDED: no open reservation window (gpu-class=%s); "
+                                "routing to on-demand queue",
+                                namespace,
+                                name,
+                                gpu_class_label,
+                            )
                             state.add_ondemand_candidate(
                                 uid, name, namespace, gpu_class_label, gpu_count, min_rt,
                                 pod_created_at,
@@ -636,11 +666,17 @@ async def _recycle_ondemand_block(
     """
     now = datetime.now(timezone.utc)
     ordered = sorted(state.ondemand_candidates.items(), key=lambda kv: kv[1].pod_created_at)
-    for uid, candidate in ordered:
-        if candidate.gpu_class_label != gpu_class_label:
-            continue
-        if now < candidate.next_attempt_at:
-            continue
+    eligible = [
+        (uid, c) for uid, c in ordered
+        if c.gpu_class_label == gpu_class_label and now >= c.next_attempt_at
+    ]
+    if eligible:
+        log.debug(
+            "Recycling on-demand block for gpu-class=%s: %d candidate(s) eligible",
+            gpu_class_label,
+            len(eligible),
+        )
+    for uid, candidate in eligible:
         if await _try_place_ondemand(state, uid, candidate):
             state.ondemand_candidates.pop(uid, None)
             return  # one placement per recycle event is enough
@@ -776,6 +812,12 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
                     od_to_remove.append(uid)
             for uid in od_to_remove:
                 state.ondemand_candidates.pop(uid, None)
+
+        log.debug(
+            "Queue processor tick: %d reserved queue entr(ies), %d on-demand candidate(s)",
+            len(state.task_queue),
+            len(state.ondemand_candidates),
+        )
 
 
 # ---------------------------------------------------------------------------
