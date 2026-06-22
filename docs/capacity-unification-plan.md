@@ -93,7 +93,7 @@ kinds in one list); it now has one occupancy view to match.
 
 ### 3.2 What `kind` varies (and nothing else)
 
-| Concern | Reserved (`kind="user"`) | On-demand (`kind="ondemand"`) / no-show (id ∈ `noshow_reservation_ids`) |
+| Concern | Reserved (`kind="booking"`) | On-demand (`kind="reclaim"`) / no-show (id ∈ `noshow_reservation_ids`) |
 |---|---|---|
 | Eligibility | `find_best_reservation` — namespace == username | `find_ondemand_block` — any namespace |
 | Deadline | chain back-to-back (`compute_max_deadline_seconds`) | cap to single window |

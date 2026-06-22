@@ -189,7 +189,7 @@ class ControllerState:
         will clear deadlines for reservations that already have matching pods.
         """
         for r in self.reservations:
-            if r.kind != "user" or r.user is None:
+            if r.kind != "booking" or r.user is None:
                 continue
             if r.id in self.noshow_deadlines:
                 continue  # already tracked (e.g. called twice)
@@ -220,7 +220,7 @@ class ControllerState:
         existing deadlines and does not resurrect already-declared no-shows.
         """
         for r in self.reservations:
-            if r.kind != "user" or r.user is None:
+            if r.kind != "booking" or r.user is None:
                 continue
             if r.id in self.noshow_deadlines:
                 continue
@@ -311,7 +311,7 @@ class ControllerState:
                 (r for r in self.reservations if r.id == booking_reservation_id),
                 None,
             )
-            if res is None or res.kind != "user" or res.user is None:
+            if res is None or res.kind != "booking" or res.user is None:
                 return  # on-demand / no-show booking — not a holder
             cleared = [
                 rid
@@ -331,7 +331,7 @@ class ControllerState:
         candidates = [
             r
             for r in self.reservations
-            if r.kind == "user"
+            if r.kind == "booking"
             and r.user is not None
             and r.user.username == namespace
             and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
@@ -396,7 +396,7 @@ class ControllerState:
         candidates = [
             r
             for r in self.reservations
-            if r.kind == "user"
+            if r.kind == "booking"
             and r.user is not None
             and r.user.username == namespace
             and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
@@ -496,7 +496,7 @@ class ControllerState:
                 r
                 for r in self.reservations
                 if r.id != reservation.id
-                and r.kind == "user"
+                and r.kind == "booking"
                 and r.user is not None
                 and r.user.username == namespace
                 and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
@@ -542,7 +542,7 @@ class ControllerState:
         prev_end = slot_end(current_reservation)
         total = max(0.0, (prev_end - now).total_seconds())
         for res in self._chain_for(current_reservation, now):
-            total += res.policy.duration_minutes * 60.0
+            total += (slot_end(res) - slot_start(res)).total_seconds()
         return int(total)
 
     def reservations_claimed_by(
@@ -560,7 +560,7 @@ class ControllerState:
         now = now or datetime.now(timezone.utc)
         res = next((r for r in self.reservations if r.id == reservation_id), None)
         claimed = {reservation_id}
-        if res is not None and res.kind == "user" and res.user is not None:
+        if res is not None and res.kind == "booking" and res.user is not None:
             claimed |= {r.id for r in self._chain_for(res, now)}
         return claimed
 
@@ -700,7 +700,7 @@ class ControllerState:
         """Find the best on-demand block for a given pod.
 
         Criteria (all must hold):
-        - ``kind == "ondemand"`` or the reservation has been declared a no-show
+        - ``kind == "reclaim"`` or the reservation has been declared a no-show
         - not currently claimed by a live chained holder
         - GPU class label matches *gpu_class_label*
         - Window is currently open: ``slot_start(r) <= now < slot_end(r)``
@@ -723,7 +723,7 @@ class ControllerState:
         from_active = [
             r
             for r in self.reservations
-            if (r.kind == "ondemand" or r.id in self.noshow_reservation_ids)
+            if (r.kind == "reclaim" or r.id in self.noshow_reservation_ids)
             and r.id not in self.claimed_reservation_ids
             and _label_matches(r)
             and slot_start(r) <= now < slot_end(r)

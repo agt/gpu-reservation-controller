@@ -13,7 +13,6 @@ import pytest
 from app.controller import ControllerState, OnDemandCandidate, slot_end, slot_start
 from app.schemas import (
     GpuClassBrief,
-    PolicyBrief,
     ReservationResponse,
     UserBrief,
 )
@@ -25,16 +24,6 @@ from app.schemas import (
 
 GPU_CLASS_ID = 10
 GPU_CLASS_LABEL = "h100"
-
-
-def _policy(duration_minutes: int = 120) -> PolicyBrief:
-    return PolicyBrief(
-        id=1,
-        name="Test policy",
-        start_time="08:00:00",
-        duration_minutes=duration_minutes,
-        repeat_count=1,
-    )
 
 
 def _compute_window(
@@ -58,7 +47,7 @@ def _ondemand_block(
     duration_minutes: int = 120,
     date_offset_days: int = 0,
 ) -> ReservationResponse:
-    """Return a kind='ondemand' reservation whose window is *today* at 08:00 UTC."""
+    """Return a kind='reclaim' reservation whose window is *today* at 08:00 UTC."""
     today = date.today() if date_offset_days == 0 else (
         datetime.now(timezone.utc) + timedelta(days=date_offset_days)
     ).date()
@@ -71,21 +60,12 @@ def _ondemand_block(
         group=None,
         gpu_class_id=GPU_CLASS_ID,
         gpu_class=GpuClassBrief(id=GPU_CLASS_ID, name="H100"),
-        policy_id=1,
-        slot_index=slot_index,
-        policy=PolicyBrief(
-            id=1,
-            name="Test policy",
-            start_time="08:00:00",
-            duration_minutes=duration_minutes,
-            repeat_count=1,
-        ),
         date=today,
         start_utc=start_utc,
         end_utc=end_utc,
         gpu_count=gpu_count,
         status="active",
-        kind="ondemand",
+        kind="reclaim",
         created_at=datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),
     )
@@ -128,21 +108,12 @@ def _currently_open_block(
         group=None,
         gpu_class_id=GPU_CLASS_ID,
         gpu_class=GpuClassBrief(id=GPU_CLASS_ID, name="H100"),
-        policy_id=1,
-        slot_index=0,
-        policy=PolicyBrief(
-            id=1,
-            name="Test policy",
-            start_time=start_time,
-            duration_minutes=duration_minutes,
-            repeat_count=1,
-        ),
         date=start_dt.date(),
         start_utc=start_utc,
         end_utc=end_utc,
         gpu_count=gpu_count,
         status="active",
-        kind="ondemand",
+        kind="reclaim",
         created_at=now,
         updated_at=now,
     )
@@ -202,12 +173,12 @@ class TestFindOndemandBlock:
         assert result is None
 
     def test_skips_user_kind_blocks(self):
-        """kind='user' reservations must not be matched as on-demand blocks."""
+        """kind='booking' reservations must not be matched as on-demand blocks."""
         block = _ondemand_block(1)
         # Mutate kind to simulate a user reservation
         user_block = block.model_copy(
             update={
-                "kind": "user",
+                "kind": "booking",
                 "user": UserBrief(id=99, username="student1"),
                 "user_id": 99,
             }
@@ -226,13 +197,6 @@ class TestFindOndemandBlock:
         # Block B: same class, 4-hour window; ends 2 hours after block_a
         today = date.today()
         b_start_utc, b_end_utc = _compute_window(today, "08:00:00", 0, 240)
-        block_b_policy = PolicyBrief(
-            id=2,
-            name="Long policy",
-            start_time="08:00:00",
-            duration_minutes=240,
-            repeat_count=1,
-        )
         block_b = ReservationResponse(
             id=2,
             user_id=None,
@@ -241,15 +205,12 @@ class TestFindOndemandBlock:
             group=None,
             gpu_class_id=GPU_CLASS_ID,
             gpu_class=GpuClassBrief(id=GPU_CLASS_ID, name="H100"),
-            policy_id=2,
-            slot_index=0,
-            policy=block_b_policy,
             date=today,
             start_utc=b_start_utc,
             end_utc=b_end_utc,
             gpu_count=2,
             status="active",
-            kind="ondemand",
+            kind="reclaim",
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
         )

@@ -225,7 +225,7 @@ def _make_main_module_and_state(monkeypatch):
     monkeypatch.setenv("RESERVATION_API_KEY", "test-key-guards")
     import app.main as main_module
     from app.controller import ControllerState
-    from app.schemas import GpuClassBrief, PolicyBrief, ReservationResponse
+    from app.schemas import GpuClassBrief, ReservationResponse
 
     today = date.today()
     midnight = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
@@ -235,14 +235,10 @@ def _make_main_module_and_state(monkeypatch):
         user_id=None, user=None, group_id=None, group=None,
         gpu_class_id=1,
         gpu_class=GpuClassBrief(id=1, name="H100"),
-        policy_id=1,
-        slot_index=0,
-        policy=PolicyBrief(id=1, name="p", start_time="00:00:00",
-                           duration_minutes=1440, repeat_count=1),
         date=today,
         start_utc=midnight,
         end_utc=midnight + timedelta(days=1),
-        gpu_count=4, status="active", kind="ondemand",
+        gpu_count=4, status="active", kind="reclaim",
         created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
     )
     state.reservations = [block]
@@ -284,7 +280,7 @@ def test_guard3_does_not_block_other_gpu_class(monkeypatch):
     import asyncio
     from datetime import date, datetime, timedelta, timezone
     from app.controller import OnDemandCandidate
-    from app.schemas import GpuClassBrief, PolicyBrief, ReservationResponse
+    from app.schemas import GpuClassBrief, ReservationResponse
 
     main_module, state = _make_main_module_and_state(monkeypatch)
 
@@ -296,13 +292,10 @@ def test_guard3_does_not_block_other_gpu_class(monkeypatch):
         user_id=None, user=None, group_id=None, group=None,
         gpu_class_id=2,
         gpu_class=GpuClassBrief(id=2, name="A100"),
-        policy_id=1, slot_index=0,
-        policy=PolicyBrief(id=1, name="p", start_time="00:00:00",
-                           duration_minutes=1440, repeat_count=1),
         date=today,
         start_utc=midnight,
         end_utc=midnight + timedelta(days=1),
-        gpu_count=4, status="active", kind="ondemand",
+        gpu_count=4, status="active", kind="reclaim",
         created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
     )
     state.reservations.append(a100_block)

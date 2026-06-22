@@ -27,31 +27,23 @@ class GpuClassBrief(BaseModel):
     label_value: Optional[str] = None
 
 
-class PolicyBrief(BaseModel):
-    id: int
-    name: str
-    start_time: str          # "HH:MM:SS" — minutes from midnight on reservation date
-    duration_minutes: int
-    repeat_count: int
-
-
 class ReservationResponse(BaseModel):
     id: int
-    user_id: Optional[int] = None   # null for kind="ondemand"
-    user: Optional[UserBrief] = None  # null for kind="ondemand"
+    user_id: Optional[int] = None   # null for kind="reclaim"
+    user: Optional[UserBrief] = None  # null for kind="reclaim"
     group_id: Optional[int] = None
     group: Optional[GroupBrief] = None
     gpu_class_id: int
     gpu_class: GpuClassBrief
-    policy_id: int
-    slot_index: int          # 0-based; see time-window formula in RESERVATION-API.md §4
-    policy: PolicyBrief
+    start_dt: Optional[datetime] = None  # site-local wall-clock (naive); display only
+    end_dt: Optional[datetime] = None    # site-local wall-clock (naive); display only
     date: date               # calendar date of the reservation (local time, for display)
-    start_utc: datetime      # UTC slot start; use this for all time comparisons
-    end_utc: datetime        # UTC slot end; use this for activeDeadlineSeconds
+    start_utc: datetime      # UTC start; use this for all time comparisons
+    end_utc: datetime        # UTC end; use this for activeDeadlineSeconds
     gpu_count: int           # number of GPUs reserved
+    su_cost: Optional[float] = None  # total Service Units; not consumed by the controller
     status: str              # "active" | "cancelled"
-    kind: str                # "user" | "ondemand"
+    kind: str                # "booking" | "reclaim"
     notes: Optional[str] = None
     submitted_by_id: Optional[int] = None
     submitted_by: Optional[UserBrief] = None
@@ -60,7 +52,6 @@ class ReservationResponse(BaseModel):
     cancelled_at: Optional[datetime] = None
     cancelled_by_id: Optional[int] = None
     cancelled_by: Optional[UserBrief] = None
-    created_by_id: Optional[int] = None  # admin who created an ondemand block; null if auto-filled
 
 
 class GpuClassDetail(BaseModel):

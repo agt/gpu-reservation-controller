@@ -14,7 +14,7 @@ import pytest
 
 from app.controller import ControllerState, slot_end, slot_start
 from app.k8s_client import parse_booking_reference
-from app.schemas import GpuClassBrief, PolicyBrief, ReservationResponse, UserBrief
+from app.schemas import GpuClassBrief, ReservationResponse, UserBrief
 
 
 GPU_CLASS_ID = 10
@@ -60,21 +60,12 @@ def _user_reservation(
         group=None,
         gpu_class_id=gpu_class_id,
         gpu_class=GpuClassBrief(id=gpu_class_id, name="H100"),
-        policy_id=1,
-        slot_index=slot_index,
-        policy=PolicyBrief(
-            id=1,
-            name="Test policy",
-            start_time=start_time,
-            duration_minutes=duration_minutes,
-            repeat_count=1,
-        ),
         date=reservation_date,
         start_utc=start_utc,
         end_utc=end_utc,
         gpu_count=gpu_count,
         status="active",
-        kind="user",
+        kind="booking",
         created_at=datetime(2024, 1, 1),
         updated_at=datetime(2024, 1, 1),
     )
@@ -201,7 +192,7 @@ class TestReservationsClaimedBy:
 
     def test_ondemand_reservation_claims_only_self(self):
         r1 = _user_reservation(1).model_copy(
-            update={"kind": "ondemand", "user": None, "user_id": None}
+            update={"kind": "reclaim", "user": None, "user_id": None}
         )
         state = _state(r1)
         assert state.reservations_claimed_by(1, NOW) == {1}

@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 
 from app.controller import ControllerState, slot_end, slot_start
-from app.schemas import GpuClassBrief, PolicyBrief, ReservationResponse, UserBrief
+from app.schemas import GpuClassBrief, ReservationResponse, UserBrief
 
 
 # ---------------------------------------------------------------------------
@@ -66,21 +66,12 @@ def _user_reservation(
         group=None,
         gpu_class_id=gpu_class_id,
         gpu_class=GpuClassBrief(id=gpu_class_id, name="H100"),
-        policy_id=1,
-        slot_index=slot_index,
-        policy=PolicyBrief(
-            id=1,
-            name="Test policy",
-            start_time=start_time,
-            duration_minutes=duration_minutes,
-            repeat_count=1,
-        ),
         date=reservation_date,
         start_utc=start_utc,
         end_utc=end_utc,
         gpu_count=gpu_count,
         status="active",
-        kind="user",
+        kind="booking",
         created_at=datetime(2024, 1, 1),
         updated_at=datetime(2024, 1, 1),
     )
@@ -105,21 +96,12 @@ def _ondemand_reservation(
         group=None,
         gpu_class_id=gpu_class_id,
         gpu_class=GpuClassBrief(id=gpu_class_id, name="H100"),
-        policy_id=1,
-        slot_index=slot_index,
-        policy=PolicyBrief(
-            id=1,
-            name="Test policy",
-            start_time=start_time,
-            duration_minutes=duration_minutes,
-            repeat_count=1,
-        ),
         date=reservation_date,
         start_utc=start_utc,
         end_utc=end_utc,
         gpu_count=gpu_count,
         status="active",
-        kind="ondemand",
+        kind="reclaim",
         created_at=datetime(2024, 1, 1),
         updated_at=datetime(2024, 1, 1),
     )
