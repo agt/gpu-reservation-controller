@@ -244,37 +244,64 @@ Appendix A --- Reservation-block lifecycle
 
 The state machine below tracks a single reservation block as the
 controller moves it through its life. Reserved-phase states are shown in
-blue, on-demand-phase states in green; the two red transitions are the
-irrevocable conversions of unused reserved capacity into on-demand
-capacity. Reclaim capacity holds (Section 5.1) --- the renamed scheduled
+blue, on-demand-phase states in green; three red transitions mark the
+irrevocable conversions of unused or reclaimed reserved capacity to
+on-demand capacity: no-show, idle-cull, and mid-window cancellation.
+Reclaim capacity holds (Section 5.1) --- the renamed scheduled
 on-demand blocks --- have no reserved phase and enter the diagram directly
-at the On-Demand --- Available state.
+at the On-Demand --- Available state. Note: the diagram image predates
+the mid-window cancellation path; see walkthrough step 4b below.
 
 ![States from Scheduled through Awaiting Claim, Reserved In Use,
-On-Demand Available/In Use, to Window Ended, with no-show and idle-cull
-conversions.](./media/dbedd404ff0049ba26540ae53449dab333012f9f.png "Reservation-block lifecycle state machine"){width="6.25in"
+On-Demand Available/In Use, to Window Ended, with no-show, idle-cull,
+and cancellation conversions.](./media/dbedd404ff0049ba26540ae53449dab333012f9f.png "Reservation-block lifecycle state machine"){width="6.25in"
 height="6.083333333333333in"}
 
 Walkthrough
 
-1.  **Scheduled → Awaiting Claim.** At the start of the reserved window
-    the controller begins watching for the holder's Pod and starts a
-    15-minute no-show timer.
+1.  **Scheduled → Awaiting Claim.** The controller watches for pods
+    continuously from startup. When a reservation is fetched it
+    pre-registers a no-show deadline of `slot_start + 15 min`; no
+    separate "start watching" action occurs at window-open time. On
+    controller startup, any reservation whose window is already open
+    receives a grace deadline of `now + NOSHOWN_GRACE_MINUTES` (default
+    30 min) instead, to avoid falsely declaring a live in-flight session
+    as a no-show across a restart.
 
 2.  **Awaiting Claim → Reserved In Use.** The holder's Pod is matched;
-    the controller adds the toleration and caps runtime to the window.
+    the controller adds the toleration and caps runtime to the end of the
+    reserved window (extended automatically across directly back-to-back
+    blocks held by the same student for the same GPU class and count).
 
 3.  **Awaiting Claim → On-Demand Available.** Fifteen minutes pass with
     no claiming Pod: the block is irrevocably released to the FCFS pool.
 
-4.  **Reserved In Use → On-Demand Available.** The session is found idle
-    and culled; the remaining block is released the same way.
+4a. **Reserved In Use → On-Demand Available (idle-cull).** The session
+    is found idle and culled; once the holder's Pod is deleted the
+    controller re-arms the no-show deadline (`now +
+    NOSHOWN_GRACE_MINUTES`, default 30 min). If the holder does not
+    relaunch within that window the remaining block is irrevocably
+    released to the FCFS pool.
+
+4b. **Reserved In Use → On-Demand Available (cancellation).** If the
+    reservation is cancelled mid-window, the controller evicts the
+    holder's Pod (emitting a `ReservationCancelled` event and deleting
+    it), releases the GPU capacity, and immediately opens the remaining
+    window for on-demand placement. Like the no-show and idle-cull paths,
+    this conversion is irrevocable for the remainder of the window.
 
 5.  **On-Demand Available → In Use.** An eligible Pending Pod is placed,
-    subject to the three guards in Section 5.2.
+    subject to the three guards in Section 5.2. The controller caps the
+    pod's runtime to the end of the on-demand block's window.
 
 6.  **On-Demand In Use → Available.** That Pod finishes or is culled,
-    and the block is recycled to the next waiter.
+    and the block is recycled to the next waiter. When an on-demand block
+    is open, the controller also checks for abutting future reclaim blocks
+    that have entered the reservation app's non-preemptible guard window;
+    if found, the open block's end time is extended to cover them and
+    those blocks are stubbed so they cannot be independently placed,
+    giving a longer effective runtime to any job admitted near the end of
+    the original block.
 
 7.  **→ Window Ended.** When the window closes, the capacity that was on
     loan --- the GPU or MIG instance, not the whole node --- returns to
