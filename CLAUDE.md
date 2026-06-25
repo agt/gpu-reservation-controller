@@ -263,6 +263,7 @@ above applies.
 | `NOSHOWN_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
 | `NOSHOWN_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared |
 | `POD_LIST_TICK_INTERVAL` | `300` | Seconds between queue-processor ticks (pod LIST frequency) |
+| `POD_SCHEDULING_GATE_NAME` | *(absent)* | Name of the SchedulingGate to remove after admitting a pod; unset = disabled |
 
 ---
 

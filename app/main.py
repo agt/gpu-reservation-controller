@@ -52,6 +52,7 @@ from .k8s_client import (
     parse_booking_reference,
     pod_has_toleration,
     read_pod,
+    remove_scheduling_gate,
     set_active_deadline,
     snapshot_tolerated_pods,
 )
@@ -231,8 +232,27 @@ async def _enforce_deadline(
         )
 
 
+async def _enforce_scheduling_gate_removal(
+    pod_name: str, namespace: str, fresh_pod, gate_name: Optional[str]
+) -> None:
+    """Remove the configured scheduling gate from *fresh_pod* if present.
+
+    Best-effort: logs a warning on failure; never revokes an applied toleration.
+    """
+    if not gate_name:
+        return
+    try:
+        await remove_scheduling_gate(pod_name, namespace, fresh_pod, gate_name)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Failed to remove scheduling gate %r from pod %s/%s: %s",
+            gate_name, namespace, pod_name, exc,
+        )
+
+
 async def _try_apply_toleration(
-    state: ControllerState, uid: str, entry: QueueEntry
+    state: ControllerState, uid: str, entry: QueueEntry,
+    scheduling_gate_name: Optional[str] = None,
 ) -> bool:
     """Check GPU budget and patch the toleration onto the pod if eligible.
 
@@ -292,6 +312,9 @@ async def _try_apply_toleration(
                 booking_reference,
             )
             await _enforce_deadline(state, fresh_pod, entry)
+            await _enforce_scheduling_gate_removal(
+                entry.pod_name, entry.pod_namespace, fresh_pod, scheduling_gate_name
+            )
         return True
 
     except Exception as exc:  # noqa: BLE001
@@ -315,7 +338,8 @@ async def _try_apply_toleration(
 
 
 async def _try_place_ondemand(
-    state: ControllerState, uid: str, candidate: OnDemandCandidate
+    state: ControllerState, uid: str, candidate: OnDemandCandidate,
+    scheduling_gate_name: Optional[str] = None,
 ) -> bool:
     """Attempt to place an on-demand candidate onto a suitable block.
 
@@ -434,6 +458,9 @@ async def _try_place_ondemand(
             TOLERATION_KEY,
             candidate.gpu_class_label,
             booking_reference,
+        )
+        await _enforce_scheduling_gate_removal(
+            candidate.pod_name, candidate.pod_namespace, fresh_pod, scheduling_gate_name
         )
         log.info(
             "Placed on-demand pod %s/%s onto block #%d "
@@ -576,7 +603,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
             if config.ondemand_placement_enabled:
                 block_id = state.release_pod(uid)
                 if block_id is not None:
-                    await _recycle_ondemand_block(state, gpu_class_label)
+                    await _recycle_ondemand_block(state, gpu_class_label, config.scheduling_gate_name)
 
         elif event_type in ("ADDED", "MODIFIED"):
             phase = get_pod_phase(pod)
@@ -587,7 +614,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                 state.remove_ondemand_candidate(uid)
                 block_id = state.release_pod(uid)
                 if block_id is not None:
-                    await _recycle_ondemand_block(state, gpu_class_label)
+                    await _recycle_ondemand_block(state, gpu_class_label, config.scheduling_gate_name)
                 continue
 
             if has_tol:
@@ -624,7 +651,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                                     namespace,
                                     name,
                                 )
-                                if await _try_apply_toleration(state, uid, entry):
+                                if await _try_apply_toleration(state, uid, entry, config.scheduling_gate_name):
                                     state.task_queue.pop(uid, None)
 
                 elif config.ondemand_placement_enabled and event_type == "ADDED":
@@ -655,7 +682,8 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
 
 
 async def _recycle_ondemand_block(
-    state: ControllerState, gpu_class_label: str
+    state: ControllerState, gpu_class_label: str,
+    scheduling_gate_name: Optional[str] = None,
 ) -> None:
     """After a pod vacates an on-demand block, try to place the next candidate.
 
@@ -677,7 +705,7 @@ async def _recycle_ondemand_block(
             len(eligible),
         )
     for uid, candidate in eligible:
-        if await _try_place_ondemand(state, uid, candidate):
+        if await _try_place_ondemand(state, uid, candidate, scheduling_gate_name):
             state.ondemand_candidates.pop(uid, None)
             return  # one placement per recycle event is enough
 
@@ -795,7 +823,7 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
                 continue
 
             # --- window is active: attempt to apply the toleration ---
-            if await _try_apply_toleration(state, uid, entry):
+            if await _try_apply_toleration(state, uid, entry, config.scheduling_gate_name):
                 to_remove.append(uid)
 
         for uid in to_remove:
@@ -808,7 +836,7 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
             for uid, candidate in ordered:
                 if now < candidate.next_attempt_at:
                     continue
-                if await _try_place_ondemand(state, uid, candidate):
+                if await _try_place_ondemand(state, uid, candidate, config.scheduling_gate_name):
                     od_to_remove.append(uid)
             for uid in od_to_remove:
                 state.ondemand_candidates.pop(uid, None)

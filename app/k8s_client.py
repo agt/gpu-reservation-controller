@@ -333,6 +333,38 @@ async def apply_toleration(
     )
 
 
+async def remove_scheduling_gate(
+    pod_name: str, namespace: str, pod, gate_name: str
+) -> None:
+    """Remove *gate_name* from pod.spec.schedulingGates if present.
+
+    Uses the strategic-merge-patch ``$patch: delete`` directive so only the
+    named gate is removed; any other gates on the pod are preserved.
+    """
+    existing_gates = pod.spec.scheduling_gates or []
+    if not any(g.name == gate_name for g in existing_gates):
+        log.debug(
+            "k8s: scheduling gate %r not present on pod %s/%s; skipping removal",
+            gate_name, namespace, pod_name,
+        )
+        return
+
+    patch = {"spec": {"schedulingGates": [{"name": gate_name, "$patch": "delete"}]}}
+    log.debug(
+        "k8s: removing scheduling gate %r from pod %s/%s",
+        gate_name, namespace, pod_name,
+    )
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: _core_v1.patch_namespaced_pod(pod_name, namespace, patch),
+    )
+    log.info(
+        "Removed scheduling gate %r from pod %s/%s",
+        gate_name, namespace, pod_name,
+    )
+
+
 async def set_active_deadline(pod_name: str, namespace: str, seconds: int) -> None:
     """Patch pod's spec.activeDeadlineSeconds to *seconds* and record the limit
     in the ``horae/pod-runtime-limit-seconds`` annotation."""

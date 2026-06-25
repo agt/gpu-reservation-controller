@@ -61,6 +61,10 @@ config:
   # Log level: DEBUG, INFO, WARNING, ERROR
   logLevel: "INFO"
 
+  # Name of the SchedulingGate to remove when admitting a pod.
+  # Leave empty to disable scheduling gate management.
+  podSchedulingGateName: ""
+
 # ---------------------------------------------------------------------------
 # ServiceAccount and RBAC
 # ---------------------------------------------------------------------------
