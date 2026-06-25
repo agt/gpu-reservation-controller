@@ -1,4 +1,4 @@
-# Group Manager Guide — Horae GPU Reservation System
+# Group Manager Guide — galends GPU Reservation System
 
 *Audience: course instructors and research-group leads who have been assigned the
 **group manager** role for one or more usage groups.*
@@ -71,7 +71,7 @@ https://<cluster-hostname>/login.html
      "Password" (required, marked with a red asterisk).  Blue "Sign in" button. -->
 
 > **Screenshot: Login page**
-> *(A centered card shows the site title "Horae — GPU Reservation",
+> *(A centered card shows the site title "galends — GPU Reservation",
 > a subtitle "Sign in to manage your GPU reservations", and Username / Password
 > fields above a blue Sign in button.)*
 
