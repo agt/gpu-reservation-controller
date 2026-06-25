@@ -19,6 +19,7 @@ class Config:
     noshown_timeout_minutes: int   # minutes after slot_start before no-show is declared
     noshown_grace_minutes: int     # grace period when controller starts mid-window
     pod_list_tick_interval: int    # seconds between queue-processor ticks
+    scheduling_gate_name: Optional[str]  # SchedulingGate to remove on admission; None = disabled
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -56,4 +57,5 @@ class Config:
             pod_list_tick_interval=int(
                 os.environ.get("POD_LIST_TICK_INTERVAL", "300")
             ),
+            scheduling_gate_name=os.environ.get("POD_SCHEDULING_GATE_NAME") or None,
         )
