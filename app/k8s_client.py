@@ -58,12 +58,50 @@ def init_k8s(kubeconfig_path: Optional[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Phases from which a pod never returns to Running — its GPU slot is free and
+# it should be released from occupancy.  Defined once here (next to
+# get_pod_phase) so the watch loop, the reserved path, and the on-demand path
+# all agree on what "terminal" means (CODE-REVIEW D1c).  The on-demand *drop*
+# additionally treats "Unknown" as gone-for-placement (TERMINAL_PHASES +
+# ("Unknown",)); that is a placement decision, not an occupancy release.
+TERMINAL_PHASES = ("Succeeded", "Failed")
+
+
 def get_pod_phase(pod) -> str:
     """Return the pod's phase string (e.g. "Pending", "Running", "Succeeded", "Failed").
 
     Returns an empty string if the phase is unavailable.
     """
     return (pod.status.phase if pod.status else None) or ""
+
+
+def is_terminal_phase(pod) -> bool:
+    """Return True if *pod* is in a terminal phase (Succeeded/Failed)."""
+    return get_pod_phase(pod) in TERMINAL_PHASES
+
+
+def get_pod_active_deadline(pod) -> Optional[int]:
+    """Return the pod's ``spec.activeDeadlineSeconds``, or ``None`` if unset."""
+    return pod.spec.active_deadline_seconds if pod.spec else None
+
+
+def get_pod_creation_timestamp(pod) -> Optional[datetime]:
+    """Return the pod's ``metadata.creationTimestamp``, or ``None`` if unset."""
+    return pod.metadata.creation_timestamp
+
+
+def get_unschedulable_message(pod) -> str:
+    """Return the ``PodScheduled`` condition message, truncated to 120 chars.
+
+    Empty string when there is no such condition.  Owning the pod-object dig
+    here keeps ``main.py`` out of ``pod.status.conditions`` internals
+    (CODE-REVIEW D10).
+    """
+    conditions = (pod.status.conditions or []) if pod.status else []
+    scheduled = next((c for c in conditions if c.type == "PodScheduled"), None)
+    if scheduled is None:
+        return ""
+    return (scheduled.message or "")[:120]
 
 
 def get_pod_min_runtime_seconds(pod) -> Optional[int]:
@@ -109,10 +147,36 @@ def get_pod_booking_reference(pod) -> Optional[str]:
     return annotations.get("horae/booking-reference")
 
 
-# Prefixes used in horae/booking-reference values.  All three embed the
-# reservation id that the pod was admitted under; the prefix records which path
-# admitted it (reserved / on-demand / no-show) and is otherwise cosmetic.
-_BOOKING_REFERENCE_PREFIXES = ("res-", "ondemand-", "noshow-")
+# Booking-reference "kinds": the prefix recorded in a horae/booking-reference
+# value.  All three embed the reservation id the pod was admitted under; the
+# kind records which path admitted it (reserved / on-demand / no-show) and is
+# otherwise cosmetic.  Construction (make_booking_reference) and parsing
+# (parse_booking_reference) live together so a new admission path or a renamed
+# prefix cannot silently break occupancy reconstruction (CODE-REVIEW D2).
+BOOKING_KIND_RESERVED = "res"
+BOOKING_KIND_ONDEMAND = "ondemand"
+BOOKING_KIND_NOSHOW = "noshow"
+
+_BOOKING_REFERENCE_PREFIXES = (
+    f"{BOOKING_KIND_RESERVED}-",
+    f"{BOOKING_KIND_ONDEMAND}-",
+    f"{BOOKING_KIND_NOSHOW}-",
+)
+
+
+def make_booking_reference(kind: str, reservation_id: int) -> str:
+    """Build a ``horae/booking-reference`` value for *reservation_id*.
+
+    *kind* is one of ``BOOKING_KIND_RESERVED`` / ``BOOKING_KIND_ONDEMAND`` /
+    ``BOOKING_KIND_NOSHOW``; the result round-trips through
+    ``parse_booking_reference``.
+    """
+    return f"{kind}-{reservation_id}"
+
+
+def is_reserved_path(reference: Optional[str]) -> bool:
+    """Return True if *reference* was written by the reserved (holder) path."""
+    return bool(reference) and reference.startswith(f"{BOOKING_KIND_RESERVED}-")
 
 
 def parse_booking_reference(reference: Optional[str]) -> Optional[int]:

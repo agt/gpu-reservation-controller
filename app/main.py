@@ -39,17 +39,27 @@ from .controller import (
     slot_start,
 )
 from .k8s_client import (
+    BOOKING_KIND_NOSHOW,
+    BOOKING_KIND_ONDEMAND,
+    BOOKING_KIND_RESERVED,
+    TERMINAL_PHASES,
     PodWatcher,
     apply_toleration,
     delete_pod,
     emit_reservation_cancelled_event,
     emit_runtime_capped_event,
+    get_pod_active_deadline,
     get_pod_booking_reference,
+    get_pod_creation_timestamp,
     get_pod_gpu_count,
     get_pod_min_runtime_seconds,
     get_pod_phase,
+    get_unschedulable_message,
     init_k8s,
     is_gpu_only_pending,
+    is_reserved_path,
+    is_terminal_phase,
+    make_booking_reference,
     parse_booking_reference,
     pod_has_toleration,
     read_pod,
@@ -64,6 +74,24 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
 )
 log = logging.getLogger(__name__)
+
+
+# Retry backoff shared by both admission paths (CODE-REVIEW D1e).  The jittered
+# range is used when a placement attempt fails for budget/transient reasons; the
+# short retry is used when a pod's scheduling state is not yet knowable and we
+# want to look again promptly (well within one POD_LIST_TICK_INTERVAL tick).
+RETRY_JITTER_RANGE = (120, 300)
+SHORT_RETRY_SECONDS = 30
+
+
+def _jittered_retry_at(now: datetime) -> datetime:
+    """Return *now* pushed forward by a random 2–5 min backoff."""
+    return now + timedelta(seconds=random.randint(*RETRY_JITTER_RANGE))
+
+
+def _short_retry_at(now: datetime) -> datetime:
+    """Return *now* pushed forward by the short (30 s) retry interval."""
+    return now + timedelta(seconds=SHORT_RETRY_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -208,27 +236,30 @@ async def _handle_cancelled_reservations(
 
 
 async def _enforce_deadline(
-    state: ControllerState, fresh_pod, entry: QueueEntry
+    pod_name: str, namespace: str, fresh_pod, max_seconds: int
 ) -> None:
-    """Cap the pod's activeDeadlineSeconds to its reservation window(s).
+    """Cap the pod's activeDeadlineSeconds to *max_seconds* and emit an Event.
+
+    Shared by both admission paths (CODE-REVIEW D1a); callers compute
+    *max_seconds* (the reserved path chains back-to-back windows, the on-demand
+    path uses the single block's remaining time).  Only patches when the current
+    deadline is unset or looser than *max_seconds*.
 
     Best-effort: logs a warning on failure but does not raise, so a deadline
     enforcement failure never rolls back an already-applied toleration.
     """
     try:
-        now = datetime.now(timezone.utc)
-        max_secs = state.compute_max_deadline_seconds(now, entry.reservation)
-        current = fresh_pod.spec.active_deadline_seconds
-        if current is None or current > max_secs:
-            await set_active_deadline(entry.pod_name, entry.pod_namespace, max_secs)
+        current = get_pod_active_deadline(fresh_pod)
+        if current is None or current > max_seconds:
+            await set_active_deadline(pod_name, namespace, max_seconds)
             await emit_runtime_capped_event(
-                fresh_pod, entry.pod_name, entry.pod_namespace, max_secs
+                fresh_pod, pod_name, namespace, max_seconds
             )
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "Failed to enforce activeDeadlineSeconds on pod %s/%s: %s",
-            entry.pod_namespace,
-            entry.pod_name,
+            namespace,
+            pod_name,
             exc,
         )
 
@@ -270,22 +301,21 @@ async def _try_apply_toleration(
     **Does not** evaluate timing (window open/closed, retry cooldown); callers
     are responsible for those guards before invoking this function.
     """
-    booking_reference = f"res-{entry.reservation.id}"
+    booking_reference = make_booking_reference(BOOKING_KIND_RESERVED, entry.reservation.id)
 
     available = state.available(entry.reservation, exclude_uid=uid)
     if entry.gpu_requested > available:
-        delay = random.randint(120, 300)
+        now = datetime.now(timezone.utc)
         log.debug(
             "Pod %s/%s: GPU budget full "
-            "(%d requested > %d available of %d reserved); retry in %d s",
+            "(%d requested > %d available of %d reserved); retry later",
             entry.pod_namespace,
             entry.pod_name,
             entry.gpu_requested,
             available,
             entry.reservation.gpu_count,
-            delay,
         )
-        entry.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        entry.next_attempt_at = _jittered_retry_at(now)
         return False
 
     # Optimistically reserve capacity before any await (single-threaded loop).
@@ -294,6 +324,19 @@ async def _try_apply_toleration(
         # Re-fetch the pod immediately before patching so we include any
         # tolerations that arrived since we last saw it.
         fresh_pod = await read_pod(entry.pod_name, entry.pod_namespace)
+
+        # Drop a pod that completed while queued — mirrors the on-demand path's
+        # terminal-phase drop, so a finished pod is never tolerated / capped
+        # (which would only fail into the deadline warning path) (CODE-REVIEW D1c).
+        if is_terminal_phase(fresh_pod):
+            log.info(
+                "Pod %s/%s is %s; dropping from queue",
+                entry.pod_namespace,
+                entry.pod_name,
+                get_pod_phase(fresh_pod),
+            )
+            state.release_pod(uid)
+            return True
 
         if pod_has_toleration(
             fresh_pod, TOLERATION_KEY, entry.gpu_class_label, "NoSchedule"
@@ -312,24 +355,38 @@ async def _try_apply_toleration(
                 entry.gpu_class_label,
                 booking_reference,
             )
-            await _enforce_deadline(state, fresh_pod, entry)
+            now = datetime.now(timezone.utc)
+            max_secs = state.compute_max_deadline_seconds(now, entry.reservation)
+            await _enforce_deadline(
+                entry.pod_name, entry.pod_namespace, fresh_pod, max_secs
+            )
             await _enforce_scheduling_gate_removal(
                 entry.pod_name, entry.pod_namespace, fresh_pod, scheduling_gate_name
+            )
+            log.info(
+                "Admitted pod %s/%s under reservation #%d "
+                "(gpu-class=%s, gpus=%d, %d/%d free after placement, cap=%ds)",
+                entry.pod_namespace,
+                entry.pod_name,
+                entry.reservation.id,
+                entry.gpu_class_label,
+                entry.gpu_requested,
+                state.available(entry.reservation),
+                entry.reservation.gpu_count,
+                max_secs,
             )
         return True
 
     except Exception as exc:  # noqa: BLE001
         # Roll back the optimistic reservation so capacity is not leaked.
         state.release_pod(uid)
-        delay = random.randint(120, 300)
         log.warning(
-            "Error processing pod %s/%s: %s; retry in %d s",
+            "Error processing pod %s/%s: %s; will retry",
             entry.pod_namespace,
             entry.pod_name,
             exc,
-            delay,
         )
-        entry.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        entry.next_attempt_at = _jittered_retry_at(datetime.now(timezone.utc))
         return False
 
 
@@ -364,14 +421,12 @@ async def _try_place_ondemand(
         candidate.min_runtime_seconds,
     )
     if block is None:
-        delay = random.randint(120, 300)
         log.debug(
-            "On-demand candidate %s/%s: no suitable block available; retry in %d s",
+            "On-demand candidate %s/%s: no suitable block available; retry later",
             candidate.pod_namespace,
             candidate.pod_name,
-            delay,
         )
-        candidate.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        candidate.next_attempt_at = _jittered_retry_at(datetime.now(timezone.utc))
         return False
 
     # Guard 3: safety interlock — hold on-demand placement for any GPU class
@@ -379,27 +434,29 @@ async def _try_place_ondemand(
     if candidate.gpu_class_label in state.stuck_holder_gpu_classes:
         log.debug(
             "On-demand candidate %s/%s: safety interlock active for gpu-class=%s; "
-            "retry in 30 s",
+            "retry shortly",
             candidate.pod_namespace,
             candidate.pod_name,
             candidate.gpu_class_label,
         )
-        candidate.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=30)
+        candidate.next_attempt_at = _short_retry_at(datetime.now(timezone.utc))
         return False
 
     if block.id in state.noshow_reservation_ids:
-        booking_reference = f"noshow-{block.id}"
+        booking_reference = make_booking_reference(BOOKING_KIND_NOSHOW, block.id)
     else:
-        booking_reference = f"ondemand-{block.id}"
+        booking_reference = make_booking_reference(BOOKING_KIND_ONDEMAND, block.id)
     # --- optimistic reservation (before any await) ---
     state.record_placement(block.id, uid, candidate.gpu_requested)
 
     try:
         fresh_pod = await read_pod(candidate.pod_name, candidate.pod_namespace)
 
-        # Drop gone or terminal pods.
+        # Drop gone or terminal pods.  Placement additionally treats "Unknown"
+        # (node unreachable) as gone — there is nothing to schedule onto — unlike
+        # occupancy release, which only frees confirmed-terminal slots (D1c).
         phase = get_pod_phase(fresh_pod)
-        if phase in ("Succeeded", "Failed", "Unknown"):
+        if phase in TERMINAL_PHASES or phase == "Unknown":
             log.info(
                 "On-demand candidate %s/%s is %s; dropping",
                 candidate.pod_namespace,
@@ -413,31 +470,23 @@ async def _try_place_ondemand(
         gpu_only = is_gpu_only_pending(fresh_pod, TOLERATION_KEY)
         if gpu_only is False:
             # Pod has non-GPU resource constraints; our toleration cannot help.
-            msg = ""
-            if fresh_pod.status and fresh_pod.status.conditions:
-                sched = next(
-                    (c for c in fresh_pod.status.conditions if c.type == "PodScheduled"),
-                    None,
-                )
-                if sched:
-                    msg = (sched.message or "")[:120]
             log.info(
                 "On-demand candidate %s/%s: not GPU-only-pending (%r); dropping",
                 candidate.pod_namespace,
                 candidate.pod_name,
-                msg,
+                get_unschedulable_message(fresh_pod),
             )
             state.release_pod(uid)
             return True
         if gpu_only is None:
-            # Scheduling conditions not yet populated; keep candidate, retry next tick.
+            # Scheduling conditions not yet populated; keep candidate, retry shortly.
             log.debug(
-                "On-demand candidate %s/%s: scheduling conditions not yet set; retry in 30 s",
+                "On-demand candidate %s/%s: scheduling conditions not yet set; retry shortly",
                 candidate.pod_namespace,
                 candidate.pod_name,
             )
             state.release_pod(uid)
-            candidate.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=30)
+            candidate.next_attempt_at = _short_retry_at(datetime.now(timezone.utc))
             return False
 
         if pod_has_toleration(fresh_pod, TOLERATION_KEY, candidate.gpu_class_label, "NoSchedule"):
@@ -460,12 +509,21 @@ async def _try_place_ondemand(
             candidate.gpu_class_label,
             booking_reference,
         )
+
+        # Cap runtime to the on-demand block's window end (no back-to-back
+        # chaining) BEFORE lifting the scheduling gate: on a block whose whole
+        # premise is "free only until slot_end", the pod must not be allowed to
+        # start running with no deadline if the cap patch fails (CODE-REVIEW D1b).
+        remaining = max(int((slot_end(block) - datetime.now(timezone.utc)).total_seconds()), 1)
+        await _enforce_deadline(
+            candidate.pod_name, candidate.pod_namespace, fresh_pod, remaining
+        )
         await _enforce_scheduling_gate_removal(
             candidate.pod_name, candidate.pod_namespace, fresh_pod, scheduling_gate_name
         )
         log.info(
             "Placed on-demand pod %s/%s onto block #%d "
-            "(gpu-class=%s, gpus=%d, block has %d/%d free after placement)",
+            "(gpu-class=%s, gpus=%d, block has %d/%d free after placement, cap=%ds)",
             candidate.pod_namespace,
             candidate.pod_name,
             block.id,
@@ -473,42 +531,21 @@ async def _try_place_ondemand(
             candidate.gpu_requested,
             state.available(block),
             block.gpu_count,
+            remaining,
         )
-
-        # Cap runtime to the on-demand block's window end (no back-to-back chaining).
-        remaining = int((slot_end(block) - datetime.now(timezone.utc)).total_seconds())
-        remaining = max(remaining, 1)
-        try:
-            current_deadline = fresh_pod.spec.active_deadline_seconds
-            if current_deadline is None or current_deadline > remaining:
-                await set_active_deadline(
-                    candidate.pod_name, candidate.pod_namespace, remaining
-                )
-                await emit_runtime_capped_event(
-                    fresh_pod, candidate.pod_name, candidate.pod_namespace, remaining
-                )
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Failed to enforce activeDeadlineSeconds on on-demand pod %s/%s: %s",
-                candidate.pod_namespace,
-                candidate.pod_name,
-                exc,
-            )
 
         return True
 
     except Exception as exc:  # noqa: BLE001
         # Roll back the optimistic occupancy record so capacity is not leaked.
         state.release_pod(uid)
-        delay = random.randint(120, 300)
         log.warning(
-            "Error placing on-demand pod %s/%s: %s; retry in %d s",
+            "Error placing on-demand pod %s/%s: %s; will retry",
             candidate.pod_namespace,
             candidate.pod_name,
             exc,
-            delay,
         )
-        candidate.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        candidate.next_attempt_at = _jittered_retry_at(datetime.now(timezone.utc))
         return False
 
 
@@ -618,7 +655,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
             # as the DELETED branch: occupancy covers all paths.  The continue also
             # keeps a terminal pod out of the has_tol keep-warm below, which would
             # otherwise re-add it to occupancy on every MODIFIED event.
-            if phase in ("Succeeded", "Failed"):
+            if phase in TERMINAL_PHASES:
                 state.remove_ondemand_candidate(uid)
                 block_id = state.release_pod(uid)
                 if config.ondemand_placement_enabled and block_id is not None:
@@ -677,7 +714,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                     if phase == "Pending":
                         min_rt = get_pod_min_runtime_seconds(pod)
                         if min_rt is not None:
-                            ts = pod.metadata.creation_timestamp
+                            ts = get_pod_creation_timestamp(pod)
                             pod_created_at = ts if ts is not None else datetime.now(timezone.utc)
                             log.debug(
                                 "Pod %s/%s ADDED: no open reservation window (gpu-class=%s); "
@@ -778,7 +815,7 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
                 p.reservation_id
                 for p in live
                 if p.reservation_id is not None
-                and (p.booking_reference or "").startswith("res-")
+                and is_reserved_path(p.booking_reference)
             ]
             state.refresh_claimed_reservations(holder_ids, now)
 
