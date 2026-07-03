@@ -20,12 +20,13 @@ PodWatcher                                   — async-generator based pod event
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Callable, Optional, TypeVar
 
 from kubernetes import client as k8s_client, config as k8s_config, watch
 from kubernetes.client.rest import ApiException
@@ -266,14 +267,25 @@ def is_gpu_only_pending(pod, toleration_key: str) -> Optional[bool]:
 # Async wrappers around blocking kubernetes calls
 # ---------------------------------------------------------------------------
 
+_T = TypeVar("_T")
+
+
+async def _run(fn: Callable[..., _T], *args, **kwargs) -> _T:
+    """Run a blocking kubernetes-client call on the default thread-pool executor.
+
+    Single choke point for every blocking ``_core_v1`` call made from async code
+    (CODE-REVIEW D3b) — the natural place to add ApiException mapping or metrics
+    later.  The dedicated watch thread calls the client directly and does not use
+    this.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
+
 
 async def read_pod(name: str, namespace: str):
     """Fetch the current pod object (re-read before patching to get fresh state)."""
     log.debug("k8s: read_namespaced_pod %s/%s", namespace, name)
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None, lambda: _core_v1.read_namespaced_pod(name, namespace)
-    )
+    return await _run(_core_v1.read_namespaced_pod, name, namespace)
 
 
 @dataclass(frozen=True)
@@ -306,13 +318,11 @@ async def snapshot_tolerated_pods(toleration_key: str) -> list[ToleratedPodInfo]
     reconstruction, the claimed-reservation set, and guard 3, replacing the
     former per-attempt namespaced counts and the separate guard scans.
     """
-    loop = asyncio.get_running_loop()
     log.debug(
         "k8s: list_pod_for_all_namespaces selector=gpu-class (tolerated snapshot)"
     )
-    pod_list = await loop.run_in_executor(
-        None,
-        lambda: _core_v1.list_pod_for_all_namespaces(label_selector="gpu-class"),
+    pod_list = await _run(
+        _core_v1.list_pod_for_all_namespaces, label_selector="gpu-class"
     )
     out: list[ToleratedPodInfo] = []
     for pod in pod_list.items:
@@ -383,11 +393,7 @@ async def apply_toleration(
         "k8s: patch_namespaced_pod %s/%s (add toleration %s=%s:NoSchedule, booking=%s)",
         namespace, pod_name, tol_key, tol_value, booking_reference,
     )
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        None,
-        lambda: _core_v1.patch_namespaced_pod(pod_name, namespace, patch),
-    )
+    await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
     log.info(
         "Applied toleration %s=%s:NoSchedule to pod %s/%s (booking=%s)",
         tol_key,
@@ -419,11 +425,7 @@ async def remove_scheduling_gate(
         "k8s: removing scheduling gate %r from pod %s/%s",
         gate_name, namespace, pod_name,
     )
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        None,
-        lambda: _core_v1.patch_namespaced_pod(pod_name, namespace, patch),
-    )
+    await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
     log.info(
         "Removed scheduling gate %r from pod %s/%s",
         gate_name, namespace, pod_name,
@@ -437,15 +439,11 @@ async def set_active_deadline(pod_name: str, namespace: str, seconds: int) -> No
         "k8s: patch_namespaced_pod %s/%s (activeDeadlineSeconds=%d)",
         namespace, pod_name, seconds,
     )
-    loop = asyncio.get_running_loop()
     patch = {
         "metadata": {"annotations": {"horae/pod-runtime-limit-seconds": str(seconds)}},
         "spec": {"activeDeadlineSeconds": seconds},
     }
-    await loop.run_in_executor(
-        None,
-        lambda: _core_v1.patch_namespaced_pod(pod_name, namespace, patch),
-    )
+    await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
     log.info(
         "Set activeDeadlineSeconds=%d on pod %s/%s",
         seconds,
@@ -454,27 +452,26 @@ async def set_active_deadline(pod_name: str, namespace: str, seconds: int) -> No
     )
 
 
-async def emit_runtime_capped_event(
+async def _emit_pod_event(
     pod,
     pod_name: str,
     namespace: str,
-    deadline_seconds: int,
+    *,
+    name_prefix: str,
+    reason: str,
+    action: str,
+    message: str,
 ) -> None:
-    """Create a Kubernetes Event linked to *pod* with reason='RuntimeCapped'."""
+    """Create a ``Normal`` Kubernetes Event linked to *pod*.
+
+    Shared body for the runtime-cap and cancellation emitters (CODE-REVIEW D3c),
+    which differ only in *name_prefix* / *reason* / *action* / *message*.  Uses
+    ``generate_name`` so re-emitting for the same pod never 409s (B10).
+    """
     now = datetime.now(timezone.utc)
-    minutes, secs = divmod(deadline_seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    human = (
-        f"{hours}h{minutes:02d}m{secs:02d}s"
-        if hours
-        else f"{minutes}m{secs:02d}s"
-    )
     event = k8s_client.CoreV1Event(
         metadata=k8s_client.V1ObjectMeta(
-            # generate_name (not a deterministic name) so re-emitting a cap for
-            # the same pod — controller restart, or a second cap when a merged
-            # block extends the deadline — does not 409 AlreadyExists (B10).
-            generate_name="gpu-runcap-",
+            generate_name=name_prefix,
             namespace=namespace,
         ),
         involved_object=k8s_client.V1ObjectReference(
@@ -484,25 +481,46 @@ async def emit_runtime_capped_event(
             namespace=namespace,
             uid=pod.metadata.uid,
         ),
-        reason="RuntimeCapped",
-        message=(
-            f"activeDeadlineSeconds set to {deadline_seconds} ({human}) "
-            f"to ensure the pod terminates within its GPU reservation window(s)."
-        ),
+        reason=reason,
+        message=message,
         type="Normal",
         first_timestamp=now,
         last_timestamp=now,
         count=1,
         reporting_component="gpu-reservation-controller",
-        action="CapRuntime",
+        action=action,
     )
     log.debug(
-        "k8s: create_namespaced_event %s (pod=%s, reason=RuntimeCapped)", namespace, pod_name
+        "k8s: create_namespaced_event %s (pod=%s, reason=%s)", namespace, pod_name, reason
     )
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        None,
-        lambda: _core_v1.create_namespaced_event(namespace, event),
+    await _run(_core_v1.create_namespaced_event, namespace, event)
+
+
+async def emit_runtime_capped_event(
+    pod,
+    pod_name: str,
+    namespace: str,
+    deadline_seconds: int,
+) -> None:
+    """Create a Kubernetes Event linked to *pod* with reason='RuntimeCapped'."""
+    minutes, secs = divmod(deadline_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    human = (
+        f"{hours}h{minutes:02d}m{secs:02d}s"
+        if hours
+        else f"{minutes}m{secs:02d}s"
+    )
+    await _emit_pod_event(
+        pod,
+        pod_name,
+        namespace,
+        name_prefix="gpu-runcap-",
+        reason="RuntimeCapped",
+        action="CapRuntime",
+        message=(
+            f"activeDeadlineSeconds set to {deadline_seconds} ({human}) "
+            f"to ensure the pod terminates within its GPU reservation window(s)."
+        ),
     )
     log.info(
         "Emitted RuntimeCapped event for pod %s/%s (deadline=%ds)",
@@ -519,12 +537,8 @@ async def delete_pod(name: str, namespace: str) -> None:
     by the time the controller processes the cancellation.
     """
     log.debug("k8s: delete_namespaced_pod %s/%s", namespace, name)
-    loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(
-            None,
-            lambda: _core_v1.delete_namespaced_pod(name, namespace),
-        )
+        await _run(_core_v1.delete_namespaced_pod, name, namespace)
         log.info("Deleted pod %s/%s", namespace, name)
     except ApiException as exc:
         if exc.status == 404:
@@ -540,38 +554,14 @@ async def emit_reservation_cancelled_event(
     cancelled_by_desc: str,
 ) -> None:
     """Create a Kubernetes Event linked to *pod* with reason='ReservationCancelled'."""
-    now = datetime.now(timezone.utc)
-    event = k8s_client.CoreV1Event(
-        metadata=k8s_client.V1ObjectMeta(
-            # generate_name so re-emitting for the same pod does not 409 (B10).
-            generate_name="gpu-rescancel-",
-            namespace=namespace,
-        ),
-        involved_object=k8s_client.V1ObjectReference(
-            api_version="v1",
-            kind="Pod",
-            name=pod_name,
-            namespace=namespace,
-            uid=pod.metadata.uid,
-        ),
-        reason="ReservationCancelled",
-        message=f"Pod evicted: GPU reservation cancelled {cancelled_by_desc}.",
-        type="Normal",
-        first_timestamp=now,
-        last_timestamp=now,
-        count=1,
-        reporting_component="gpu-reservation-controller",
-        action="EvictPod",
-    )
-    log.debug(
-        "k8s: create_namespaced_event %s (pod=%s, reason=ReservationCancelled)",
-        namespace,
+    await _emit_pod_event(
+        pod,
         pod_name,
-    )
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        None,
-        lambda: _core_v1.create_namespaced_event(namespace, event),
+        namespace,
+        name_prefix="gpu-rescancel-",
+        reason="ReservationCancelled",
+        action="EvictPod",
+        message=f"Pod evicted: GPU reservation cancelled {cancelled_by_desc}.",
     )
     log.info(
         "Emitted ReservationCancelled event for pod %s/%s",
