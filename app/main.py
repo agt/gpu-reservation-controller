@@ -8,8 +8,9 @@ Starts three background asyncio tasks inside a FastAPI lifespan:
 
 Additionally, when a pod is detected arriving *inside* an already-open
 reservation window (e.g. a JupyterHub notebook pod), the pod-watch loop
-bypasses the 30-second queue-processor polling interval and attempts to
-apply the toleration immediately, minimising scheduler delay for the user.
+bypasses the queue-processor polling interval (POD_LIST_TICK_INTERVAL,
+default 300 s) and attempts to apply the toleration immediately, minimising
+scheduler delay for the user.
 
 A minimal GET /health endpoint allows Kubernetes liveness probes to verify
 the process is alive.
@@ -233,7 +234,7 @@ async def _enforce_deadline(
 
 
 async def _enforce_scheduling_gate_removal(
-    pod_name: str, namespace: str, fresh_pod, gate_name: Optional[str]
+    pod_name: str, namespace: str, fresh_pod, gate_name: str | None
 ) -> None:
     """Remove the configured scheduling gate from *fresh_pod* if present.
 
@@ -252,7 +253,7 @@ async def _enforce_scheduling_gate_removal(
 
 async def _try_apply_toleration(
     state: ControllerState, uid: str, entry: QueueEntry,
-    scheduling_gate_name: Optional[str] = None,
+    scheduling_gate_name: str | None = None,
 ) -> bool:
     """Check GPU budget and patch the toleration onto the pod if eligible.
 
@@ -339,7 +340,7 @@ async def _try_apply_toleration(
 
 async def _try_place_ondemand(
     state: ControllerState, uid: str, candidate: OnDemandCandidate,
-    scheduling_gate_name: Optional[str] = None,
+    scheduling_gate_name: str | None = None,
 ) -> bool:
     """Attempt to place an on-demand candidate onto a suitable block.
 
@@ -600,20 +601,27 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                     waited,
                 )
             state.remove_ondemand_candidate(uid)
-            if config.ondemand_placement_enabled:
-                block_id = state.release_pod(uid)
-                if block_id is not None:
-                    await _recycle_ondemand_block(state, gpu_class_label, config.scheduling_gate_name)
+            # Occupancy is the unified budget map for every admission path, so a
+            # deleted pod must always be released — not only when on-demand
+            # placement is enabled (otherwise reserved-path budget leaks until the
+            # next reconcile).  Only the on-demand recycle is gated on the flag.
+            block_id = state.release_pod(uid)
+            if config.ondemand_placement_enabled and block_id is not None:
+                await _recycle_ondemand_block(state, gpu_class_label, config.scheduling_gate_name)
 
         elif event_type in ("ADDED", "MODIFIED"):
             phase = get_pod_phase(pod)
             has_tol = pod_has_toleration(pod, TOLERATION_KEY, gpu_class_label, "NoSchedule")
 
-            # --- terminal on-demand pod: free its slot ---
-            if config.ondemand_placement_enabled and phase in ("Succeeded", "Failed"):
+            # --- terminal pod: free its slot ---
+            # Unconditional (not gated on the on-demand flag) for the same reason
+            # as the DELETED branch: occupancy covers all paths.  The continue also
+            # keeps a terminal pod out of the has_tol keep-warm below, which would
+            # otherwise re-add it to occupancy on every MODIFIED event.
+            if phase in ("Succeeded", "Failed"):
                 state.remove_ondemand_candidate(uid)
                 block_id = state.release_pod(uid)
-                if block_id is not None:
+                if config.ondemand_placement_enabled and block_id is not None:
                     await _recycle_ondemand_block(state, gpu_class_label, config.scheduling_gate_name)
                 continue
 
@@ -639,12 +647,20 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                     state.enqueue_pod(uid, name, namespace, gpu_class_label, gpu_count)
 
                     # Fast path: ADDED pod inside an open window — don't wait for
-                    # the queue processor's 30-second polling interval.
+                    # the queue processor's POD_LIST_TICK_INTERVAL tick (default 300 s).
                     if event_type == "ADDED":
                         entry = state.task_queue.get(uid)
                         if entry is not None:
                             now = datetime.now(timezone.utc)
-                            if slot_start(entry.reservation) <= now < slot_end(entry.reservation):
+                            # Honor the retry cooldown: on a watch reconnect every
+                            # pod is replayed as ADDED, and enqueue_pod is
+                            # idempotent, so without this guard the fast path would
+                            # retry an entry still in budget-full/error backoff,
+                            # ignoring next_attempt_at as the queue processor does (B8).
+                            if (
+                                slot_start(entry.reservation) <= now < slot_end(entry.reservation)
+                                and now >= entry.next_attempt_at
+                            ):
                                 log.info(
                                     "Pod %s/%s arrived inside reservation window; "
                                     "attempting immediate toleration",
@@ -683,7 +699,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
 
 async def _recycle_ondemand_block(
     state: ControllerState, gpu_class_label: str,
-    scheduling_gate_name: Optional[str] = None,
+    scheduling_gate_name: str | None = None,
 ) -> None:
     """After a pod vacates an on-demand block, try to place the next candidate.
 
@@ -935,3 +951,20 @@ app = create_app()
 async def health() -> dict:
     """Liveness probe — returns 200 OK when the process is running."""
     return {"status": "ok"}
+
+
+def main() -> None:
+    """Run the controller, binding uvicorn to the configured HEALTH_PORT.
+
+    Launching programmatically (rather than via a hardcoded ``uvicorn`` CLI port)
+    is what makes ``HEALTH_PORT`` actually take effect, so Helm's ``healthPort``
+    and both probes stay consistent with the listening port (CODE-REVIEW P2).
+    """
+    import uvicorn
+
+    config: Config = app.state.config
+    uvicorn.run(app, host="0.0.0.0", port=config.health_port)
+
+
+if __name__ == "__main__":
+    main()

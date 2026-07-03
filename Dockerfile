@@ -32,7 +32,10 @@ USER appuser
 ENV RESERVATION_API_URL=""
 ENV RESERVATION_API_KEY=""
 
-# Optional tuning — override as needed.
+# Optional tuning — a representative subset shown here for visibility; these
+# match the application defaults in config.py.  The full set of tunables is
+# documented in README.md and CLAUDE.md and can be overridden at deploy time
+# (the Helm chart wires them all).
 ENV RESERVATION_FETCH_INTERVAL="300"
 ENV RESERVATION_LOOKAHEAD_DAYS="7"
 ENV HEALTH_PORT="8000"
@@ -44,7 +47,9 @@ EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD python -c \
-        "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" \
+        "import os,urllib.request; urllib.request.urlopen('http://localhost:%s/health' % os.environ.get('HEALTH_PORT','8000'))" \
     || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Launch via the module entrypoint so HEALTH_PORT controls the bind port
+# (uvicorn is started programmatically from app.main:main).
+CMD ["python", "-m", "app.main"]

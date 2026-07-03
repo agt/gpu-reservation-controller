@@ -53,7 +53,7 @@ system is designed to accommodate greater values in the future.)
            │ task queue (in memory)
            ▼
 ┌──────────────────────────────────────────────────────┐
-│ 3. Queue processor  (every 30 s)                     │
+│ 3. Queue processor  (every 300 s)                    │
 │    Handles pods queued before their window opened,   │
 │    and retries for pods that were over-budget:       │
 │      a. Count nvidia.com/gpu already in use by other │
@@ -279,10 +279,13 @@ All settings are supplied via environment variables.
 | `RESERVATION_LOOKAHEAD_DAYS` | no | `7` | How many calendar days ahead to fetch reservations |
 | `KUBECONFIG` | no | *(absent)* | Path to a kubeconfig file; if unset, in-cluster service-account credentials are used |
 | `HEALTH_PORT` | no | `8000` | Port for the `GET /health` liveness endpoint |
-| `TZ` | no | system default | IANA timezone for reservation window arithmetic, e.g. `America/Los_Angeles` |
+| `TZ` | no | system default | Affects log timestamp display only; reservation window arithmetic is UTC-based and does not depend on it |
 | `ONDEMAND_PLACEMENT_ENABLED` | no | `true` | Set to `false` to disable on-demand placement and run reserved-path logic only |
 | `NOSHOWN_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and opening the block to on-demand pods |
 | `NOSHOWN_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress |
+| `POD_LIST_TICK_INTERVAL` | no | `300` | Seconds between queue-processor ticks (pod LIST frequency) |
+| `POD_SCHEDULING_GATE_NAME` | no | *(absent)* | Name of a SchedulingGate to remove from a pod after admitting it; unset disables scheduling-gate removal |
+| `LOG_LEVEL` | no | `INFO` | Python logging level for the controller |
 
 > **Note:** `reclaim_preempt_guard_minutes` (used by reclaim-block merging) is
 > **not** an environment variable — the controller reads it from the reservation
@@ -348,8 +351,9 @@ kubectl create secret generic gpu-reservation-api-key \
 
 ### 2 — RBAC
 
-The controller needs read access to pods across all namespaces, and write
-access (PATCH) to pods in namespaces where reservations are active.
+The controller needs read access to pods across all namespaces, write access
+(PATCH) to pods in namespaces where reservations are active, and `delete` on
+pods so it can evict pods whose reservation is cancelled mid-window.
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -359,7 +363,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "patch"]
+    verbs: ["get", "list", "watch", "patch", "delete"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create"]
@@ -492,16 +496,21 @@ gpu-reservation-controller/
 │   ├── config.py             Config dataclass from environment variables
 │   ├── schemas.py            Pydantic models for reservation API responses
 │   ├── reservation_client.py httpx async client for the reservation API
-│   ├── k8s_client.py         Kubernetes client wrapper (watch, patch, count)
+│   ├── k8s_client.py         Kubernetes client wrapper (watch, patch, occupancy snapshot)
 │   └── controller.py         Shared state, queue, matching, window arithmetic
 ├── tests/                    pytest suite (controller logic, guards, no-show, on-demand)
 ├── helm/gpu-reservation-controller/  Helm chart (Deployment, RBAC, Service)
-├── docs/overview.md          Design & operations plan (stakeholder-facing)
+├── docs/
+│   ├── RESERVATION-API.md    Reservation management API specification
+│   │                         (identical copy of API.md in gpu-reservation-app —
+│   │                         update both together)
+│   ├── SCHEDULING.md         Reservation-app scheduling/reclaim behaviour reference
+│   └── lifecycle.mmd/.png    Pod lifecycle state diagram (Mermaid + rendered)
 ├── requirements.txt
+├── requirements-dev.txt
+├── pytest.ini
 ├── Dockerfile
-├── RESERVATION-API.md        Reservation management API specification
-│                             (identical copy of API.md in gpu-reservation-app —
-│                             update both together)
+├── OBSERVABILITY.md          Catalogue of every structured log point
 ├── CLAUDE.md                 Architecture reference for AI coding assistants
 ├── AGENTS.md                 Development standards for AI coding agents
 └── README.md                 This file

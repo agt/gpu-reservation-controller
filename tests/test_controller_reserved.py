@@ -279,11 +279,13 @@ class TestComputeMaxDeadline:
         now = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)  # 1 hour into the 2-hour window
         assert state.compute_max_deadline_seconds(now, res) == 3600
 
-    def test_window_expired_returns_zero(self):
+    def test_window_expired_floors_at_one(self):
+        # B3: an expired window must floor at 1, never 0 — Kubernetes rejects
+        # activeDeadlineSeconds: 0, which would leave the pod uncapped.
         res = _user_reservation(1, start_time="08:00:00", duration_minutes=120)
         state = _state(res)
         now = datetime(2024, 1, 15, 11, 0, tzinfo=timezone.utc)  # 1 hour after window ended
-        assert state.compute_max_deadline_seconds(now, res) == 0
+        assert state.compute_max_deadline_seconds(now, res) == 1
 
     def test_one_backtoback_adds_full_duration(self):
         # res1: 08:00–10:00  res2: 10:00–12:00 (slot_index=1, same policy params)

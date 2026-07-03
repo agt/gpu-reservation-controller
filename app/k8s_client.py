@@ -22,12 +22,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import time
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
 from kubernetes import client as k8s_client, config as k8s_config, watch
+from kubernetes.client.rest import ApiException
 
 log = logging.getLogger(__name__)
 
@@ -406,7 +407,10 @@ async def emit_runtime_capped_event(
     )
     event = k8s_client.CoreV1Event(
         metadata=k8s_client.V1ObjectMeta(
-            name=f"gpu-runcap-{pod.metadata.uid}",
+            # generate_name (not a deterministic name) so re-emitting a cap for
+            # the same pod — controller restart, or a second cap when a merged
+            # block extends the deadline — does not 409 AlreadyExists (B10).
+            generate_name="gpu-runcap-",
             namespace=namespace,
         ),
         involved_object=k8s_client.V1ObjectReference(
@@ -458,12 +462,10 @@ async def delete_pod(name: str, namespace: str) -> None:
             lambda: _core_v1.delete_namespaced_pod(name, namespace),
         )
         log.info("Deleted pod %s/%s", namespace, name)
-    except Exception as exc:
-        if getattr(getattr(exc, "status", None), "__class__", None) is not None:
-            status = getattr(exc, "status", None)
-            if status == 404:
-                log.debug("Pod %s/%s already gone (404)", namespace, name)
-                return
+    except ApiException as exc:
+        if exc.status == 404:
+            log.debug("Pod %s/%s already gone (404)", namespace, name)
+            return
         raise
 
 
@@ -477,7 +479,8 @@ async def emit_reservation_cancelled_event(
     now = datetime.now(timezone.utc)
     event = k8s_client.CoreV1Event(
         metadata=k8s_client.V1ObjectMeta(
-            name=f"gpu-rescancel-{pod.metadata.uid}",
+            # generate_name so re-emitting for the same pod does not 409 (B10).
+            generate_name="gpu-rescancel-",
             namespace=namespace,
         ),
         involved_object=k8s_client.V1ObjectReference(
@@ -539,11 +542,12 @@ class PodWatcher:
     async def events(self) -> AsyncIterator[tuple[str, object]]:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+        stop_event = threading.Event()
 
         def _run_watch() -> None:
-            """Blocking watch loop; runs in a thread-pool thread."""
+            """Blocking watch loop; runs in a dedicated daemon thread."""
             _fail_count = 0
-            while True:
+            while not stop_event.is_set():
                 try:
                     w = watch.Watch()
 
@@ -579,6 +583,9 @@ class PodWatcher:
                         resource_version=resource_version,
                         timeout_seconds=270,
                     ):
+                        if stop_event.is_set():
+                            w.stop()
+                            return
                         obj = event["object"]
                         log.debug(
                             "k8s: watch event %s pod %s/%s",
@@ -603,13 +610,22 @@ class PodWatcher:
                         log.debug(
                             "Pod watch stream ended (%s); reconnecting in 5 s", exc
                         )
-                    time.sleep(5)
+                    # Interruptible sleep: a set stop_event returns immediately.
+                    if stop_event.wait(5):
+                        return
 
-        # Submit the blocking watch to the default thread-pool executor.
-        # The thread runs indefinitely (daemon); it will be killed when the
-        # process exits.
-        loop.run_in_executor(None, _run_watch)
+        # Run the blocking watch in a dedicated daemon thread rather than the
+        # shared default executor: it never returns on its own, so it must not
+        # occupy an executor slot every other K8s call contends for, and as a
+        # daemon it cannot hang interpreter exit / test teardown.  The stop_event
+        # lets us unwind the reconnect loop promptly when the consumer stops
+        # iterating (B7).
+        thread = threading.Thread(target=_run_watch, name="pod-watch", daemon=True)
+        thread.start()
 
-        while True:
-            event_type, pod = await queue.get()
-            yield event_type, pod
+        try:
+            while True:
+                event_type, pod = await queue.get()
+                yield event_type, pod
+        finally:
+            stop_event.set()

@@ -584,7 +584,10 @@ class ControllerState:
         total = max(0.0, (prev_end - now).total_seconds())
         for res in self._chain_for(current_reservation, now):
             total += (slot_end(res) - slot_start(res)).total_seconds()
-        return int(total)
+        # Floor at 1: Kubernetes rejects activeDeadlineSeconds: 0, and if the
+        # window expired between the caller's now-check and here the total can be
+        # zero.  Mirrors the on-demand path's max(remaining, 1) (CODE-REVIEW B3).
+        return max(1, int(total))
 
     def reservations_claimed_by(
         self,
@@ -789,7 +792,23 @@ class ControllerState:
                 )
                 continue  # subject gone, or whole merged span has ended
             if subject_id in self.claimed_reservation_ids:
-                continue  # a reserved holder now occupies it — not on-demand
+                # A reserved holder now occupies the subject, so it is no longer
+                # an on-demand block and its window must NOT be extended.  But an
+                # on-demand job placed earlier may still be running on a deadline
+                # already extended across the absorbed blocks (deadlines are never
+                # retracted), so keep those blocks stubbed and the merge retained
+                # until the whole span ends — otherwise they are re-exposed for
+                # double-booking (CODE-REVIEW B4).
+                self.merged_stub_ids.update(merge.absorbed_ids)
+                surviving[subject_id] = merge
+                log.info(
+                    "Reclaim merge for subject #%d: subject now claimed by a "
+                    "reserved holder; absorbed block(s) %s kept stubbed until %s",
+                    subject_id,
+                    merge.absorbed_ids,
+                    merge.extended_end.isoformat(),
+                )
+                continue
             absorbed = [by_id.get(aid) for aid in merge.absorbed_ids]
             if any(a is None or a.kind != "reclaim" for a in absorbed):
                 missing = [
@@ -1008,10 +1027,19 @@ class ControllerState:
         return max(0, gpu_count - used)
 
     def _reservation_gpu_count(self, reservation_id: int) -> int:
-        """Return gpu_count for a reservation by id, or 0 if not found."""
+        """Return gpu_count for a reservation by id, or 0 if not found.
+
+        Consults cancelled-in-window blocks as well as the active list: on-demand
+        pods can be placed onto freed cancelled capacity, and those blocks live
+        only in ``cancelled_reservations``.  Without this, every such placement
+        logged "0/0 free" (B11).
+        """
         for r in self.reservations:
             if r.id == reservation_id:
                 return r.gpu_count
+        cancelled = self.cancelled_reservations.get(reservation_id)
+        if cancelled is not None:
+            return cancelled.gpu_count
         return 0
 
     # ------------------------------------------------------------------

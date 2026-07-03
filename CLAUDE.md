@@ -39,7 +39,7 @@ app/
 ├── config.py             Config dataclass populated from environment variables
 ├── schemas.py            Pydantic models mirroring RESERVATION-API.md §6
 ├── reservation_client.py httpx async client — fetches reservations + GPU class details
-├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, set_active_deadline, emit_runtime_capped_event, count usage
+├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, set_active_deadline, emit_runtime_capped_event, snapshot_tolerated_pods (occupancy rebuild)
 └── controller.py         ControllerState, QueueEntry, matching, window arithmetic
 ```
 
@@ -145,7 +145,8 @@ log timestamp display).
 When a pod ADDED event arrives while its reservation window is already open
 (the common case for JupyterHub notebook servers launched during a session),
 `pod_watch_loop` calls `_try_apply_toleration` immediately rather than waiting
-up to 30 s for the next queue-processor tick.
+up to a full `POD_LIST_TICK_INTERVAL` (default 300 s) for the next
+queue-processor tick.
 
 Only ADDED events trigger the fast path.  MODIFIED events — which can arrive in
 rapid bursts as Kubernetes reconciles pod state — go through the normal queue so
@@ -220,7 +221,8 @@ queue-processor tick rebuilds the map wholesale from a live cluster snapshot
 (`snapshot_tolerated_pods` → `reconcile_occupancy`), so a missed watch event
 self-heals within one tick.  An optimistic placement recorded between ticks whose
 patch is not yet visible in the snapshot may be briefly dropped and re-captured
-on the next tick — a window bounded by the 30 s tick interval.
+on the next tick — a window bounded by the `POD_LIST_TICK_INTERVAL` tick
+(default 300 s).
 
 **No-show state does not survive restarts.**  `noshow_reservation_ids` is
 in-memory and never written back to the reservation API (the key is

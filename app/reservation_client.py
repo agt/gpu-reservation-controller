@@ -3,15 +3,17 @@
 Implements only the endpoints the controller needs:
   - GET /api/reservations  — paginated list of all (active + cancelled) reservations
   - GET /api/gpu-classes/{id}  — per-class detail including label_value
+  - GET /api/settings  — app settings (reclaim window/guard) for reclaim merging
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
+from pydantic import ValidationError
 
 from .config import Config
 from .schemas import AppSettings, GpuClassDetail, ReservationResponse
@@ -37,7 +39,12 @@ class ReservationClient:
 
     async def fetch_reservations(self) -> list[ReservationResponse]:
         """Return all reservations (active and cancelled) from today through lookahead window."""
-        today = date.today()
+        # UTC everywhere: date.today() would use the process TZ and drop
+        # currently-open reservations east of UTC (see CODE-REVIEW-2026-07 B2).
+        # The API filter is date-based while windows are UTC-instant-based, so
+        # widen date_start by one day to avoid clipping a window open right now.
+        today = datetime.now(timezone.utc).date()
+        start = today - timedelta(days=1)
         end = today + timedelta(days=self._lookahead_days)
         results: list[ReservationResponse] = []
         offset = 0
@@ -48,7 +55,7 @@ class ReservationClient:
                 "/api/reservations",
                 params={
                     "status": "all",
-                    "date_start": today.isoformat(),
+                    "date_start": start.isoformat(),
                     "date_end": end.isoformat(),
                     "limit": limit,
                     "offset": offset,
@@ -90,6 +97,12 @@ class ReservationClient:
         except httpx.RequestError as exc:
             log.warning("Could not fetch GPU class %d: %s", gpu_class_id, exc)
             return None
+        except (ValidationError, ValueError) as exc:
+            # Malformed / unparseable payload (ValueError covers JSONDecodeError):
+            # honor the documented "None on error" contract instead of letting it
+            # abort the whole refresh cycle (B9).
+            log.warning("Could not parse GPU class %d response: %s", gpu_class_id, exc)
+            return None
 
     async def fetch_settings(self) -> Optional[AppSettings]:
         """Return the app settings (reclaim window/guard), or None on error."""
@@ -102,4 +115,9 @@ class ReservationClient:
             return None
         except httpx.RequestError as exc:
             log.warning("Could not fetch app settings: %s", exc)
+            return None
+        except (ValidationError, ValueError) as exc:
+            # See fetch_gpu_class: a malformed /api/settings payload must skip the
+            # guard update, not abort the refresh cycle (B9).
+            log.warning("Could not parse app settings response: %s", exc)
             return None
