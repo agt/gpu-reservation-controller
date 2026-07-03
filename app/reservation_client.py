@@ -8,7 +8,7 @@ Implements only the endpoints the controller needs:
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -37,7 +37,12 @@ class ReservationClient:
 
     async def fetch_reservations(self) -> list[ReservationResponse]:
         """Return all reservations (active and cancelled) from today through lookahead window."""
-        today = date.today()
+        # UTC everywhere: date.today() would use the process TZ and drop
+        # currently-open reservations east of UTC (see CODE-REVIEW-2026-07 B2).
+        # The API filter is date-based while windows are UTC-instant-based, so
+        # widen date_start by one day to avoid clipping a window open right now.
+        today = datetime.now(timezone.utc).date()
+        start = today - timedelta(days=1)
         end = today + timedelta(days=self._lookahead_days)
         results: list[ReservationResponse] = []
         offset = 0
@@ -48,7 +53,7 @@ class ReservationClient:
                 "/api/reservations",
                 params={
                     "status": "all",
-                    "date_start": today.isoformat(),
+                    "date_start": start.isoformat(),
                     "date_end": end.isoformat(),
                     "limit": limit,
                     "offset": offset,

@@ -600,20 +600,27 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                     waited,
                 )
             state.remove_ondemand_candidate(uid)
-            if config.ondemand_placement_enabled:
-                block_id = state.release_pod(uid)
-                if block_id is not None:
-                    await _recycle_ondemand_block(state, gpu_class_label, config.scheduling_gate_name)
+            # Occupancy is the unified budget map for every admission path, so a
+            # deleted pod must always be released — not only when on-demand
+            # placement is enabled (otherwise reserved-path budget leaks until the
+            # next reconcile).  Only the on-demand recycle is gated on the flag.
+            block_id = state.release_pod(uid)
+            if config.ondemand_placement_enabled and block_id is not None:
+                await _recycle_ondemand_block(state, gpu_class_label, config.scheduling_gate_name)
 
         elif event_type in ("ADDED", "MODIFIED"):
             phase = get_pod_phase(pod)
             has_tol = pod_has_toleration(pod, TOLERATION_KEY, gpu_class_label, "NoSchedule")
 
-            # --- terminal on-demand pod: free its slot ---
-            if config.ondemand_placement_enabled and phase in ("Succeeded", "Failed"):
+            # --- terminal pod: free its slot ---
+            # Unconditional (not gated on the on-demand flag) for the same reason
+            # as the DELETED branch: occupancy covers all paths.  The continue also
+            # keeps a terminal pod out of the has_tol keep-warm below, which would
+            # otherwise re-add it to occupancy on every MODIFIED event.
+            if phase in ("Succeeded", "Failed"):
                 state.remove_ondemand_candidate(uid)
                 block_id = state.release_pod(uid)
-                if block_id is not None:
+                if config.ondemand_placement_enabled and block_id is not None:
                     await _recycle_ondemand_block(state, gpu_class_label, config.scheduling_gate_name)
                 continue
 
