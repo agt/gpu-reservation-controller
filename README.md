@@ -281,8 +281,8 @@ All settings are supplied via environment variables.
 | `HEALTH_PORT` | no | `8000` | Port for the `GET /health` liveness endpoint |
 | `TZ` | no | system default | Affects log timestamp display only; reservation window arithmetic is UTC-based and does not depend on it |
 | `ONDEMAND_PLACEMENT_ENABLED` | no | `true` | Set to `false` to disable on-demand placement and run reserved-path logic only |
-| `NOSHOWN_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and opening the block to on-demand pods |
-| `NOSHOWN_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress |
+| `NOSHOW_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and opening the block to on-demand pods (legacy alias `NOSHOWN_TIMEOUT_MINUTES` still accepted) |
+| `NOSHOW_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress (legacy alias `NOSHOWN_GRACE_MINUTES` still accepted) |
 | `POD_LIST_TICK_INTERVAL` | no | `300` | Seconds between queue-processor ticks (pod LIST frequency) |
 | `POD_SCHEDULING_GATE_NAME` | no | *(absent)* | Name of a SchedulingGate to remove from a pod after admitting it; unset disables scheduling-gate removal |
 | `LOG_LEVEL` | no | `INFO` | Python logging level for the controller |
