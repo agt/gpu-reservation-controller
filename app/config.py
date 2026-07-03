@@ -20,6 +20,7 @@ class Config:
     noshown_grace_minutes: int     # grace period when controller starts mid-window
     pod_list_tick_interval: int    # seconds between queue-processor ticks
     scheduling_gate_name: Optional[str]  # SchedulingGate to remove on admission; None = disabled
+    log_level: str = "INFO"        # root log level (LOG_LEVEL)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -33,6 +34,12 @@ class Config:
             raise RuntimeError(
                 "RESERVATION_API_KEY environment variable is required"
             )
+
+        def _noshow(canonical: str, legacy: str, default: str) -> str:
+            # Prefer the NOSHOW_* spelling; fall back to the legacy grep-hostile
+            # NOSHOWN_* name so existing deployments keep working (CODE-REVIEW H3).
+            return os.environ.get(canonical) or os.environ.get(legacy, default)
+
         return cls(
             reservation_api_url=url,
             reservation_api_key=key,
@@ -49,13 +56,14 @@ class Config:
             ).lower()
             not in ("false", "0", "no"),
             noshown_timeout_minutes=int(
-                os.environ.get("NOSHOWN_TIMEOUT_MINUTES", "15")
+                _noshow("NOSHOW_TIMEOUT_MINUTES", "NOSHOWN_TIMEOUT_MINUTES", "15")
             ),
             noshown_grace_minutes=int(
-                os.environ.get("NOSHOWN_GRACE_MINUTES", "30")
+                _noshow("NOSHOW_GRACE_MINUTES", "NOSHOWN_GRACE_MINUTES", "30")
             ),
             pod_list_tick_interval=int(
                 os.environ.get("POD_LIST_TICK_INTERVAL", "300")
             ),
             scheduling_gate_name=os.environ.get("POD_SCHEDULING_GATE_NAME") or None,
+            log_level=os.environ.get("LOG_LEVEL", "INFO"),
         )

@@ -66,22 +66,22 @@ def _sched_condition(status: str, reason: str = "Unschedulable", message: str = 
 
 def test_not_pending_returns_none():
     pod = _pod(phase="Running")
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_no_status_returns_none():
     pod = _pod(phase=None)
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_no_pod_scheduled_condition_returns_none():
     pod = _pod(phase="Pending", conditions=[])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_pod_scheduled_status_true_returns_none():
     pod = _pod(phase="Pending", conditions=[_sched_condition("True")])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_pod_scheduled_reason_not_unschedulable_returns_none():
@@ -89,7 +89,7 @@ def test_pod_scheduled_reason_not_unschedulable_returns_none():
         phase="Pending",
         conditions=[_sched_condition("False", reason="SchedulerError", message="some error")],
     )
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +105,7 @@ GPU_ONLY_MSG = (
 
 def test_gpu_only_message_returns_true():
     pod = _pod(conditions=[_sched_condition("False", message=GPU_ONLY_MSG)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is True
+    assert is_gpu_only_pending(pod) is True
 
 
 def test_gpu_plus_our_taint_returns_true():
@@ -115,7 +115,7 @@ def test_gpu_plus_our_taint_returns_true():
         "5 node(s) had untolerated taint {gpu-class-reservation=h100: NoSchedule}."
     )
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is True
+    assert is_gpu_only_pending(pod) is True
 
 
 def test_gpu_plus_memory_returns_false():
@@ -124,48 +124,48 @@ def test_gpu_plus_memory_returns_false():
         "3 Insufficient memory."
     )
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is False
+    assert is_gpu_only_pending(pod) is False
 
 
 def test_gpu_plus_cpu_returns_false():
     msg = "0/5 nodes are available: 5 Insufficient nvidia.com/gpu, 2 Insufficient cpu."
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is False
+    assert is_gpu_only_pending(pod) is False
 
 
 def test_memory_only_no_gpu_returns_false():
     msg = "0/5 nodes are available: 5 Insufficient memory."
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is False
+    assert is_gpu_only_pending(pod) is False
 
 
 def test_cpu_only_returns_false():
     msg = "0/5 nodes are available: 5 Insufficient cpu."
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is False
+    assert is_gpu_only_pending(pod) is False
 
 
 def test_empty_message_returns_none():
     pod = _pod(conditions=[_sched_condition("False", message="")])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_message_none_returns_none():
     cond = SimpleNamespace(type="PodScheduled", status="False", reason="Unschedulable", message=None)
     pod = _pod(conditions=[cond])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_affinity_failure_no_gpu_returns_none():
     msg = "0/5 nodes are available: 5 node(s) didn't match Pod's node affinity/selector."
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_other_taint_without_gpu_returns_none():
     msg = "0/5 nodes are available: 5 node(s) had untolerated taint {other-key=val: NoSchedule}."
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_gpu_message_with_ephemeral_storage_returns_false():
@@ -174,13 +174,13 @@ def test_gpu_message_with_ephemeral_storage_returns_false():
         "2 Insufficient ephemeral-storage."
     )
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is False
+    assert is_gpu_only_pending(pod) is False
 
 
 def test_multiple_non_gpu_insufficient_returns_false():
     msg = "0/10 nodes are available: 5 Insufficient memory, 5 Insufficient cpu."
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is False
+    assert is_gpu_only_pending(pod) is False
 
 
 def test_gpu_only_with_preemption_note_returns_true():
@@ -190,7 +190,7 @@ def test_gpu_only_with_preemption_note_returns_true():
         "preemption: 0/3 nodes are available: 3 No preemption victims found for incoming pod."
     )
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is True
+    assert is_gpu_only_pending(pod) is True
 
 
 # ---------------------------------------------------------------------------

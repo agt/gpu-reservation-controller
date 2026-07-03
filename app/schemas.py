@@ -63,18 +63,18 @@ class AppSettings(BaseModel):
     capacity — safe for the controller to merge/schedule onto.
     """
 
-    reclaim_window_minutes: int
+    # Nothing consumes reclaim_window_minutes; give it a default so a renamed or
+    # omitted field doesn't fail validation and silently disable reclaim merging
+    # (fetch_settings would return None) (CODE-REVIEW H7).
+    reclaim_window_minutes: Optional[int] = None
     reclaim_preempt_guard_minutes: int
 
 
-class GpuClassDetail(BaseModel):
+class GpuClassDetail(GpuClassBrief):
     """Returned by GET /api/gpu-classes/{id}.
 
-    ``label_value`` is the Kubernetes node-label value used when matching
-    pod gpu-class labels (e.g. "h100", "a100-80gb").  It is optional in the
-    API; if absent, pods for this GPU class cannot be matched.
+    Identical shape to ``GpuClassBrief`` (id, name, optional ``label_value`` —
+    the Kubernetes node-label value used to match pod gpu-class labels, e.g.
+    "h100"); subclassed rather than redeclared so the two cannot drift
+    (CODE-REVIEW H7).
     """
-
-    id: int
-    name: str
-    label_value: Optional[str] = None

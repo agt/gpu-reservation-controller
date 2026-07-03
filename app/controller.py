@@ -1006,7 +1006,7 @@ class ControllerState:
             if pod_uid in occupants:
                 gpu_count = occupants.pop(pod_uid)
                 log.info(
-                    "Released slot: reservation #%d ← pod uid=%s freed %d GPU(s)",
+                    "Released capacity: reservation #%d ← pod uid=%s freed %d GPU(s)",
                     reservation_id,
                     pod_uid,
                     gpu_count,

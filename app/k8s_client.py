@@ -10,7 +10,7 @@ get_pod_gpu_count(pod)                       — sum nvidia.com/gpu requests
 get_pod_booking_reference(pod)               — read horae/booking-reference annotation
 parse_booking_reference(ref)                 — reservation id from a booking-reference
 pod_has_toleration(pod, ...)                 — check for a specific toleration
-is_gpu_only_pending(pod, toleration_key)     — guard 1: GPU-only scheduling failure check
+is_gpu_only_pending(pod)                      — guard 1: GPU-only scheduling failure check
 read_pod(name, namespace)                    — fetch current pod object
 snapshot_tolerated_pods(tol_key)             — one LIST → occupancy + claims + guard 3
 apply_toleration(...)                        — PATCH a pod to add toleration + booking annotation
@@ -216,7 +216,7 @@ def _pod_has_any_reservation_toleration(pod, toleration_key: str) -> bool:
     return any(t.key == toleration_key for t in (pod.spec.tolerations or []))
 
 
-def is_gpu_only_pending(pod, toleration_key: str) -> Optional[bool]:
+def is_gpu_only_pending(pod) -> Optional[bool]:
     """Guard 1: determine whether *pod* is Pending solely due to GPU shortage.
 
     Inspects ``pod.status.conditions[type=PodScheduled]`` to classify the
@@ -282,7 +282,7 @@ async def _run(fn: Callable[..., _T], *args, **kwargs) -> _T:
     return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
 
-async def read_pod(name: str, namespace: str):
+async def read_pod(name: str, namespace: str) -> "k8s_client.V1Pod":
     """Fetch the current pod object (re-read before patching to get fresh state)."""
     log.debug("k8s: read_namespaced_pod %s/%s", namespace, name)
     return await _run(_core_v1.read_namespaced_pod, name, namespace)

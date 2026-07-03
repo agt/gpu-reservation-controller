@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import random
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -68,12 +67,21 @@ from .k8s_client import (
     snapshot_tolerated_pods,
 )
 from .reservation_client import ReservationClient
+from .schemas import ReservationResponse
 
 logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
 )
 log = logging.getLogger(__name__)
+
+
+def _configure_logging(config: Config) -> None:
+    """Apply the configured root log level (LOG_LEVEL via Config, CODE-REVIEW H1).
+
+    Keeps all environment parsing in ``config.py`` — ``main.py`` no longer reads
+    ``os.environ`` directly.
+    """
+    logging.getLogger().setLevel(config.log_level.upper())
 
 
 # Retry backoff shared by both admission paths (CODE-REVIEW D1e).  The jittered
@@ -155,7 +163,7 @@ async def _refresh_reservations(
 
     # Handle mid-window cancellations: evict pods and reclaim capacity.
     if cancelled_in_window:
-        await _handle_cancelled_reservations(state, cancelled_in_window, now)
+        await _handle_cancelled_reservations(state, cancelled_in_window)
 
     # Re-apply persistent reclaim-block merges to the freshly loaded reservation
     # objects (and discover new ones) so a reload never re-exposes an absorbed
@@ -171,8 +179,7 @@ async def _refresh_reservations(
 
 async def _handle_cancelled_reservations(
     state: ControllerState,
-    cancelled_in_window: list,
-    now: datetime,
+    cancelled_in_window: list[ReservationResponse],
 ) -> None:
     """Evict pods admitted under cancelled reservations and reclaim capacity.
 
@@ -467,7 +474,7 @@ async def _try_place_ondemand(
             return True
 
         # Guard 1: GPU-only-pending check.
-        gpu_only = is_gpu_only_pending(fresh_pod, TOLERATION_KEY)
+        gpu_only = is_gpu_only_pending(fresh_pod)
         if gpu_only is False:
             # Pod has non-GPU resource constraints; our toleration cannot help.
             log.info(
@@ -580,7 +587,9 @@ async def reservation_fetch_loop(
                 len(state.gpu_class_labels),
             )
         except Exception as exc:  # noqa: BLE001
-            log.error("Reservation refresh failed: %s", exc)
+            # exc_info so an unexpected bug (e.g. a TypeError in merge arithmetic)
+            # is distinguishable from a transient API error in the logs (H2).
+            log.error("Reservation refresh failed: %s", exc, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +618,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
         uid: str = pod.metadata.uid
         name: str = pod.metadata.name
         namespace: str = pod.metadata.namespace
-        labels: dict = pod.metadata.labels or {}
+        labels: dict[str, str] = pod.metadata.labels or {}
         gpu_class_label: str | None = labels.get("gpu-class")
 
         if not gpu_class_label:
@@ -644,7 +653,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
             # next reconcile).  Only the on-demand recycle is gated on the flag.
             block_id = state.release_pod(uid)
             if config.ondemand_placement_enabled and block_id is not None:
-                await _recycle_ondemand_block(state, gpu_class_label, config.scheduling_gate_name)
+                await _place_ondemand_candidates(state, config, gpu_class=gpu_class_label, max_placements=1)
 
         elif event_type in ("ADDED", "MODIFIED"):
             phase = get_pod_phase(pod)
@@ -659,7 +668,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                 state.remove_ondemand_candidate(uid)
                 block_id = state.release_pod(uid)
                 if config.ondemand_placement_enabled and block_id is not None:
-                    await _recycle_ondemand_block(state, gpu_class_label, config.scheduling_gate_name)
+                    await _place_ondemand_candidates(state, config, gpu_class=gpu_class_label, max_placements=1)
                 continue
 
             if has_tol:
@@ -705,7 +714,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                                     name,
                                 )
                                 if await _try_apply_toleration(state, uid, entry, config.scheduling_gate_name):
-                                    state.task_queue.pop(uid, None)
+                                    state.dequeue_pod(uid)
 
                 elif config.ondemand_placement_enabled and event_type == "ADDED":
                     # ---- on-demand path ----
@@ -734,33 +743,37 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _recycle_ondemand_block(
-    state: ControllerState, gpu_class_label: str,
-    scheduling_gate_name: str | None = None,
-) -> None:
-    """After a pod vacates an on-demand block, try to place the next candidate.
+async def _place_ondemand_candidates(
+    state: ControllerState,
+    config: Config,
+    *,
+    gpu_class: str | None = None,
+    max_placements: int | None = None,
+) -> int:
+    """Attempt on-demand placement for eligible candidates in FIFO order.
 
-    Scans ``state.ondemand_candidates`` for a candidate of the same GPU class
-    whose ``next_attempt_at`` has passed and immediately tries to place it.
-    Only the first successful placement is made per call; the queue processor
-    will handle any remaining candidates on its next tick.
+    Single scan shared by the queue processor (all classes, no cap) and the
+    post-vacate recycle path (one class, ``max_placements=1``) — replacing the
+    two copies that sorted by ``pod_created_at``, filtered on ``next_attempt_at``,
+    called ``_try_place_ondemand``, and popped on success (CODE-REVIEW D5).
+
+    *gpu_class* restricts to one GPU class; *max_placements* stops after that many
+    successful placements.  Returns the number placed.
     """
     now = datetime.now(timezone.utc)
+    placed = 0
     ordered = sorted(state.ondemand_candidates.items(), key=lambda kv: kv[1].pod_created_at)
-    eligible = [
-        (uid, c) for uid, c in ordered
-        if c.gpu_class_label == gpu_class_label and now >= c.next_attempt_at
-    ]
-    if eligible:
-        log.debug(
-            "Recycling on-demand block for gpu-class=%s: %d candidate(s) eligible",
-            gpu_class_label,
-            len(eligible),
-        )
-    for uid, candidate in eligible:
-        if await _try_place_ondemand(state, uid, candidate, scheduling_gate_name):
-            state.ondemand_candidates.pop(uid, None)
-            return  # one placement per recycle event is enough
+    for uid, candidate in ordered:
+        if now < candidate.next_attempt_at:
+            continue
+        if gpu_class is not None and candidate.gpu_class_label != gpu_class:
+            continue
+        if await _try_place_ondemand(state, uid, candidate, config.scheduling_gate_name):
+            state.remove_ondemand_candidate(uid)
+            placed += 1
+            if max_placements is not None and placed >= max_placements:
+                break
+    return placed
 
 
 # ---------------------------------------------------------------------------
@@ -797,7 +810,7 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
         try:
             snapshot = await snapshot_tolerated_pods(TOLERATION_KEY)
         except Exception as exc:  # noqa: BLE001
-            log.warning("Failed to snapshot tolerated pods: %s", exc)
+            log.warning("Failed to snapshot tolerated pods: %s", exc, exc_info=True)
 
         if snapshot is not None:
             live = [p for p in snapshot if p.phase in ("Running", "Pending")]
@@ -879,20 +892,14 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
             if await _try_apply_toleration(state, uid, entry, config.scheduling_gate_name):
                 to_remove.append(uid)
 
+        # Route removals through the logging helper so admissions produce a
+        # "Dequeued" line, not just deletions (CODE-REVIEW D5).
         for uid in to_remove:
-            state.task_queue.pop(uid, None)
+            state.dequeue_pod(uid)
 
         # --- on-demand path ---
         if config.ondemand_placement_enabled:
-            od_to_remove: list[str] = []
-            ordered = sorted(state.ondemand_candidates.items(), key=lambda kv: kv[1].pod_created_at)
-            for uid, candidate in ordered:
-                if now < candidate.next_attempt_at:
-                    continue
-                if await _try_place_ondemand(state, uid, candidate, config.scheduling_gate_name):
-                    od_to_remove.append(uid)
-            for uid in od_to_remove:
-                state.ondemand_candidates.pop(uid, None)
+            await _place_ondemand_candidates(state, config)
 
         log.debug(
             "Queue processor tick: %d reserved queue entr(ies), %d on-demand candidate(s)",
@@ -968,6 +975,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     config = Config.from_env()
+    _configure_logging(config)
     app = FastAPI(
         title="GPU Reservation Controller",
         description="Applies GPU reservation tolerations to Kubernetes pods",
@@ -986,7 +994,7 @@ app = create_app()
 
 
 @app.get("/health", tags=["ops"])
-async def health() -> dict:
+async def health() -> dict[str, str]:
     """Liveness probe — returns 200 OK when the process is running."""
     return {"status": "ok"}
 
