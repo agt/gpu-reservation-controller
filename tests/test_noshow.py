@@ -1,6 +1,6 @@
 """Unit tests for no-show reservation conversion logic.
 
-Covers: initialize_noshow_tracking, update_noshow_tracking, reconcile_noshow,
+Covers: update_noshow_tracking (init + new), reconcile_noshow,
 check_noshow_deadlines, mark_pod_seen_for_noshow, enqueue_pod deadline clearing,
 find_best_reservation skipping no-shows, find_ondemand_block including no-shows,
 reconcile_occupancy including no-shows, and compute_max_deadline_seconds skipping
@@ -141,28 +141,28 @@ class TestInitializeNoshowTracking:
         r = _user_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
         now = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
-        state.initialize_noshow_tracking(now, TIMEOUT, GRACE)
+        state.update_noshow_tracking(now, TIMEOUT, GRACE, reason="init")
         assert state.noshow_deadlines[1] == slot_start(r) + timedelta(minutes=TIMEOUT)
 
     def test_midwindow_deadline_is_now_plus_grace(self):
         r = _user_reservation(1)  # window: FIXED_DATE 08:00–10:00 UTC
         now = _window_open_now()   # 09:00 UTC — inside the window
         state = _state(r)
-        state.initialize_noshow_tracking(now, TIMEOUT, GRACE)
+        state.update_noshow_tracking(now, TIMEOUT, GRACE, reason="init")
         assert state.noshow_deadlines[1] == now + timedelta(minutes=GRACE)
 
     def test_expired_reservation_not_tracked(self):
         r = _user_reservation(1)  # window ended on FIXED_DATE in the past
         now = _window_start_dt() + timedelta(hours=3)  # after slot_end
         state = _state(r)
-        state.initialize_noshow_tracking(now, TIMEOUT, GRACE)
+        state.update_noshow_tracking(now, TIMEOUT, GRACE, reason="init")
         assert 1 not in state.noshow_deadlines
 
     def test_ondemand_reservation_not_tracked(self):
         r = _ondemand_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
         now = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
-        state.initialize_noshow_tracking(now, TIMEOUT, GRACE)
+        state.update_noshow_tracking(now, TIMEOUT, GRACE, reason="init")
         assert 1 not in state.noshow_deadlines
 
     def test_user_none_not_tracked(self):
@@ -172,7 +172,7 @@ class TestInitializeNoshowTracking:
             **{**r.model_dump(), "user": None, "user_id": None}
         )
         now = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
-        state.initialize_noshow_tracking(now, TIMEOUT, GRACE)
+        state.update_noshow_tracking(now, TIMEOUT, GRACE, reason="init")
         assert 1 not in state.noshow_deadlines
 
     def test_multiple_reservations_all_tracked(self):
@@ -180,7 +180,7 @@ class TestInitializeNoshowTracking:
         r2 = _user_reservation(2, reservation_date=FUTURE_DATE, slot_index=1)
         state = _state(r1, r2)
         now = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
-        state.initialize_noshow_tracking(now, TIMEOUT, GRACE)
+        state.update_noshow_tracking(now, TIMEOUT, GRACE, reason="init")
         assert 1 in state.noshow_deadlines
         assert 2 in state.noshow_deadlines
 
@@ -190,7 +190,7 @@ class TestInitializeNoshowTracking:
         sentinel = datetime(2099, 1, 1, tzinfo=timezone.utc)
         state.noshow_deadlines[1] = sentinel
         now = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
-        state.initialize_noshow_tracking(now, TIMEOUT, GRACE)
+        state.update_noshow_tracking(now, TIMEOUT, GRACE, reason="init")
         assert state.noshow_deadlines[1] == sentinel
 
 

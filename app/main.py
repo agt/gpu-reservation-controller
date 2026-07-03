@@ -514,7 +514,7 @@ async def _try_place_ondemand(
         # chaining) BEFORE lifting the scheduling gate: on a block whose whole
         # premise is "free only until slot_end", the pod must not be allowed to
         # start running with no deadline if the cap patch fails (CODE-REVIEW D1b).
-        remaining = max(int((slot_end(block) - datetime.now(timezone.utc)).total_seconds()), 1)
+        remaining = max(int((state.effective_end(block) - datetime.now(timezone.utc)).total_seconds()), 1)
         await _enforce_deadline(
             candidate.pod_name, candidate.pod_namespace, fresh_pod, remaining
         )
@@ -926,10 +926,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             len(state.gpu_class_labels),
         )
         now = datetime.now(timezone.utc)
-        state.initialize_noshow_tracking(
+        state.update_noshow_tracking(
             now,
             config.noshown_timeout_minutes,
             config.noshown_grace_minutes,
+            reason="init",
         )
         log.info(
             "No-show tracking initialised: %d reservation(s) watched",
