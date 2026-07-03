@@ -950,3 +950,20 @@ app = create_app()
 async def health() -> dict:
     """Liveness probe — returns 200 OK when the process is running."""
     return {"status": "ok"}
+
+
+def main() -> None:
+    """Run the controller, binding uvicorn to the configured HEALTH_PORT.
+
+    Launching programmatically (rather than via a hardcoded ``uvicorn`` CLI port)
+    is what makes ``HEALTH_PORT`` actually take effect, so Helm's ``healthPort``
+    and both probes stay consistent with the listening port (CODE-REVIEW P2).
+    """
+    import uvicorn
+
+    config: Config = app.state.config
+    uvicorn.run(app, host="0.0.0.0", port=config.health_port)
+
+
+if __name__ == "__main__":
+    main()

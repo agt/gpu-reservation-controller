@@ -348,8 +348,9 @@ kubectl create secret generic gpu-reservation-api-key \
 
 ### 2 — RBAC
 
-The controller needs read access to pods across all namespaces, and write
-access (PATCH) to pods in namespaces where reservations are active.
+The controller needs read access to pods across all namespaces, write access
+(PATCH) to pods in namespaces where reservations are active, and `delete` on
+pods so it can evict pods whose reservation is cancelled mid-window.
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -359,7 +360,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "patch"]
+    verbs: ["get", "list", "watch", "patch", "delete"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create"]
