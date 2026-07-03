@@ -9,67 +9,18 @@ No Kubernetes or HTTP calls are made.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
-from app.controller import ControllerState, slot_start
 from app.schemas import GpuClassBrief, ReservationResponse, UserBrief
 
+from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, USERNAME
+from tests.conftest import make_state as _state
+from tests.conftest import reclaim_reservation as _ondemand_reservation
+from tests.conftest import user_reservation as _user_reservation
 
-GPU_CLASS_ID = 10
-GPU_CLASS_LABEL = "h100"
-FIXED_DATE = date(2024, 1, 15)
-USERNAME = "alice"
 NOW = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)  # 1 h into res #1's 08:00–10:00 UTC window
 TIMEOUT = 15
 GRACE = 30
-
-
-def _compute_window(
-    date_val: date,
-    start_time: str,
-    slot_index: int,
-    duration_minutes: int,
-) -> tuple[datetime, datetime]:
-    """Return (start_utc, end_utc) from policy fields, tagged as UTC."""
-    parts = start_time.split(":")
-    minutes = int(parts[0]) * 60 + int(parts[1]) + slot_index * duration_minutes
-    midnight = datetime.combine(date_val, datetime.min.time()).replace(tzinfo=timezone.utc)
-    start = midnight + timedelta(minutes=minutes)
-    return start, start + timedelta(minutes=duration_minutes)
-
-
-def _user_reservation(
-    res_id: int,
-    *,
-    username: str = USERNAME,
-    gpu_count: int = 2,
-    slot_index: int = 0,
-    duration_minutes: int = 120,
-) -> ReservationResponse:
-    start_utc, end_utc = _compute_window(FIXED_DATE, "08:00:00", slot_index, duration_minutes)
-    return ReservationResponse(
-        id=res_id,
-        user_id=1,
-        user=UserBrief(id=1, username=username),
-        group_id=None,
-        group=None,
-        gpu_class_id=GPU_CLASS_ID,
-        gpu_class=GpuClassBrief(id=GPU_CLASS_ID, name="H100"),
-        date=FIXED_DATE,
-        start_utc=start_utc,
-        end_utc=end_utc,
-        gpu_count=gpu_count,
-        status="active",
-        kind="booking",
-        created_at=datetime(2024, 1, 1),
-        updated_at=datetime(2024, 1, 1),
-    )
-
-
-def _ondemand_reservation(res_id: int, slot_index: int = 0) -> ReservationResponse:
-    return _user_reservation(res_id, slot_index=slot_index).model_copy(
-        update={"kind": "reclaim", "user": None, "user_id": None}
-    )
 
 
 def _open_chain_pair() -> tuple[ReservationResponse, ReservationResponse]:
@@ -112,13 +63,6 @@ def _open_chain_pair() -> tuple[ReservationResponse, ReservationResponse]:
         )
 
     return _res(1, 0), _res(2, 1)
-
-
-def _state(*reservations: ReservationResponse) -> ControllerState:
-    state = ControllerState()
-    state.reservations = list(reservations)
-    state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
-    return state
 
 
 # ---------------------------------------------------------------------------

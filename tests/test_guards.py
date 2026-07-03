@@ -13,9 +13,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Optional
 
-import pytest
-
-from app.controller import TOLERATION_KEY
 from app.k8s_client import is_gpu_only_pending
 
 
@@ -217,8 +214,12 @@ def test_stuck_holder_gpu_classes_can_be_set():
 
 
 def _make_main_module_and_state(monkeypatch):
-    """Import app.main with required env vars and return (main_module, state, block)."""
-    import asyncio
+    """Import app.main with required env vars and return ``(main_module, state)``.
+
+    app.main is imported inside the function (after the env vars are set) because
+    importing it executes ``create_app()`` at module load, which calls
+    ``Config.from_env()`` and would fail without the required vars.
+    """
     from datetime import date, datetime, timedelta, timezone
 
     monkeypatch.setenv("RESERVATION_API_URL", "http://localhost:9999")
@@ -321,6 +322,6 @@ def test_guard3_does_not_block_other_gpu_class(monkeypatch):
     monkeypatch.setattr(main_module, "read_pod", fake_read_pod)
     # The RuntimeError from fake_read_pod is caught by _try_place_ondemand's
     # outer except, which rolls back and returns False.
-    result = asyncio.run(main_module._try_place_ondemand(state, "uid-2", candidate))
+    asyncio.run(main_module._try_place_ondemand(state, "uid-2", candidate))
 
     assert guard3_bypassed, "read_pod should have been called (guard 3 did not block a100)"

@@ -13,43 +13,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from app.controller import ControllerState, slot_end
-from app.schemas import GpuClassBrief, ReservationResponse
+from app.controller import ControllerState
 
-GPU_CLASS_ID = 10
-GPU_CLASS_LABEL = "h100"
+from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL
+from tests.conftest import block as _block
+
 GUARD_MINUTES = 60
-
-
-def _block(
-    block_id: int,
-    start_utc: datetime,
-    end_utc: datetime,
-    *,
-    gpu_count: int = 2,
-    kind: str = "reclaim",
-    status: str = "active",
-    gpu_class_id: int = GPU_CLASS_ID,
-    user: bool = False,
-) -> ReservationResponse:
-    """Build a reservation with an explicit UTC window."""
-    return ReservationResponse(
-        id=block_id,
-        user_id=1 if user else None,
-        user=None,
-        group_id=None,
-        group=None,
-        gpu_class_id=gpu_class_id,
-        gpu_class=GpuClassBrief(id=gpu_class_id, name="H100"),
-        date=start_utc.date(),
-        start_utc=start_utc,
-        end_utc=end_utc,
-        gpu_count=gpu_count,
-        status=status,
-        kind=kind,
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
-    )
 
 
 def _fresh_state(fetch_at: datetime) -> ControllerState:
