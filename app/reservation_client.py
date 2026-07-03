@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
+from pydantic import ValidationError
 
 from .config import Config
 from .schemas import AppSettings, GpuClassDetail, ReservationResponse
@@ -95,6 +96,12 @@ class ReservationClient:
         except httpx.RequestError as exc:
             log.warning("Could not fetch GPU class %d: %s", gpu_class_id, exc)
             return None
+        except (ValidationError, ValueError) as exc:
+            # Malformed / unparseable payload (ValueError covers JSONDecodeError):
+            # honor the documented "None on error" contract instead of letting it
+            # abort the whole refresh cycle (B9).
+            log.warning("Could not parse GPU class %d response: %s", gpu_class_id, exc)
+            return None
 
     async def fetch_settings(self) -> Optional[AppSettings]:
         """Return the app settings (reclaim window/guard), or None on error."""
@@ -107,4 +114,9 @@ class ReservationClient:
             return None
         except httpx.RequestError as exc:
             log.warning("Could not fetch app settings: %s", exc)
+            return None
+        except (ValidationError, ValueError) as exc:
+            # See fetch_gpu_class: a malformed /api/settings payload must skip the
+            # guard update, not abort the refresh cycle (B9).
+            log.warning("Could not parse app settings response: %s", exc)
             return None

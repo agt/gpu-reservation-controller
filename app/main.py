@@ -233,7 +233,7 @@ async def _enforce_deadline(
 
 
 async def _enforce_scheduling_gate_removal(
-    pod_name: str, namespace: str, fresh_pod, gate_name: Optional[str]
+    pod_name: str, namespace: str, fresh_pod, gate_name: str | None
 ) -> None:
     """Remove the configured scheduling gate from *fresh_pod* if present.
 
@@ -252,7 +252,7 @@ async def _enforce_scheduling_gate_removal(
 
 async def _try_apply_toleration(
     state: ControllerState, uid: str, entry: QueueEntry,
-    scheduling_gate_name: Optional[str] = None,
+    scheduling_gate_name: str | None = None,
 ) -> bool:
     """Check GPU budget and patch the toleration onto the pod if eligible.
 
@@ -339,7 +339,7 @@ async def _try_apply_toleration(
 
 async def _try_place_ondemand(
     state: ControllerState, uid: str, candidate: OnDemandCandidate,
-    scheduling_gate_name: Optional[str] = None,
+    scheduling_gate_name: str | None = None,
 ) -> bool:
     """Attempt to place an on-demand candidate onto a suitable block.
 
@@ -651,7 +651,15 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                         entry = state.task_queue.get(uid)
                         if entry is not None:
                             now = datetime.now(timezone.utc)
-                            if slot_start(entry.reservation) <= now < slot_end(entry.reservation):
+                            # Honor the retry cooldown: on a watch reconnect every
+                            # pod is replayed as ADDED, and enqueue_pod is
+                            # idempotent, so without this guard the fast path would
+                            # retry an entry still in budget-full/error backoff,
+                            # ignoring next_attempt_at as the queue processor does (B8).
+                            if (
+                                slot_start(entry.reservation) <= now < slot_end(entry.reservation)
+                                and now >= entry.next_attempt_at
+                            ):
                                 log.info(
                                     "Pod %s/%s arrived inside reservation window; "
                                     "attempting immediate toleration",
@@ -690,7 +698,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
 
 async def _recycle_ondemand_block(
     state: ControllerState, gpu_class_label: str,
-    scheduling_gate_name: Optional[str] = None,
+    scheduling_gate_name: str | None = None,
 ) -> None:
     """After a pod vacates an on-demand block, try to place the next candidate.
 

@@ -254,7 +254,12 @@ def test_cancelled_block_can_be_subject():
     assert state.merged_stub_ids == {2}
 
 
-def test_merge_dropped_when_subject_becomes_claimed():
+def test_claimed_subject_keeps_absorbed_blocks_stubbed():
+    """B4: when the subject becomes claimed by a reserved holder the merge must
+    NOT be silently dropped — the absorbed blocks stay stubbed (and the merge
+    retained) until the whole span ends, or a still-running on-demand job on an
+    already-extended deadline would be double-booked.  The claimed subject's own
+    window is not extended."""
     now = datetime.now(timezone.utc)
     t0 = now - timedelta(minutes=10)
     t1 = now + timedelta(minutes=30)
@@ -266,17 +271,17 @@ def test_merge_dropped_when_subject_becomes_claimed():
     state.reconcile_reclaim_merges(now)
     assert state.merged_stub_ids == {2}
 
-    # A reserved holder now claims the subject window: the merge is dropped and
-    # the future block reverts to an independent reclaim block.
+    # A reserved holder now claims the subject window; objects are rebuilt
+    # wholesale (mimicking a reservation reload).
     fresh_subject = _block(1, t0, t1)
     fresh_future = _block(2, t1, t2)
     state.reservations = [fresh_subject, fresh_future]
     state.claimed_reservation_ids = {1}
     state.reconcile_reclaim_merges(now)
 
-    assert state.reclaim_merges == {}
-    assert state.merged_stub_ids == set()
-    assert fresh_subject.end_utc == t1
+    assert 1 in state.reclaim_merges           # merge retained
+    assert 2 in state.merged_stub_ids          # absorbed block still stubbed
+    assert fresh_subject.end_utc == t1         # claimed subject NOT extended
 
 
 def test_no_merge_when_guard_unknown():
