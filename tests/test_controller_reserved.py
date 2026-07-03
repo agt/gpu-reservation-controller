@@ -8,77 +8,27 @@ No Kubernetes or HTTP calls are made.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
-
-import pytest
+from datetime import datetime, timezone
 
 from app.controller import ControllerState, QueueEntry, slot_end, slot_start
-from app.schemas import GpuClassBrief, ReservationResponse, UserBrief
+from app.schemas import ReservationResponse
+
+from tests.conftest import (
+    FIXED_DATE,
+    FUTURE_DATE,
+    GPU_CLASS_ID,
+    GPU_CLASS_LABEL,
+    OTHER_CLASS_ID,
+    OTHER_CLASS_LABEL,
+    USERNAME,
+)
+from tests.conftest import make_state as _state
+from tests.conftest import reservation, user_reservation as _user_reservation
 
 
 # ---------------------------------------------------------------------------
 # Shared constants & factories
 # ---------------------------------------------------------------------------
-
-GPU_CLASS_ID = 10
-GPU_CLASS_LABEL = "h100"
-OTHER_CLASS_ID = 20
-OTHER_CLASS_LABEL = "a100"
-FIXED_DATE = date(2024, 1, 15)   # Past date; window timing controlled via explicit `now`
-FUTURE_DATE = date(2099, 6, 15)  # Far future; slot_end always > datetime.now(utc)
-USERNAME = "student1"
-
-
-def _compute_window(
-    date_val: date,
-    start_time: str,
-    slot_index: int,
-    duration_minutes: int,
-) -> tuple[datetime, datetime]:
-    """Return (start_utc, end_utc) from policy fields, tagged as UTC."""
-    parts = start_time.split(":")
-    minutes = int(parts[0]) * 60 + int(parts[1]) + slot_index * duration_minutes
-    midnight = datetime.combine(date_val, datetime.min.time()).replace(tzinfo=timezone.utc)
-    start = midnight + timedelta(minutes=minutes)
-    return start, start + timedelta(minutes=duration_minutes)
-
-
-def _user_reservation(
-    res_id: int,
-    *,
-    username: str = USERNAME,
-    gpu_class_id: int = GPU_CLASS_ID,
-    gpu_count: int = 2,
-    slot_index: int = 0,
-    start_time: str = "08:00:00",
-    duration_minutes: int = 120,
-    reservation_date: date = FIXED_DATE,
-) -> ReservationResponse:
-    start_utc, end_utc = _compute_window(reservation_date, start_time, slot_index, duration_minutes)
-    return ReservationResponse(
-        id=res_id,
-        user_id=1,
-        user=UserBrief(id=1, username=username),
-        group_id=None,
-        group=None,
-        gpu_class_id=gpu_class_id,
-        gpu_class=GpuClassBrief(id=gpu_class_id, name="H100"),
-        date=reservation_date,
-        start_utc=start_utc,
-        end_utc=end_utc,
-        gpu_count=gpu_count,
-        status="active",
-        kind="booking",
-        created_at=datetime(2024, 1, 1),
-        updated_at=datetime(2024, 1, 1),
-    )
-
-
-def _state(*reservations: ReservationResponse) -> ControllerState:
-    state = ControllerState()
-    state.reservations = list(reservations)
-    state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
-    return state
 
 
 def _queued_entry(uid: str, reservation: ReservationResponse, pod_name: str = "pod-1") -> QueueEntry:
@@ -99,33 +49,15 @@ def _queued_entry(uid: str, reservation: ReservationResponse, pod_name: str = "p
 
 
 class TestSlotArithmetic:
-    def test_slot_start_index_0(self):
-        res = _user_reservation(1, start_time="08:00:00", slot_index=0)
-        assert slot_start(res) == datetime(2024, 1, 15, 8, 0, tzinfo=timezone.utc)
-
-    def test_slot_start_index_1_advances_by_duration(self):
-        # slot_start = midnight + (480 + 1×120) minutes = 10:00 UTC
-        res = _user_reservation(1, start_time="08:00:00", duration_minutes=120, slot_index=1)
-        assert slot_start(res) == datetime(2024, 1, 15, 10, 0, tzinfo=timezone.utc)
-
-    def test_slot_start_index_2(self):
-        # slot_start = midnight + (480 + 2×120) minutes = 12:00 UTC
-        res = _user_reservation(1, start_time="08:00:00", duration_minutes=120, slot_index=2)
-        assert slot_start(res) == datetime(2024, 1, 15, 12, 0, tzinfo=timezone.utc)
-
-    def test_slot_start_with_minute_offset(self):
-        res = _user_reservation(1, start_time="08:30:00", slot_index=0)
-        assert slot_start(res) == datetime(2024, 1, 15, 8, 30, tzinfo=timezone.utc)
-
-    def test_slot_end_equals_start_plus_duration(self):
-        res = _user_reservation(1, start_time="08:00:00", duration_minutes=90, slot_index=0)
-        assert slot_end(res) == slot_start(res) + timedelta(minutes=90)
-
-    def test_slot_end_crosses_midnight(self):
-        # 23:30 + 90 min = 01:00 next day
-        res = _user_reservation(1, start_time="23:30:00", duration_minutes=90, slot_index=0)
-        assert slot_start(res) == datetime(2024, 1, 15, 23, 30, tzinfo=timezone.utc)
-        assert slot_end(res) == datetime(2024, 1, 16, 1, 0, tzinfo=timezone.utc)
+    def test_accessors_return_window_fields(self):
+        # slot_start / slot_end are trivial accessors: they return start_utc /
+        # end_utc unchanged (no local-time conversion).  Nothing else to test
+        # here now that window construction lives in the shared factory (T2).
+        start = datetime(2024, 1, 15, 8, 0, tzinfo=timezone.utc)
+        end = datetime(2024, 1, 15, 10, 0, tzinfo=timezone.utc)
+        res = reservation(1, start_utc=start, end_utc=end)
+        assert slot_start(res) == start
+        assert slot_end(res) == end
 
 
 # ---------------------------------------------------------------------------

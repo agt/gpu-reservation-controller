@@ -10,7 +10,6 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 import httpx
-import pytest
 
 from app.config import Config
 from app.reservation_client import ReservationClient

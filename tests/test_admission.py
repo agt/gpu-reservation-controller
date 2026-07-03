@@ -1,0 +1,269 @@
+"""Coverage for Config.from_env and the unified reserved admission path (T6).
+
+``Config.from_env`` had no tests (required-var errors, falsy parsing, the
+NOSHOW_* aliases); neither did ``_try_apply_toleration`` itself — the budget
+check, optimistic record/rollback, the already-tolerated dequeue, and the
+terminal-phase drop added when the two admission paths were unified.
+
+The async tests import ``app.main`` after setting the required env vars, because
+importing it runs ``create_app()`` (and ``Config.from_env``) at module load.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
+
+from app.controller import ControllerState, QueueEntry
+from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, USERNAME, reservation
+
+_CONFIG_ENV = [
+    "RESERVATION_API_URL",
+    "RESERVATION_API_KEY",
+    "RESERVATION_FETCH_INTERVAL",
+    "RESERVATION_LOOKAHEAD_DAYS",
+    "KUBECONFIG",
+    "HEALTH_PORT",
+    "ONDEMAND_PLACEMENT_ENABLED",
+    "NOSHOW_TIMEOUT_MINUTES",
+    "NOSHOWN_TIMEOUT_MINUTES",
+    "NOSHOW_GRACE_MINUTES",
+    "NOSHOWN_GRACE_MINUTES",
+    "POD_LIST_TICK_INTERVAL",
+    "POD_SCHEDULING_GATE_NAME",
+    "LOG_LEVEL",
+]
+
+
+def _clean_env(monkeypatch):
+    for key in _CONFIG_ENV:
+        monkeypatch.delenv(key, raising=False)
+
+
+# ---------------------------------------------------------------------------
+# Config.from_env
+# ---------------------------------------------------------------------------
+
+
+class TestConfigFromEnv:
+    def test_missing_url_raises(self, monkeypatch):
+        from app.config import Config
+
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("RESERVATION_API_KEY", "k")
+        with pytest.raises(RuntimeError, match="RESERVATION_API_URL"):
+            Config.from_env()
+
+    def test_missing_key_raises(self, monkeypatch):
+        from app.config import Config
+
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("RESERVATION_API_URL", "http://x")
+        with pytest.raises(RuntimeError, match="RESERVATION_API_KEY"):
+            Config.from_env()
+
+    def test_defaults_and_url_stripped(self, monkeypatch):
+        from app.config import Config
+
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("RESERVATION_API_URL", "http://x/")
+        monkeypatch.setenv("RESERVATION_API_KEY", "gpures_k")
+        c = Config.from_env()
+        assert c.reservation_api_url == "http://x"   # trailing slash stripped
+        assert c.log_level == "INFO"
+        assert c.noshown_timeout_minutes == 15
+        assert c.noshown_grace_minutes == 30
+        assert c.pod_list_tick_interval == 300
+        assert c.ondemand_placement_enabled is True
+        assert c.scheduling_gate_name is None
+
+    def test_noshow_new_name_preferred_over_legacy(self, monkeypatch):
+        from app.config import Config
+
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("RESERVATION_API_URL", "http://x")
+        monkeypatch.setenv("RESERVATION_API_KEY", "k")
+        monkeypatch.setenv("NOSHOW_TIMEOUT_MINUTES", "7")
+        monkeypatch.setenv("NOSHOWN_TIMEOUT_MINUTES", "99")
+        assert Config.from_env().noshown_timeout_minutes == 7
+
+    def test_noshow_legacy_alias_still_honored(self, monkeypatch):
+        from app.config import Config
+
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("RESERVATION_API_URL", "http://x")
+        monkeypatch.setenv("RESERVATION_API_KEY", "k")
+        monkeypatch.setenv("NOSHOWN_GRACE_MINUTES", "42")
+        assert Config.from_env().noshown_grace_minutes == 42
+
+    @pytest.mark.parametrize("value,expected", [
+        ("false", False), ("0", False), ("no", False), ("FALSE", False),
+        ("true", True), ("1", True), ("anything-else", True),
+    ])
+    def test_ondemand_flag_falsy_parsing(self, monkeypatch, value, expected):
+        from app.config import Config
+
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("RESERVATION_API_URL", "http://x")
+        monkeypatch.setenv("RESERVATION_API_KEY", "k")
+        monkeypatch.setenv("ONDEMAND_PLACEMENT_ENABLED", value)
+        assert Config.from_env().ondemand_placement_enabled is expected
+
+
+# ---------------------------------------------------------------------------
+# _try_apply_toleration (reserved path)
+# ---------------------------------------------------------------------------
+
+
+def _main_module(monkeypatch):
+    monkeypatch.setenv("RESERVATION_API_URL", "http://localhost:9999")
+    monkeypatch.setenv("RESERVATION_API_KEY", "test-key-admission")
+    import app.main as main_module
+
+    return main_module
+
+
+def _pod(*, uid="uid-1", phase="Pending", tolerations=None, deadline=None):
+    return SimpleNamespace(
+        metadata=SimpleNamespace(
+            uid=uid, name="pod-1", namespace=USERNAME,
+            annotations=None, labels={"gpu-class": GPU_CLASS_LABEL},
+        ),
+        status=SimpleNamespace(phase=phase, conditions=None),
+        spec=SimpleNamespace(
+            tolerations=tolerations if tolerations is not None else [],
+            active_deadline_seconds=deadline,
+            containers=[],
+            scheduling_gates=None,
+        ),
+    )
+
+
+def _open_reservation(gpu_count=2):
+    now = datetime.now(timezone.utc)
+    return reservation(
+        1,
+        start_utc=now - timedelta(minutes=30),
+        end_utc=now + timedelta(minutes=30),
+        gpu_count=gpu_count,
+        gpu_class_label=GPU_CLASS_LABEL,
+    )
+
+
+def _entry(res, *, uid="uid-1", gpu=1):
+    return QueueEntry(
+        pod_uid=uid, pod_name="pod-1", pod_namespace=USERNAME,
+        gpu_class_label=GPU_CLASS_LABEL, gpu_requested=gpu,
+        reservation=res, next_attempt_at=datetime.now(timezone.utc),
+    )
+
+
+def _state_with(res):
+    state = ControllerState()
+    state.reservations = [res]
+    state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
+    return state
+
+
+class TestTryApplyToleration:
+    def test_budget_full_backs_off_without_reading_pod(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        res = _open_reservation(gpu_count=2)
+        state = _state_with(res)
+        state.record_placement(res.id, "other-pod", 2)   # fully occupied
+        entry = _entry(res, gpu=1)
+        before = entry.next_attempt_at
+
+        read_called = []
+
+        async def fake_read_pod(name, namespace):
+            read_called.append((name, namespace))
+            return _pod()
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        result = asyncio.run(m._try_apply_toleration(state, "uid-1", entry))
+
+        assert result is False
+        assert read_called == []                 # never got past the budget check
+        assert entry.next_attempt_at > before    # backoff scheduled
+        assert "uid-1" not in state.occupancy.get(res.id, {})
+
+    def test_terminal_pod_is_dropped_without_patching(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        res = _open_reservation()
+        state = _state_with(res)
+        entry = _entry(res)
+
+        applied = []
+
+        async def fake_read_pod(name, namespace):
+            return _pod(phase="Succeeded")
+
+        async def fake_apply(*args, **kwargs):
+            applied.append(args)
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        monkeypatch.setattr(m, "apply_toleration", fake_apply)
+        result = asyncio.run(m._try_apply_toleration(state, "uid-1", entry))
+
+        assert result is True                    # dequeued
+        assert applied == []                     # completed pod never patched
+        assert state.available(res) == 2         # optimistic record rolled back
+
+    def test_successful_apply_records_and_stamps_reserved_booking(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        res = _open_reservation()
+        state = _state_with(res)
+        entry = _entry(res, gpu=1)
+        calls = {}
+
+        async def fake_read_pod(name, namespace):
+            return _pod(phase="Pending", tolerations=[])
+
+        async def fake_apply(pod_name, namespace, pod, key, value, booking):
+            calls["booking"] = booking
+            calls["value"] = value
+
+        async def fake_set_deadline(pod_name, namespace, seconds):
+            calls["deadline"] = seconds
+
+        async def fake_emit(*args, **kwargs):
+            pass
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        monkeypatch.setattr(m, "apply_toleration", fake_apply)
+        monkeypatch.setattr(m, "set_active_deadline", fake_set_deadline)
+        monkeypatch.setattr(m, "emit_runtime_capped_event", fake_emit)
+        result = asyncio.run(m._try_apply_toleration(state, "uid-1", entry))
+
+        assert result is True
+        assert calls["booking"] == "res-1"       # make_booking_reference round-trip
+        assert calls["value"] == GPU_CLASS_LABEL
+        assert calls["deadline"] > 0             # capped, never 0 (B3 floor)
+        assert state.available(res) == 1         # 1 GPU now recorded as used
+
+    def test_already_tolerated_pod_is_dequeued_without_reapplying(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        res = _open_reservation()
+        state = _state_with(res)
+        entry = _entry(res)
+        existing_tol = SimpleNamespace(
+            key="gpu-class-reservation", value=GPU_CLASS_LABEL, effect="NoSchedule",
+        )
+        applied = []
+
+        async def fake_read_pod(name, namespace):
+            return _pod(phase="Pending", tolerations=[existing_tol])
+
+        async def fake_apply(*args, **kwargs):
+            applied.append(args)
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        monkeypatch.setattr(m, "apply_toleration", fake_apply)
+        result = asyncio.run(m._try_apply_toleration(state, "uid-1", entry))
+
+        assert result is True
+        assert applied == []                     # already had the toleration

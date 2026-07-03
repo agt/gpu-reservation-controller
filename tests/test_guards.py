@@ -13,9 +13,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Optional
 
-import pytest
-
-from app.controller import TOLERATION_KEY
 from app.k8s_client import is_gpu_only_pending
 
 
@@ -66,22 +63,22 @@ def _sched_condition(status: str, reason: str = "Unschedulable", message: str = 
 
 def test_not_pending_returns_none():
     pod = _pod(phase="Running")
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_no_status_returns_none():
     pod = _pod(phase=None)
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_no_pod_scheduled_condition_returns_none():
     pod = _pod(phase="Pending", conditions=[])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_pod_scheduled_status_true_returns_none():
     pod = _pod(phase="Pending", conditions=[_sched_condition("True")])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_pod_scheduled_reason_not_unschedulable_returns_none():
@@ -89,7 +86,7 @@ def test_pod_scheduled_reason_not_unschedulable_returns_none():
         phase="Pending",
         conditions=[_sched_condition("False", reason="SchedulerError", message="some error")],
     )
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +102,7 @@ GPU_ONLY_MSG = (
 
 def test_gpu_only_message_returns_true():
     pod = _pod(conditions=[_sched_condition("False", message=GPU_ONLY_MSG)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is True
+    assert is_gpu_only_pending(pod) is True
 
 
 def test_gpu_plus_our_taint_returns_true():
@@ -115,7 +112,7 @@ def test_gpu_plus_our_taint_returns_true():
         "5 node(s) had untolerated taint {gpu-class-reservation=h100: NoSchedule}."
     )
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is True
+    assert is_gpu_only_pending(pod) is True
 
 
 def test_gpu_plus_memory_returns_false():
@@ -124,48 +121,48 @@ def test_gpu_plus_memory_returns_false():
         "3 Insufficient memory."
     )
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is False
+    assert is_gpu_only_pending(pod) is False
 
 
 def test_gpu_plus_cpu_returns_false():
     msg = "0/5 nodes are available: 5 Insufficient nvidia.com/gpu, 2 Insufficient cpu."
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is False
+    assert is_gpu_only_pending(pod) is False
 
 
 def test_memory_only_no_gpu_returns_false():
     msg = "0/5 nodes are available: 5 Insufficient memory."
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is False
+    assert is_gpu_only_pending(pod) is False
 
 
 def test_cpu_only_returns_false():
     msg = "0/5 nodes are available: 5 Insufficient cpu."
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is False
+    assert is_gpu_only_pending(pod) is False
 
 
 def test_empty_message_returns_none():
     pod = _pod(conditions=[_sched_condition("False", message="")])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_message_none_returns_none():
     cond = SimpleNamespace(type="PodScheduled", status="False", reason="Unschedulable", message=None)
     pod = _pod(conditions=[cond])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_affinity_failure_no_gpu_returns_none():
     msg = "0/5 nodes are available: 5 node(s) didn't match Pod's node affinity/selector."
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_other_taint_without_gpu_returns_none():
     msg = "0/5 nodes are available: 5 node(s) had untolerated taint {other-key=val: NoSchedule}."
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is None
+    assert is_gpu_only_pending(pod) is None
 
 
 def test_gpu_message_with_ephemeral_storage_returns_false():
@@ -174,13 +171,13 @@ def test_gpu_message_with_ephemeral_storage_returns_false():
         "2 Insufficient ephemeral-storage."
     )
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is False
+    assert is_gpu_only_pending(pod) is False
 
 
 def test_multiple_non_gpu_insufficient_returns_false():
     msg = "0/10 nodes are available: 5 Insufficient memory, 5 Insufficient cpu."
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is False
+    assert is_gpu_only_pending(pod) is False
 
 
 def test_gpu_only_with_preemption_note_returns_true():
@@ -190,7 +187,7 @@ def test_gpu_only_with_preemption_note_returns_true():
         "preemption: 0/3 nodes are available: 3 No preemption victims found for incoming pod."
     )
     pod = _pod(conditions=[_sched_condition("False", message=msg)])
-    assert is_gpu_only_pending(pod, TOLERATION_KEY) is True
+    assert is_gpu_only_pending(pod) is True
 
 
 # ---------------------------------------------------------------------------
@@ -217,8 +214,12 @@ def test_stuck_holder_gpu_classes_can_be_set():
 
 
 def _make_main_module_and_state(monkeypatch):
-    """Import app.main with required env vars and return (main_module, state, block)."""
-    import asyncio
+    """Import app.main with required env vars and return ``(main_module, state)``.
+
+    app.main is imported inside the function (after the env vars are set) because
+    importing it executes ``create_app()`` at module load, which calls
+    ``Config.from_env()`` and would fail without the required vars.
+    """
     from datetime import date, datetime, timedelta, timezone
 
     monkeypatch.setenv("RESERVATION_API_URL", "http://localhost:9999")
@@ -321,6 +322,6 @@ def test_guard3_does_not_block_other_gpu_class(monkeypatch):
     monkeypatch.setattr(main_module, "read_pod", fake_read_pod)
     # The RuntimeError from fake_read_pod is caught by _try_place_ondemand's
     # outer except, which rolls back and returns False.
-    result = asyncio.run(main_module._try_place_ondemand(state, "uid-2", candidate))
+    asyncio.run(main_module._try_place_ondemand(state, "uid-2", candidate))
 
     assert guard3_bypassed, "read_pod should have been called (guard 3 did not block a100)"

@@ -24,9 +24,13 @@ log = logging.getLogger(__name__)
 class ReservationClient:
     def __init__(self, config: Config) -> None:
         self._lookahead_days = config.reservation_lookahead_days
+        # Client-level default timeout (CODE-REVIEW D8) so a future endpoint added
+        # without an explicit timeout doesn't silently inherit httpx's 5 s default;
+        # per-request timeouts below override it where a different value is wanted.
         self._client = httpx.AsyncClient(
             base_url=config.reservation_api_url,
             headers={"X-API-Key": config.reservation_api_key},
+            timeout=httpx.Timeout(10.0),
         )
 
     async def aclose(self) -> None:
@@ -38,7 +42,14 @@ class ReservationClient:
     # ------------------------------------------------------------------
 
     async def fetch_reservations(self) -> list[ReservationResponse]:
-        """Return all reservations (active and cancelled) from today through lookahead window."""
+        """Return all reservations (active and cancelled) from today through lookahead window.
+
+        Raises:
+            httpx.HTTPStatusError / httpx.RequestError: on API or network failure.
+                Unlike ``fetch_gpu_class`` / ``fetch_settings`` (which degrade to
+                ``None``), a failed reservation fetch propagates so the refresh
+                cycle aborts rather than acting on an empty reservation list.
+        """
         # UTC everywhere: date.today() would use the process TZ and drop
         # currently-open reservations east of UTC (see CODE-REVIEW-2026-07 B2).
         # The API filter is date-based while windows are UTC-instant-based, so
@@ -82,9 +93,7 @@ class ReservationClient:
     async def fetch_gpu_class(self, gpu_class_id: int) -> Optional[GpuClassDetail]:
         """Return detail for a single GPU class, or None on error."""
         try:
-            resp = await self._client.get(
-                f"/api/gpu-classes/{gpu_class_id}", timeout=10.0
-            )
+            resp = await self._client.get(f"/api/gpu-classes/{gpu_class_id}")
             resp.raise_for_status()
             return GpuClassDetail.model_validate(resp.json())
         except httpx.HTTPStatusError as exc:
@@ -107,7 +116,7 @@ class ReservationClient:
     async def fetch_settings(self) -> Optional[AppSettings]:
         """Return the app settings (reclaim window/guard), or None on error."""
         try:
-            resp = await self._client.get("/api/settings", timeout=10.0)
+            resp = await self._client.get("/api/settings")
             resp.raise_for_status()
             return AppSettings.model_validate(resp.json())
         except httpx.HTTPStatusError as exc:

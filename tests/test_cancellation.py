@@ -9,33 +9,19 @@ Covers:
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
-
-import pytest
+from datetime import date, timedelta
 
 from app.controller import ControllerState, canceller_description, slot_end
-from app.schemas import GpuClassBrief, ReservationResponse, UserBrief
+from app.schemas import ReservationResponse, UserBrief
+
+from tests.conftest import ADMIN_USERNAME, FIXED_DATE, GPU_CLASS_LABEL, USERNAME
+from tests.conftest import make_state as _state_with_label
+from tests.conftest import reservation, window_from_minutes
 
 
 # ---------------------------------------------------------------------------
 # Constants & factories
 # ---------------------------------------------------------------------------
-
-GPU_CLASS_ID = 10
-GPU_CLASS_LABEL = "h100"
-FIXED_DATE = date(2024, 1, 15)
-USERNAME = "alice"
-ADMIN_USERNAME = "sysadmin"
-
-
-def _window(
-    minutes_from_midnight_start: int,
-    duration_minutes: int,
-    day: date = FIXED_DATE,
-) -> tuple[datetime, datetime]:
-    midnight = datetime.combine(day, datetime.min.time()).replace(tzinfo=timezone.utc)
-    start = midnight + timedelta(minutes=minutes_from_midnight_start)
-    return start, start + timedelta(minutes=duration_minutes)
 
 
 def _user_res(
@@ -50,32 +36,23 @@ def _user_res(
     cancelled_by: UserBrief | None = None,
     day: date = FIXED_DATE,
 ) -> ReservationResponse:
-    s, e = _window(start_offset, duration, day)
-    return ReservationResponse(
-        id=res_id,
-        user_id=user_id,
-        user=UserBrief(id=user_id, username=username),
-        group_id=None,
-        group=None,
-        gpu_class_id=GPU_CLASS_ID,
-        gpu_class=GpuClassBrief(id=GPU_CLASS_ID, name="H100", label_value=GPU_CLASS_LABEL),
-        date=day,
+    """Booking reservation from a minutes-past-midnight offset; ``status`` follows
+    ``cancelled_by_id``.  Delegates to the canonical factory (CODE-REVIEW T1)."""
+    s, e = window_from_minutes(start_offset, duration, day)
+    return reservation(
+        res_id,
         start_utc=s,
         end_utc=e,
-        gpu_count=gpu_count,
-        status="cancelled" if cancelled_by_id else "active",
         kind="booking",
-        created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
-        updated_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        username=username,
+        user_id=user_id,
+        gpu_count=gpu_count,
+        gpu_class_label=GPU_CLASS_LABEL,
+        status="cancelled" if cancelled_by_id else "active",
         cancelled_by_id=cancelled_by_id,
         cancelled_by=cancelled_by,
+        day=day,
     )
-
-
-def _state_with_label() -> ControllerState:
-    state = ControllerState()
-    state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
-    return state
 
 
 # ---------------------------------------------------------------------------

@@ -212,53 +212,28 @@ class ControllerState:
     # No-show tracking
     # ------------------------------------------------------------------
 
-    def initialize_noshow_tracking(
-        self,
-        now: datetime,
-        timeout_minutes: int,
-        grace_minutes: int,
-    ) -> None:
-        """Set up no-show deadlines for all active user reservations.
-
-        Called once after the initial reservation fetch in the lifespan.
-        For each active user reservation:
-        - Window not yet open: deadline = slot_start + timeout_minutes
-        - Window already open (mid-window startup): deadline = now + grace_minutes
-        - Window already expired: skipped
-
-        The initial pod LIST events processed shortly after by pod_watch_loop
-        will clear deadlines for reservations that already have matching pods.
-        """
-        for r in self.reservations:
-            if r.kind != "booking" or r.user is None:
-                continue
-            if r.id in self.noshow_deadlines:
-                continue  # already tracked (e.g. called twice)
-            end = slot_end(r)
-            start = slot_start(r)
-            if end <= now:
-                continue
-            if start > now:
-                deadline = start + timedelta(minutes=timeout_minutes)
-            else:
-                deadline = now + timedelta(minutes=grace_minutes)
-            self.noshow_deadlines[r.id] = deadline
-            log.debug(
-                "No-show tracking: reservation #%d deadline=%s",
-                r.id,
-                deadline.strftime("%Y-%m-%d %H:%M"),
-            )
-
     def update_noshow_tracking(
         self,
         now: datetime,
         timeout_minutes: int,
         grace_minutes: int,
+        reason: str = "new",
     ) -> None:
-        """Add newly-fetched reservations to no-show tracking.
+        """Arm no-show deadlines for active user reservations not yet tracked.
 
-        Called after each subsequent reservation refresh.  Does not overwrite
-        existing deadlines and does not resurrect already-declared no-shows.
+        Called once after the initial reservation fetch (``reason="init"``) and
+        after each subsequent refresh (``reason="new"``, the default).  For each
+        active user reservation not already tracked, not already declared a
+        no-show, and not claimed by a live chained holder:
+        - Window not yet open: deadline = slot_start + timeout_minutes
+        - Window already open (mid-window startup): deadline = now + grace_minutes
+        - Window already expired: skipped
+
+        Does not overwrite existing deadlines or resurrect declared no-shows.  At
+        startup the ``noshow_reservation_ids`` / ``claimed_reservation_ids``
+        guards are provably empty, so this is a superset of the old
+        ``initialize_noshow_tracking`` — which was deleted so a guard added here
+        can never be forgotten in a parallel copy (CODE-REVIEW D7).
         """
         for r in self.reservations:
             if r.kind != "booking" or r.user is None:
@@ -279,7 +254,8 @@ class ControllerState:
                 deadline = now + timedelta(minutes=grace_minutes)
             self.noshow_deadlines[r.id] = deadline
             log.debug(
-                "No-show tracking (new): reservation #%d deadline=%s",
+                "No-show tracking (%s): reservation #%d deadline=%s",
+                reason,
                 r.id,
                 deadline.strftime("%Y-%m-%d %H:%M"),
             )
@@ -315,8 +291,18 @@ class ControllerState:
         ]
         for rid in expired:
             del self.noshow_deadlines[rid]
-            self.noshow_reservation_ids.add(rid)
             res = next((r for r in self.reservations if r.id == rid), None)
+            # Don't declare a no-show for a window that has already ended: it can
+            # never be selected as an on-demand block, so "capacity opened" would
+            # be a misleading log line (CODE-REVIEW D9).  Just drop the deadline.
+            if res is not None and slot_end(res) <= now:
+                log.debug(
+                    "No-show deadline for reservation #%d passed but window already "
+                    "ended; not declaring no-show",
+                    rid,
+                )
+                continue
+            self.noshow_reservation_ids.add(rid)
             user = res.user.username if (res and res.user) else "unknown"
             gpu_class = self.gpu_class_labels.get(res.gpu_class_id, "unknown") if res else "unknown"
             log.info(
@@ -552,16 +538,18 @@ class ControllerState:
         prev_end = slot_end(reservation)
         visited: set[int] = set()
         while True:
-            next_res = next(
-                (
-                    r
-                    for r in candidates
-                    if r.id not in visited and slot_start(r) == prev_end
-                ),
-                None,
-            )
-            if next_res is None:
+            # If several reservations abut the same instant (shouldn't happen in
+            # this data model, but the two window-extension mechanisms must answer
+            # it identically), take the longest — the same max(key=slot_end) rule
+            # reclaim-merge discovery uses (CODE-REVIEW D4b).
+            abutting = [
+                r
+                for r in candidates
+                if r.id not in visited and slot_start(r) == prev_end
+            ]
+            if not abutting:
                 break
+            next_res = max(abutting, key=slot_end)
             chain.append(next_res)
             prev_end = slot_end(next_res)
             visited.add(next_res.id)
@@ -613,14 +601,24 @@ class ControllerState:
 
         Called after each reservation refresh.  Entries whose reservation was
         cancelled are removed and, if a new matching reservation exists, the pod
-        is re-queued for it.
+        is re-queued for it.  Surviving entries have their captured reservation
+        object swapped for the freshly loaded one of the same id: ``reservations``
+        is replaced wholesale each cycle, and this is the only place a
+        wholesale-replaced object would otherwise be retained stale (CODE-REVIEW
+        D9).
         """
-        active_ids = {r.id for r in self.reservations}
+        by_id = {r.id: r for r in self.reservations}
+        active_ids = set(by_id)
         stale_uids = [
             uid
             for uid, entry in self.task_queue.items()
             if entry.reservation.id not in active_ids
         ]
+        # Re-point surviving entries at the fresh reservation object.
+        for entry in self.task_queue.values():
+            fresh = by_id.get(entry.reservation.id)
+            if fresh is not None:
+                entry.reservation = fresh
         for uid in stale_uids:
             entry = self.task_queue.pop(uid)
             new_res = self.find_best_reservation(
@@ -734,8 +732,58 @@ class ControllerState:
         )
         return max(0, reservation.gpu_count - used)
 
+    def _effective_label(self, r: ReservationResponse) -> Optional[str]:
+        """Return *r*'s GPU-class label: the cached value, else the label_value
+        embedded in the reservation's ``gpu_class`` (populated for cancelled
+        blocks whose class dropped out of the active-reservation cache)."""
+        cached = self.gpu_class_labels.get(r.gpu_class_id)
+        if cached is not None:
+            return cached
+        return r.gpu_class.label_value if r.gpu_class else None
+
+    def effective_end(self, r: ReservationResponse) -> datetime:
+        """Return *r*'s window end, extended if it is a reclaim-merge subject.
+
+        The merge overlay lives in ``reclaim_merges`` (keyed by subject id)
+        rather than mutating the fetched ``ReservationResponse.end_utc``
+        (CODE-REVIEW D4a): a wholesale reservation reload needs no re-application,
+        the API models stay effectively immutable, and any other consumer of
+        ``end_utc`` still sees the value the API returned.  On-demand placement
+        and the on-demand deadline cap read window ends through this method.
+        """
+        merge = self.reclaim_merges.get(r.id)
+        return merge.extended_end if merge is not None else slot_end(r)
+
+    def _iter_ondemand_blocks(self, now: datetime):
+        """Yield every currently-open on-demand block (CODE-REVIEW D4d).
+
+        A block is an active ``kind == "reclaim"`` hold or a declared no-show
+        from the live reservation list, or a retained cancelled-in-window
+        reservation.  Windows currently claimed by a live chained holder and
+        blocks absorbed into a merge (stubs) are excluded.  "Open" is judged
+        against ``effective_end`` so an already-extended subject stays open for
+        the whole merged span.  Single definition feeding both
+        ``reconcile_reclaim_merges`` (subject discovery) and
+        ``find_ondemand_block`` (placement).
+        """
+        for r in self.reservations:
+            if (
+                (r.kind == "reclaim" or r.id in self.noshow_reservation_ids)
+                and r.id not in self.claimed_reservation_ids
+                and r.id not in self.merged_stub_ids
+                and slot_start(r) <= now < self.effective_end(r)
+            ):
+                yield r
+        for r in self.cancelled_reservations.values():
+            if (
+                r.id not in self.claimed_reservation_ids
+                and r.id not in self.merged_stub_ids
+                and slot_start(r) <= now < self.effective_end(r)
+            ):
+                yield r
+
     def reconcile_reclaim_merges(self, now: datetime) -> None:
-        """Re-apply persistent reclaim merges and discover new ones.
+        """Validate persistent reclaim merges and discover new ones.
 
         A "subject block" is any currently-open on-demand window — a reclaim
         hold, a declared no-show, or a cancelled-in-window reservation.  When a
@@ -743,9 +791,10 @@ class ControllerState:
         and equal ``gpu_count`` that was already inside
         ``reclaim_preempt_guard_minutes`` **at the last reservation fetch** (the
         app has committed it and will not preempt it), the two are merged: the
-        subject's window is stretched to the future block's end and that block is
-        recorded as a stub (excluded from independent on-demand placement).  This
-        maximises the runtime of an on-demand job beginning in the subject block.
+        subject's *effective* window is stretched to the future block's end (via
+        the ``reclaim_merges`` overlay, not by mutating the object) and that block
+        is recorded as a stub (excluded from independent on-demand placement).
+        This maximises the runtime of an on-demand job beginning in the subject.
 
         The commitment test uses ``last_reservation_fetch_at + guard`` as the
         horizon, **not** ``now``: a block must have been within the guard in the
@@ -756,18 +805,15 @@ class ControllerState:
         poll interval, a block legitimately entering the guard is always seen by a
         fresh fetch (still present, or gone if preempted) before it is merged.
 
-        Re-applying surviving records first — before the freshly loaded
-        reservation objects are consulted by the placement logic — is what makes
-        merges survive a wholesale reservation reload, so a reload never
-        re-exposes an absorbed block while a deadline-extended job still depends
-        on it.  Idempotent; safe to call every refresh and every queue tick.
-        Does nothing while the guard is unknown.
+        The overlay persists in ``reclaim_merges`` across wholesale reservation
+        reloads, so a reload never re-exposes an absorbed block while a
+        deadline-extended job still depends on it.  Idempotent; safe to call every
+        refresh and every queue tick.  When the guard or the fetch timestamp is
+        unknown, surviving merges are still validated and kept, but no new merge
+        is discovered (conservative — CODE-REVIEW D4c).
         """
         guard = self.reclaim_preempt_guard_minutes
         self.merged_stub_ids = set()
-        if guard is None:
-            self.reclaim_merges = {}
-            return
 
         # Index reservations a merge might reference: live reservations plus
         # retained cancelled-in-window blocks (which can be subjects).
@@ -775,13 +821,7 @@ class ControllerState:
         for rid, r in self.cancelled_reservations.items():
             by_id.setdefault(rid, r)
 
-        def _label(r: ReservationResponse) -> Optional[str]:
-            cached = self.gpu_class_labels.get(r.gpu_class_id)
-            if cached is not None:
-                return cached
-            return r.gpu_class.label_value if r.gpu_class else None
-
-        # --- 1. Re-apply surviving records (persistence across reloads) ---
+        # --- 1. Validate surviving records (persistence across reloads) ---
         surviving: dict[int, ReclaimMerge] = {}
         for subject_id, merge in self.reclaim_merges.items():
             subject = by_id.get(subject_id)
@@ -822,11 +862,10 @@ class ControllerState:
                     missing,
                 )
                 continue  # an absorbed block vanished (e.g. preempted) — drop
-            subject.end_utc = merge.extended_end
             self.merged_stub_ids.update(merge.absorbed_ids)
             surviving[subject_id] = merge
             log.debug(
-                "Re-applied reclaim merge: subject #%d extended to %s (absorbed: %s)",
+                "Retained reclaim merge: subject #%d extended to %s (absorbed: %s)",
                 subject_id,
                 merge.extended_end.isoformat(),
                 merge.absorbed_ids,
@@ -836,38 +875,24 @@ class ControllerState:
         # --- 2. Discover new merges (and extend existing ones transitively) ---
         # Commitment is judged against the data we hold: a candidate is eligible
         # only if its start was within the guard at the last reservation fetch.
-        # Without a fetch timestamp we cannot make that judgement safely, so we
-        # re-apply surviving merges but discover none.
-        if self.last_reservation_fetch_at is None:
+        # Without the guard or a fetch timestamp we cannot make that judgement
+        # safely, so we keep the surviving merges but discover none (D4c).
+        if guard is None or self.last_reservation_fetch_at is None:
             return
         horizon = self.last_reservation_fetch_at + timedelta(minutes=guard)
         reclaim_blocks = [r for r in self.reservations if r.kind == "reclaim"]
 
-        subjects: list[ReservationResponse] = [
-            r
-            for r in self.reservations
-            if (r.kind == "reclaim" or r.id in self.noshow_reservation_ids)
-            and r.id not in self.claimed_reservation_ids
-            and slot_start(r) <= now < slot_end(r)
-        ]
-        subjects += [
-            r
-            for r in self.cancelled_reservations.values()
-            if r.id not in self.claimed_reservation_ids
-            and slot_start(r) <= now < slot_end(r)
-        ]
-
         seen: set[int] = set()
-        for subject in subjects:
-            if subject.id in seen or subject.id in self.merged_stub_ids:
+        for subject in list(self._iter_ondemand_blocks(now)):
+            if subject.id in seen:
                 continue
             seen.add(subject.id)
-            label = _label(subject)
+            label = self._effective_label(subject)
             if label is None:
                 continue
             existing = self.reclaim_merges.get(subject.id)
             absorbed_ids: list[int] = list(existing.absorbed_ids) if existing else []
-            cur_end = slot_end(subject)  # already extended if a record survived
+            cur_end = self.effective_end(subject)  # extended if a record survived
             grew = False
             while True:
                 targets = [
@@ -877,7 +902,7 @@ class ControllerState:
                     and r.id not in self.merged_stub_ids
                     and r.id not in absorbed_ids
                     and r.gpu_count == subject.gpu_count
-                    and _label(r) == label
+                    and self._effective_label(r) == label
                     and slot_start(r) == cur_end
                     and slot_start(r) <= horizon
                 ]
@@ -887,7 +912,6 @@ class ControllerState:
                 absorbed_ids.append(target.id)
                 self.merged_stub_ids.add(target.id)
                 cur_end = slot_end(target)
-                subject.end_utc = cur_end
                 grew = True
             if absorbed_ids:
                 self.reclaim_merges[subject.id] = ReclaimMerge(
@@ -923,55 +947,30 @@ class ControllerState:
         - Sufficient capacity: ``available(r) >= gpu_requested``
         - Enough time remains: ``(slot_end(r) - now).total_seconds() >= min_runtime_seconds``
 
-        Selection: prefer the block with the **latest** ``slot_end`` (maximises the
-        pod's effective runtime); break ties by most available capacity.
+        Selection: prefer the block with the **latest** ``effective_end``
+        (maximises the pod's effective runtime, extended if merged); break ties
+        by most available capacity.
         """
-        def _label_matches(r: ReservationResponse) -> bool:
-            cached = self.gpu_class_labels.get(r.gpu_class_id)
-            if cached is not None:
-                return cached == gpu_class_label
-            # Fall back to the label_value embedded in the reservation response
-            # (populated from GpuClassBrief) for cancelled reservations whose
-            # GPU class may have dropped out of the active-reservation cache.
-            return (r.gpu_class.label_value if r.gpu_class else None) == gpu_class_label
-
-        # Active on-demand / no-show blocks from the live reservation list.
-        from_active = [
+        candidates = [
             r
-            for r in self.reservations
-            if (r.kind == "reclaim" or r.id in self.noshow_reservation_ids)
-            and r.id not in self.claimed_reservation_ids
-            and r.id not in self.merged_stub_ids
-            and _label_matches(r)
-            and slot_start(r) <= now < slot_end(r)
+            for r in self._iter_ondemand_blocks(now)
+            if self._effective_label(r) == gpu_class_label
             and self.available(r) >= gpu_requested
-            and (slot_end(r) - now).total_seconds() >= min_runtime_seconds
+            and (self.effective_end(r) - now).total_seconds() >= min_runtime_seconds
         ]
-        # Freed capacity from cancelled user reservations (not in self.reservations).
-        from_cancelled = [
-            r
-            for r in self.cancelled_reservations.values()
-            if r.id not in self.claimed_reservation_ids
-            and r.id not in self.merged_stub_ids
-            and _label_matches(r)
-            and slot_start(r) <= now < slot_end(r)
-            and self.available(r) >= gpu_requested
-            and (slot_end(r) - now).total_seconds() >= min_runtime_seconds
-        ]
-        candidates = from_active + from_cancelled
         if not candidates:
             return None
-        # Latest slot_end first; break ties by most available capacity (desc).
+        # Latest effective_end first; break ties by most available capacity (desc).
         block = max(
             candidates,
-            key=lambda r: (slot_end(r), self.available(r)),
+            key=lambda r: (self.effective_end(r), self.available(r)),
         )
         log.debug(
             "Selected on-demand block #%d for gpu-class=%s (window %s–%s, %d/%d free)",
             block.id,
             gpu_class_label,
             slot_start(block).strftime("%Y-%m-%d %H:%M"),
-            slot_end(block).strftime("%H:%M"),
+            self.effective_end(block).strftime("%H:%M"),
             self.available(block),
             block.gpu_count,
         )
@@ -1007,7 +1006,7 @@ class ControllerState:
             if pod_uid in occupants:
                 gpu_count = occupants.pop(pod_uid)
                 log.info(
-                    "Released slot: reservation #%d ← pod uid=%s freed %d GPU(s)",
+                    "Released capacity: reservation #%d ← pod uid=%s freed %d GPU(s)",
                     reservation_id,
                     pod_uid,
                     gpu_count,
@@ -1104,7 +1103,9 @@ class ControllerState:
         expired = [rid for rid, r in self.cancelled_reservations.items() if slot_end(r) <= now]
         for rid in expired:
             del self.cancelled_reservations[rid]
-            log.debug("Cancelled reservation #%d window ended; removed from on-demand pool", rid)
+            # Placement-affecting (freed capacity leaves the on-demand pool), so
+            # INFO like the other on-demand-pool state changes (CODE-REVIEW D9).
+            log.info("Cancelled reservation #%d window ended; removed from on-demand pool", rid)
 
     def reconcile_occupancy(self, placements: list[tuple[int, str, int]]) -> None:
         """Rebuild the occupancy map from a live cluster snapshot.

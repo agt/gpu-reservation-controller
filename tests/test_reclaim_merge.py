@@ -13,43 +13,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from app.controller import ControllerState, slot_end
-from app.schemas import GpuClassBrief, ReservationResponse
+from app.controller import ControllerState
 
-GPU_CLASS_ID = 10
-GPU_CLASS_LABEL = "h100"
+from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL
+from tests.conftest import block as _block
+
 GUARD_MINUTES = 60
-
-
-def _block(
-    block_id: int,
-    start_utc: datetime,
-    end_utc: datetime,
-    *,
-    gpu_count: int = 2,
-    kind: str = "reclaim",
-    status: str = "active",
-    gpu_class_id: int = GPU_CLASS_ID,
-    user: bool = False,
-) -> ReservationResponse:
-    """Build a reservation with an explicit UTC window."""
-    return ReservationResponse(
-        id=block_id,
-        user_id=1 if user else None,
-        user=None,
-        group_id=None,
-        group=None,
-        gpu_class_id=gpu_class_id,
-        gpu_class=GpuClassBrief(id=gpu_class_id, name="H100"),
-        date=start_utc.date(),
-        start_utc=start_utc,
-        end_utc=end_utc,
-        gpu_count=gpu_count,
-        status=status,
-        kind=kind,
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
-    )
 
 
 def _fresh_state(fetch_at: datetime) -> ControllerState:
@@ -73,16 +42,18 @@ def test_basic_merge_extends_subject_and_stubs_future():
 
     state.reconcile_reclaim_merges(now)
 
-    assert subject.end_utc == t2
+    # The overlay extends effective_end; the fetched object is not mutated (D4a).
+    assert state.effective_end(subject) == t2
+    assert subject.end_utc == t1
     assert state.merged_stub_ids == {2}
     assert state.reclaim_merges[1].absorbed_ids == [2]
     assert state.reclaim_merges[1].extended_end == t2
 
     # find_ondemand_block returns the extended subject (not the stub), and its
-    # slot_end (used to cap on-demand runtime) reaches the merged end.
+    # effective_end (used to cap on-demand runtime) reaches the merged end.
     block = state.find_ondemand_block(GPU_CLASS_LABEL, now, 1, 60)
     assert block is not None and block.id == 1
-    assert slot_end(block) == t2
+    assert state.effective_end(block) == t2
 
 
 def test_no_merge_when_future_block_beyond_guard():
@@ -182,10 +153,10 @@ def test_merge_persists_across_reload_after_subject_original_end():
 
     # The merge must survive: subject re-extended to t2, future still stubbed,
     # so the future block is never independently re-offered (no double-book).
-    assert fresh_subject.end_utc == t2
+    assert state.effective_end(fresh_subject) == t2
     assert state.merged_stub_ids == {2}
     block = state.find_ondemand_block(GPU_CLASS_LABEL, later, 1, 60)
-    assert block is not None and block.id == 1 and slot_end(block) == t2
+    assert block is not None and block.id == 1 and state.effective_end(block) == t2
 
 
 def test_merge_pruned_once_whole_span_ends():
@@ -226,14 +197,14 @@ def test_transitive_chaining_grows_on_a_fresh_fetch():
     # First fetch: only `mid` is within the guard; `far` (t2 start) is not yet.
     state.reconcile_reclaim_merges(now)
     assert state.merged_stub_ids == {2}
-    assert subject.end_utc == t2
+    assert state.effective_end(subject) == t2
 
     # A later fetch sees `far`'s start (t2) fall inside the guard horizon.
     fetch2 = t2 - timedelta(minutes=GUARD_MINUTES - 10)  # horizon now reaches t2
     state.last_reservation_fetch_at = fetch2
     state.reconcile_reclaim_merges(fetch2)
     assert state.merged_stub_ids == {2, 3}
-    assert subject.end_utc == t3
+    assert state.effective_end(subject) == t3
     assert state.reclaim_merges[1].absorbed_ids == [2, 3]
 
 
@@ -250,7 +221,7 @@ def test_cancelled_block_can_be_subject():
 
     state.reconcile_reclaim_merges(now)
 
-    assert cancelled.end_utc == t2
+    assert state.effective_end(cancelled) == t2
     assert state.merged_stub_ids == {2}
 
 

@@ -8,72 +8,24 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 
-import pytest
-
-from app.controller import ControllerState, OnDemandCandidate, slot_end, slot_start
+from app.controller import ControllerState, slot_end, slot_start
 from app.schemas import (
     GpuClassBrief,
     ReservationResponse,
     UserBrief,
 )
 
+from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL
+from tests.conftest import ondemand_block as _ondemand_block
+from tests.conftest import window as _compute_window
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-GPU_CLASS_ID = 10
-GPU_CLASS_LABEL = "h100"
 
-
-def _compute_window(
-    date_val: date,
-    start_time: str,
-    slot_index: int,
-    duration_minutes: int,
-) -> tuple[datetime, datetime]:
-    """Return (start_utc, end_utc) from policy fields, tagged as UTC."""
-    parts = start_time.split(":")
-    minutes = int(parts[0]) * 60 + int(parts[1]) + slot_index * duration_minutes
-    midnight = datetime.combine(date_val, datetime.min.time()).replace(tzinfo=timezone.utc)
-    start = midnight + timedelta(minutes=minutes)
-    return start, start + timedelta(minutes=duration_minutes)
-
-
-def _ondemand_block(
-    block_id: int,
-    gpu_count: int = 2,
-    slot_index: int = 0,
-    duration_minutes: int = 120,
-    date_offset_days: int = 0,
-) -> ReservationResponse:
-    """Return a kind='reclaim' reservation whose window is *today* at 08:00 UTC."""
-    today = date.today() if date_offset_days == 0 else (
-        datetime.now(timezone.utc) + timedelta(days=date_offset_days)
-    ).date()
-    start_utc, end_utc = _compute_window(today, "08:00:00", slot_index, duration_minutes)
-    return ReservationResponse(
-        id=block_id,
-        user_id=None,
-        user=None,
-        group_id=None,
-        group=None,
-        gpu_class_id=GPU_CLASS_ID,
-        gpu_class=GpuClassBrief(id=GPU_CLASS_ID, name="H100"),
-        date=today,
-        start_utc=start_utc,
-        end_utc=end_utc,
-        gpu_count=gpu_count,
-        status="active",
-        kind="reclaim",
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
-    )
-
-
-def _state_with_block(
-    block: ReservationResponse,
-) -> ControllerState:
+def _state_with_block(block: ReservationResponse) -> ControllerState:
     """Return a ControllerState pre-loaded with one on-demand block."""
     state = ControllerState()
     state.reservations = [block]
