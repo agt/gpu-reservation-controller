@@ -256,7 +256,8 @@ X-API-Key: gpures_...
     "created_at": "2026-08-20T10:15:00Z",
     "updated_at": "2026-08-20T10:15:00Z",
     "cancelled_at": null,
-    "cancelled_by_id": null
+    "cancelled_by_id": null,
+    "cancelled_by": null
   }
 ]
 ```
@@ -766,7 +767,8 @@ Returned by `GET /api/groups/{group_id}/members`.
   "created_at": "2026-08-20T10:15:00Z",
   "updated_at": "2026-08-20T10:15:00Z",
   "cancelled_at": null,
-  "cancelled_by_id": null
+  "cancelled_by_id": null,
+  "cancelled_by": null
 }
 ```
 
@@ -795,6 +797,7 @@ Returned by `GET /api/groups/{group_id}/members`.
 | `updated_at` | datetime (UTC, `Z`) | |
 | `cancelled_at` | datetime \| null (UTC, `Z`) | |
 | `cancelled_by_id` | integer \| null | User ID of whoever cancelled |
+| `cancelled_by` | UserBrief \| null | Brief info for whoever cancelled (mirrors `submitted_by`); populated on cancelled records |
 
 ---
 

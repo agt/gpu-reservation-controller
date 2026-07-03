@@ -31,12 +31,18 @@ Emitted once at process start and stop.  Source: `app/main.py` (`lifespan`).
 ## Reservation fetch
 
 Emitted by the periodic reservation refresh loop.
-Sources: `app/main.py` (`reservation_fetch_loop`, `_refresh_reservations`).
+Sources: `app/main.py` (`reservation_fetch_loop`, `_refresh_reservations`) and
+`app/reservation_client.py` (the HTTP client itself).
 
 | Level | Message | Description |
 |-------|---------|-------------|
 | DEBUG † | `Reservation refresh cycle starting` | A periodic refresh cycle is beginning. Useful to confirm the loop is alive between INFO-level events. |
+| INFO | `Fetched N reservations (N active, N cancelled) (today + N days)` | The reservation client completed its paginated `status=all` fetch; emitted by `ReservationClient.fetch_reservations`. |
 | INFO | `GPU class N (name) → label_value='value'` | A previously-unseen GPU class has been resolved to its Kubernetes label value; result is cached. |
+| WARNING | `Could not fetch GPU class N: HTTP <code>` / `Could not fetch GPU class N: <exception>` | A per-class detail fetch failed (HTTP status or network error); the class is skipped this cycle and `fetch_gpu_class` returns None. |
+| WARNING | `Could not parse GPU class N response: <exception>` | The GPU-class payload failed schema validation / JSON decoding; `fetch_gpu_class` returns None rather than aborting the refresh. |
+| WARNING | `Could not fetch app settings: HTTP <code>` / `Could not fetch app settings: <exception>` | The `GET /api/settings` fetch failed; reclaim-merge guard is left unknown for this cycle. |
+| WARNING | `Could not parse app settings response: <exception>` | The settings payload failed schema validation / JSON decoding; `fetch_settings` returns None rather than aborting the refresh. |
 | WARNING | `GPU class N has no label_value; pods for this class cannot be matched to reservations` | A GPU class referenced by an active reservation has no `label_value` set; pods for that class cannot be matched until the class is configured. |
 | INFO † | `Reservation refresh complete: N active reservation(s), N GPU class(es) resolved` | Periodic refresh completed successfully; current active reservation and GPU-class counts. |
 | ERROR | `Reservation refresh failed: <exception>` | An entire refresh cycle failed (network error, API error, etc.); previous state is retained. |
@@ -132,6 +138,22 @@ Sources: `app/main.py` (`_try_place_ondemand`, `_recycle_ondemand_block`, `queue
 | WARNING | `Error placing on-demand pod ns/name: <exception>; retry in N s` | On-demand placement failed with a transient error; optimistic occupancy record rolled back, candidate will retry. |
 | DEBUG † | `Recycling on-demand block for gpu-class=c: N candidate(s) eligible` | A pod vacated an on-demand block; N waiting candidates of the same GPU class are being considered for immediate placement. |
 | DEBUG † | `Queue processor tick: N reserved queue entr(ies), N on-demand candidate(s)` | End-of-tick summary showing how many entries remain in each queue after processing. |
+
+---
+
+## Scheduling-gate removal
+
+Emitted when `POD_SCHEDULING_GATE_NAME` is configured and the controller removes
+the named gate after admitting a pod (both reserved and on-demand paths).
+Sources: `app/k8s_client.py` (`remove_scheduling_gate`), `app/main.py`
+(`_enforce_scheduling_gate_removal`).
+
+| Level | Message | Description |
+|-------|---------|-------------|
+| DEBUG | `k8s: scheduling gate 'name' not present on pod ns/name; skipping removal` | The configured gate is not on the pod (already removed, or never set); nothing to patch. |
+| DEBUG | `k8s: removing scheduling gate 'name' from pod ns/name` | About to issue the strategic-merge `$patch: delete` for the named gate. |
+| INFO | `Removed scheduling gate 'name' from pod ns/name` | The gate was removed successfully; the scheduler can now place the pod. |
+| WARNING | `Failed to remove scheduling gate 'name' from pod ns/name: <exception>` | Best-effort gate removal failed after admission; the toleration is not revoked. |
 
 ---
 

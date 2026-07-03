@@ -1,6 +1,7 @@
 # Default values for gpu-reservation-controller.
-
-replicaCount: 1
+#
+# Note: replica count is intentionally not configurable — the controller holds
+# in-memory queue state, so the Deployment hardcodes replicas: 1.
 
 image:
   repository: gpu-reservation-controller
@@ -53,7 +54,8 @@ config:
   # declared for windows already in progress.
   noshownGraceMinutes: 30
 
-  # IANA timezone for reservation window arithmetic.
+  # IANA timezone; affects log timestamp display only (reservation window
+  # arithmetic is UTC-based and does not depend on it).
   # Leave empty to use the container's system default.
   # Example: America/Los_Angeles
   timezone: ""

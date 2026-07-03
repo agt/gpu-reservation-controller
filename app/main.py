@@ -8,8 +8,9 @@ Starts three background asyncio tasks inside a FastAPI lifespan:
 
 Additionally, when a pod is detected arriving *inside* an already-open
 reservation window (e.g. a JupyterHub notebook pod), the pod-watch loop
-bypasses the 30-second queue-processor polling interval and attempts to
-apply the toleration immediately, minimising scheduler delay for the user.
+bypasses the queue-processor polling interval (POD_LIST_TICK_INTERVAL,
+default 300 s) and attempts to apply the toleration immediately, minimising
+scheduler delay for the user.
 
 A minimal GET /health endpoint allows Kubernetes liveness probes to verify
 the process is alive.
@@ -646,7 +647,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                     state.enqueue_pod(uid, name, namespace, gpu_class_label, gpu_count)
 
                     # Fast path: ADDED pod inside an open window — don't wait for
-                    # the queue processor's 30-second polling interval.
+                    # the queue processor's POD_LIST_TICK_INTERVAL tick (default 300 s).
                     if event_type == "ADDED":
                         entry = state.task_queue.get(uid)
                         if entry is not None:

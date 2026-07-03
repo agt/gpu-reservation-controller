@@ -3,6 +3,7 @@
 Implements only the endpoints the controller needs:
   - GET /api/reservations  — paginated list of all (active + cancelled) reservations
   - GET /api/gpu-classes/{id}  — per-class detail including label_value
+  - GET /api/settings  — app settings (reclaim window/guard) for reclaim merging
 """
 
 from __future__ import annotations

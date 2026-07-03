@@ -80,6 +80,10 @@ is sufficient.
 
 The core logic modules (`controller.py`, `schemas.py`, `config.py`) have no
 Kubernetes or HTTP dependencies and can be exercised with plain `pytest` and
-in-process mocks.  `k8s_client.py` and `reservation_client.py` require a real
-(or mocked) API endpoint; use `pytest-httpx` and the kubernetes fake client for
-unit tests.
+in-process mocks.  For the boundary modules the suite stays dependency-free
+(`requirements-dev.txt` is `pytest` only): `reservation_client.py` is tested with
+httpx's built-in `httpx.MockTransport` (see `tests/test_reservation_client.py`),
+and `k8s_client.py` / the `main.py` coroutines are driven with `monkeypatch`,
+`SimpleNamespace` pod stubs, and `asyncio.run` (see `tests/test_guards.py`,
+`tests/test_watch_release.py`).  No `pytest-httpx` or kubernetes fake client is
+required or installed.
