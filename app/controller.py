@@ -15,6 +15,7 @@ reservation_client.py respectively.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -59,6 +60,32 @@ def slot_start(r: ReservationResponse) -> datetime:
 def slot_end(r: ReservationResponse) -> datetime:
     """Return the UTC end of *r*'s reserved window."""
     return r.end_utc
+
+
+def apply_push_to_active(
+    current: list[ReservationResponse],
+    pushed: list[ReservationResponse],
+) -> list[ReservationResponse]:
+    """Upsert *pushed* entries into the *current* active reservation list by id.
+
+    Used by the inbound push API to apply a partial delta:
+    - a pushed entry with ``status == "active"`` replaces any existing entry of
+      the same id, or is inserted if new (upsert);
+    - a pushed entry with any other ``status`` (e.g. ``"cancelled"``) removes
+      that id from the active set.
+
+    Pure and I/O-free so it is unit-testable in isolation; the eviction of any
+    already-admitted pod for a cancelled entry is handled separately by the
+    caller via ``detect_cancelled_in_window`` + the cancellation handler.  When
+    the same id appears more than once in *pushed*, the last occurrence wins.
+    """
+    by_id: dict[int, ReservationResponse] = {r.id: r for r in current}
+    for r in pushed:
+        if r.status == "active":
+            by_id[r.id] = r
+        else:
+            by_id.pop(r.id, None)
+    return list(by_id.values())
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +149,10 @@ class ControllerState:
     """In-memory state accessed by all background loops.
 
     All mutations happen inside the asyncio event loop, so no locking is
-    required (asyncio is single-threaded).
+    required for the background loops (asyncio is single-threaded).  The one
+    exception is ``reservation_lock``, which serialises reservation-state
+    reconciliation between the fetch loop and the inbound push endpoint — two
+    coroutines that both mutate ``reservations`` across ``await`` points.
     """
 
     def __init__(self) -> None:
@@ -207,6 +237,14 @@ class ControllerState:
         # Reclaim block ids absorbed into a subject (stubs).  Excluded from
         # on-demand placement so they are never independently double-booked.
         self.merged_stub_ids: set[int] = set()
+
+        # Serialises reservation-state reconciliation between the fetch loop and
+        # the inbound push endpoint.  Both mutate ``reservations`` and evict pods
+        # across ``await`` points; without this lock a push landing mid-fetch
+        # could be clobbered by the fetch's wholesale replace, or double-evict.
+        # (This is the one place the "no locking" note above is relaxed, now that
+        # an inbound HTTP handler runs concurrently with the background loops.)
+        self.reservation_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # No-show tracking
