@@ -69,6 +69,15 @@ spec:
             - name: POD_SCHEDULING_GATE_NAME
               value: {{ .Values.config.podSchedulingGateName | quote }}
             {{- end }}
+            {{- if .Values.inboundApiTokenSecret.name }}
+            # Enables the inbound reservation-push API (POST /api/reservations/push).
+            # Omit the secret to leave the endpoint disabled (returns 503).
+            - name: INBOUND_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.inboundApiTokenSecret.name | quote }}
+                  key: {{ .Values.inboundApiTokenSecret.key | quote }}
+            {{- end }}
             {{- if .Values.config.timezone }}
             - name: TZ
               value: {{ .Values.config.timezone | quote }}

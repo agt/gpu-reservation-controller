@@ -78,3 +78,30 @@ class GpuClassDetail(GpuClassBrief):
     "h100"); subclassed rather than redeclared so the two cannot drift
     (CODE-REVIEW H7).
     """
+
+
+# ---------------------------------------------------------------------------
+# Inbound push API (POST /api/reservations/push)
+# ---------------------------------------------------------------------------
+
+
+class ReservationPushRequest(BaseModel):
+    """Body of a push from the reservation app.
+
+    Carries one or more updated reservation entries (a partial delta, not a full
+    snapshot — bulk synchronisation remains a controller-initiated pull).  Each
+    entry is a full ``ReservationResponse`` so the same reconciliation code path
+    that handles a fetched reservation applies unchanged.  The envelope object
+    leaves room for future push kinds (e.g. standby assignments) without an API
+    break.
+    """
+
+    reservations: list[ReservationResponse]
+
+
+class ReservationPushResponse(BaseModel):
+    """Summary returned after a push has been reconciled into controller state."""
+
+    applied: int        # entries upserted into the active set
+    cancelled: int      # in-window cancellations evicted / reclaimed
+    total_active: int   # size of the active reservation set after the push

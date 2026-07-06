@@ -21,11 +21,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 
 from .config import Config
 from .controller import (
@@ -33,6 +34,7 @@ from .controller import (
     ControllerState,
     OnDemandCandidate,
     QueueEntry,
+    apply_push_to_active,
     canceller_description,
     slot_end,
     slot_start,
@@ -67,7 +69,11 @@ from .k8s_client import (
     snapshot_tolerated_pods,
 )
 from .reservation_client import ReservationClient
-from .schemas import ReservationResponse
+from .schemas import (
+    ReservationPushRequest,
+    ReservationPushResponse,
+    ReservationResponse,
+)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
@@ -107,29 +113,31 @@ def _short_retry_at(now: datetime) -> datetime:
 # ---------------------------------------------------------------------------
 
 
-async def _refresh_reservations(
-    state: ControllerState, client: ReservationClient, config: Config
+async def _reconcile_after_reservation_change(
+    state: ControllerState,
+    client: ReservationClient,
+    config: Config,
+    active_reservations: list[ReservationResponse],
+    cancelled_in_window: list[ReservationResponse],
+    now: datetime,
+    *,
+    update_fetch_stamp: bool,
 ) -> None:
-    """Fetch the current reservation list and update shared state.
+    """Apply a new active reservation set and run the reconciliation tail.
 
-    Also resolves gpu_class_id → label_value for every GPU class referenced
-    in the fetched reservations (results are cached within this cycle; the
-    cache is rebuilt from scratch each cycle so stale entries don't linger).
-    After updating the reservations, reconciles the task queue.
+    Shared by the periodic fetch loop (which supplies a full snapshot) and the
+    inbound push endpoint (which supplies a partial delta merged into the current
+    set).  Resolves gpu_class_id → label_value for every referenced GPU class
+    (rebuilt from scratch, reusing cached values), assigns the new reservation
+    list and label map, reconciles the task queue, evicts pods for any in-window
+    cancellations, and re-applies reclaim-block merges.
+
+    The caller must already hold ``state.reservation_lock`` and must have computed
+    *cancelled_in_window*.  *update_fetch_stamp* is ``True`` only for a full fetch;
+    a partial push passes ``False`` so it does not advance
+    ``last_reservation_fetch_at`` (the reclaim-merge commitment guard anchors on
+    that stamp — advancing it on partial data could race an unseen booking).
     """
-    all_reservations = await client.fetch_reservations()
-    active_reservations = [r for r in all_reservations if r.status == "active"]
-
-    # Refresh the reclaim-preempt guard from app settings; keep the previous
-    # value on a failed fetch so merging is not disrupted by a transient error.
-    settings = await client.fetch_settings()
-    if settings is not None:
-        state.reclaim_preempt_guard_minutes = settings.reclaim_preempt_guard_minutes
-
-    # Detect reservations cancelled mid-window before overwriting the state.
-    now = datetime.now(timezone.utc)
-    cancelled_in_window = state.detect_cancelled_in_window(all_reservations, now)
-
     # Resolve label_value for each unique GPU class in active reservations.
     class_ids = {r.gpu_class_id for r in active_reservations}
     new_labels: dict[int, str] = {}
@@ -152,9 +160,11 @@ async def _refresh_reservations(
 
     state.reservations = active_reservations
     state.gpu_class_labels = new_labels
-    # Stamp the freshness of this data; the reclaim-merge commitment test anchors
-    # its guard horizon here, not on the between-fetch tick clock.
-    state.last_reservation_fetch_at = now
+    if update_fetch_stamp:
+        # Stamp the freshness of this data; the reclaim-merge commitment test
+        # anchors its guard horizon here, not on the between-fetch tick clock.
+        # A partial push must not advance this stamp (see docstring).
+        state.last_reservation_fetch_at = now
 
     # Drop / re-match queue entries whose reservation was cancelled.
     state.reconcile_queue()
@@ -170,6 +180,40 @@ async def _refresh_reservations(
     # block.  Only meaningful when on-demand placement is enabled.
     if config.ondemand_placement_enabled:
         state.reconcile_reclaim_merges(datetime.now(timezone.utc))
+
+
+async def _refresh_reservations(
+    state: ControllerState, client: ReservationClient, config: Config
+) -> None:
+    """Fetch the current reservation list and update shared state.
+
+    Pulls the full ``status=all`` reservation set, refreshes the reclaim-preempt
+    guard from app settings, then hands the active subset to
+    ``_reconcile_after_reservation_change`` (under ``reservation_lock``) to apply
+    it and run the reconciliation tail.
+    """
+    all_reservations = await client.fetch_reservations()
+    active_reservations = [r for r in all_reservations if r.status == "active"]
+
+    # Refresh the reclaim-preempt guard from app settings; keep the previous
+    # value on a failed fetch so merging is not disrupted by a transient error.
+    settings = await client.fetch_settings()
+    if settings is not None:
+        state.reclaim_preempt_guard_minutes = settings.reclaim_preempt_guard_minutes
+
+    now = datetime.now(timezone.utc)
+    async with state.reservation_lock:
+        # Detect reservations cancelled mid-window before overwriting the state.
+        cancelled_in_window = state.detect_cancelled_in_window(all_reservations, now)
+        await _reconcile_after_reservation_change(
+            state,
+            client,
+            config,
+            active_reservations,
+            cancelled_in_window,
+            now,
+            update_fetch_stamp=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -919,6 +963,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     client = ReservationClient(config)
     state = ControllerState()
 
+    # Expose the shared state and client so request handlers (e.g. the inbound
+    # push endpoint) can reach them; the background loops receive them as task
+    # arguments.  Only ``config`` is available on ``app.state`` before this.
+    app.state.controller_state = state
+    app.state.reservation_client = client
+
     # Initialise Kubernetes client.
     init_k8s(config.kubeconfig_path)
 
@@ -997,6 +1047,104 @@ app = create_app()
 async def health() -> dict[str, str]:
     """Liveness probe — returns 200 OK when the process is running."""
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Inbound reservation-push API
+# ---------------------------------------------------------------------------
+
+
+def _require_push_auth(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> None:
+    """Authenticate an inbound push via a static bearer token.
+
+    - 503 if ``INBOUND_API_TOKEN`` is unset — the push endpoint is opt-in and
+      disabled by default, so existing deployments are unaffected.
+    - 401 if the ``Authorization: Bearer <token>`` header is missing or does not
+      match (constant-time compare).
+    """
+    config: Config = request.app.state.config
+    expected = config.inbound_api_token
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Inbound push API is disabled (INBOUND_API_TOKEN not set)",
+        )
+    scheme, _, token = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(token, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+@app.post(
+    "/api/reservations/push",
+    tags=["sync"],
+    response_model=ReservationPushResponse,
+    dependencies=[Depends(_require_push_auth)],
+)
+async def push_reservations(
+    body: ReservationPushRequest, request: Request
+) -> ReservationPushResponse:
+    """Apply one or more pushed reservation entries into controller state.
+
+    A fast, partial delta from the reservation app (bulk sync remains a
+    controller-initiated pull).  Entries are upserted by id; an entry whose
+    ``status`` is not ``"active"`` (e.g. a cancellation) drops the reservation
+    from the active set, and any in-window cancellation evicts its admitted pod
+    and reclaims the freed capacity — the same path a mid-window cancellation
+    takes on a normal fetch.  The next full pull remains the source of truth.
+    """
+    state: ControllerState = request.app.state.controller_state
+    client: ReservationClient = request.app.state.reservation_client
+    config: Config = request.app.state.config
+
+    pushed = body.reservations
+    now = datetime.now(timezone.utc)
+
+    async with state.reservation_lock:
+        # Evictable in-window cancellations carried by this push (idempotent:
+        # detect_cancelled_in_window skips ids already recorded / declared no-show).
+        cancelled_in_window = state.detect_cancelled_in_window(pushed, now)
+        merged_active = apply_push_to_active(state.reservations, pushed)
+
+        await _reconcile_after_reservation_change(
+            state,
+            client,
+            config,
+            merged_active,
+            cancelled_in_window,
+            now,
+            update_fetch_stamp=False,
+        )
+
+        # Re-arm / prune no-show tracking for the new set, mirroring what the
+        # fetch loop does after _refresh_reservations.
+        state.reconcile_noshow()
+        state.update_noshow_tracking(
+            now,
+            config.noshown_timeout_minutes,
+            config.noshown_grace_minutes,
+            reason="push",
+        )
+
+    applied = sum(1 for r in pushed if r.status == "active")
+    log.info(
+        "Push applied: %d active upsert(s), %d in-window cancellation(s); "
+        "%d active reservation(s) now tracked",
+        applied,
+        len(cancelled_in_window),
+        len(state.reservations),
+    )
+    return ReservationPushResponse(
+        applied=applied,
+        cancelled=len(cancelled_in_window),
+        total_active=len(state.reservations),
+    )
 
 
 def main() -> None:

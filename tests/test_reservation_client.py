@@ -28,6 +28,7 @@ def _config(**overrides) -> Config:
         noshown_grace_minutes=30,
         pod_list_tick_interval=300,
         scheduling_gate_name=None,
+        inbound_api_token=None,
     )
     base.update(overrides)
     return Config(**base)

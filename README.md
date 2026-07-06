@@ -285,6 +285,7 @@ All settings are supplied via environment variables.
 | `NOSHOW_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress (legacy alias `NOSHOWN_GRACE_MINUTES` still accepted) |
 | `POD_LIST_TICK_INTERVAL` | no | `300` | Seconds between queue-processor ticks (pod LIST frequency) |
 | `POD_SCHEDULING_GATE_NAME` | no | *(absent)* | Name of a SchedulingGate to remove from a pod after admitting it; unset disables scheduling-gate removal |
+| `INBOUND_API_TOKEN` | no | *(absent)* | Bearer token for the inbound push API (`POST /api/reservations/push`); mount from a Kubernetes Secret. Unset leaves the endpoint **disabled** (returns 503) |
 | `LOG_LEVEL` | no | `INFO` | Python logging level for the controller |
 
 > **Note:** `reclaim_preempt_guard_minutes` (used by reclaim-block merging) is
@@ -321,6 +322,46 @@ curl http://localhost:8000/health
 
 ---
 
+## Inbound push API
+
+The controller normally learns about reservation changes by **polling** the
+reservation app every `RESERVATION_FETCH_INTERVAL` seconds. To propagate changes
+faster (e.g. a cancellation, or a future standby assignment), the reservation app
+can **push** one or more updated reservation entries:
+
+```
+POST /api/reservations/push
+Authorization: Bearer <INBOUND_API_TOKEN>
+Content-Type: application/json
+
+{ "reservations": [ <ReservationResponse>, … ] }
+```
+
+- Each entry uses the same shape the app already returns from
+  `GET /api/reservations`. Entries are **upserted by id**; an entry whose
+  `status` is not `"active"` (e.g. a cancellation) drops that reservation from
+  the active set, and an in-window cancellation additionally **evicts the
+  admitted pod** and frees its capacity — the same behaviour as a cancellation
+  seen on a normal poll.
+- This is a **partial delta**; bulk synchronisation remains a controller-initiated
+  pull, and the next full poll is always the source of truth.
+- The endpoint shares the `HEALTH_PORT` listener (no extra port/Service), and
+  responds `200` (with `{"applied", "cancelled", "total_active"}`), `401`
+  (missing/invalid bearer), or `503` (endpoint disabled because
+  `INBOUND_API_TOKEN` is unset).
+
+```bash
+curl -X POST http://localhost:8000/api/reservations/push \
+  -H "Authorization: Bearer $INBOUND_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reservations": [ … ]}'
+```
+
+To enable it under Helm, point `inboundApiTokenSecret.name` at a Secret holding
+the token (see below). No additional RBAC is required.
+
+---
+
 ## Kubernetes deployment
 
 ### Helm (recommended)
@@ -340,6 +381,16 @@ helm install gpu-reservation-controller ./helm/gpu-reservation-controller \
 See `helm/gpu-reservation-controller/values.yaml` for all options (fetch
 interval, lookahead, on-demand toggle, no-show timing, resources). The
 manual manifests below remain valid for non-Helm deployments.
+
+To enable the inbound push API, create a Secret holding the bearer token and
+point the chart at it (leave it unset to keep the endpoint disabled):
+
+```bash
+kubectl create secret generic gpu-reservation-push-token \
+  --namespace gpu-system --from-literal=token='<random-token>'
+helm upgrade gpu-reservation-controller ./helm/gpu-reservation-controller \
+  --reuse-values --set inboundApiTokenSecret.name=gpu-reservation-push-token
+```
 
 ### 1 — Create the API-key Secret
 

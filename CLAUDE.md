@@ -8,10 +8,13 @@ initial setup instructions in AGENTS.md.
 ## What this project is
 
 A **Kubernetes controller daemon** — not a web application.  It has no
-database, no user-facing frontend, and no authentication layer of its own.
-It authenticates *outbound* to the GPU Reservation API using a long-lived
-service key, and it authenticates *inbound* to Kubernetes using either a
-kubeconfig file or an in-cluster service account.
+database and no user-facing frontend.  It authenticates *outbound* to the GPU
+Reservation API using a long-lived service key, and *inbound* to Kubernetes
+using either a kubeconfig file or an in-cluster service account.  It also
+exposes a small optional **inbound push API** (`POST /api/reservations/push`)
+that the reservation app calls to propagate reservation updates faster than the
+poll interval; this endpoint is guarded by a single static bearer token and is
+disabled unless that token is configured.
 
 ---
 
@@ -19,7 +22,7 @@ kubeconfig file or an in-cluster service account.
 
 | Choice | Rationale |
 |--------|-----------|
-| **FastAPI** | Provides the `GET /health` liveness endpoint and clean lifespan management for background tasks; no routers or static files needed |
+| **FastAPI** | Provides the `GET /health` liveness endpoint, the `POST /api/reservations/push` inbound API, and clean lifespan management for background tasks; no routers or static files needed |
 | **asyncio** | Single event loop drives all three background loops concurrently without threads for the application logic |
 | **httpx** | Async HTTP client for the reservation management API; supports connection pooling and clean timeout handling |
 | **kubernetes** (official Python client) | LIST + WATCH pod streams; strategic-merge-patch for toleration injection; supports both in-cluster and kubeconfig auth |
@@ -200,6 +203,38 @@ how `claimed_reservation_ids` protects chained reserved windows.  Merging is
 skipped entirely when on-demand placement is disabled or the guard is unknown
 (settings fetch failed / recovery disabled).
 
+### Inbound push API
+
+`POST /api/reservations/push` lets the reservation app push **one or more
+updated reservation entries** so changes (today: cancellations; later: standby
+assignments) propagate within seconds instead of waiting up to a full
+`RESERVATION_FETCH_INTERVAL`.  Bulk synchronisation stays a controller-initiated
+**pull** — the push is a partial delta, and the next full fetch remains the
+source of truth.
+
+- **Auth**: a single static bearer token in `INBOUND_API_TOKEN` (mount from a
+  Secret).  Unset ⇒ endpoint disabled (503); wrong/missing bearer ⇒ 401
+  (constant-time compare).  It rides the existing FastAPI app / `HEALTH_PORT`,
+  so no extra container port or Service is needed.
+- **Body**: `{"reservations": [ReservationResponse, …]}` — the same entry shape
+  the pull returns (`schemas.ReservationPushRequest`).
+- **Semantics**: entries are **upserted by id** (`apply_push_to_active` in
+  `controller.py`); an entry whose `status` is not `"active"` drops that id from
+  the active set, and an in-window cancellation evicts its admitted pod and
+  reclaims capacity — the *same* path a mid-window cancellation takes on a fetch.
+- **Shared reconciliation**: both the fetch loop and the push run
+  `_reconcile_after_reservation_change` in `main.py` (label resolution, queue
+  reconcile, cancellation eviction, reclaim-merge re-apply).  The push passes
+  `update_fetch_stamp=False` so it does **not** advance
+  `last_reservation_fetch_at` (that stamp anchors the reclaim-merge commitment
+  guard; advancing it on partial data could race an unseen booking).
+- **Concurrency**: the endpoint and the fetch loop both mutate `reservations`
+  across `await` points, so each reconcile is serialised by
+  `ControllerState.reservation_lock` (the one place the "no locking" rule is
+  relaxed).
+- **RBAC**: unchanged — eviction reuses the existing `pods: delete` /
+  `events: create` permissions.
+
 ### Startup behaviour
 
 On startup, the controller performs an initial reservation fetch and then issues
@@ -259,7 +294,8 @@ above applies.
 | `RESERVATION_FETCH_INTERVAL` | `300` | Seconds between reservation refresh cycles |
 | `RESERVATION_LOOKAHEAD_DAYS` | `7` | Calendar days ahead to fetch reservations |
 | `KUBECONFIG` | *(absent = in-cluster)* | Path to kubeconfig file for out-of-cluster use |
-| `HEALTH_PORT` | `8000` | Port for `GET /health` |
+| `HEALTH_PORT` | `8000` | Port for `GET /health` (also serves `POST /api/reservations/push`) |
+| `INBOUND_API_TOKEN` | *(absent = push API disabled)* | Bearer token guarding `POST /api/reservations/push`; mount from a Kubernetes Secret. Unset ⇒ endpoint returns 503 |
 | `TZ` | system default | Affects log timestamp display only; no longer required for window arithmetic |
 | `ONDEMAND_PLACEMENT_ENABLED` | `true` | Set to `false` to disable on-demand placement entirely |
 | `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show (legacy alias `NOSHOWN_TIMEOUT_MINUTES` still honored) |

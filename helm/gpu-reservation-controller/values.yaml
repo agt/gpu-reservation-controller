@@ -26,6 +26,15 @@ apiKeySecret:
   name: gpu-reservation-api-key
   key: api-key
 
+# Reference to a pre-existing Secret holding the bearer token for the inbound
+# reservation-push API (POST /api/reservations/push). Leave `name` empty to keep
+# the endpoint disabled (it returns 503 until INBOUND_API_TOKEN is set). When
+# set, the Secret must exist in the release namespace before deploying; the value
+# is injected as the INBOUND_API_TOKEN environment variable.
+inboundApiTokenSecret:
+  name: ""
+  key: token
+
 # ---------------------------------------------------------------------------
 # Optional tuning — defaults mirror application defaults
 # ---------------------------------------------------------------------------

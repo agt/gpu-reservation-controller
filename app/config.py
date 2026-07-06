@@ -20,6 +20,7 @@ class Config:
     noshown_grace_minutes: int     # grace period when controller starts mid-window
     pod_list_tick_interval: int    # seconds between queue-processor ticks
     scheduling_gate_name: Optional[str]  # SchedulingGate to remove on admission; None = disabled
+    inbound_api_token: Optional[str]  # bearer token for the inbound push API; None = endpoint disabled
     log_level: str = "INFO"        # root log level (LOG_LEVEL)
 
     @classmethod
@@ -65,5 +66,6 @@ class Config:
                 os.environ.get("POD_LIST_TICK_INTERVAL", "300")
             ),
             scheduling_gate_name=os.environ.get("POD_SCHEDULING_GATE_NAME") or None,
+            inbound_api_token=os.environ.get("INBOUND_API_TOKEN") or None,
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
         )
