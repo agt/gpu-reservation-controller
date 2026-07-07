@@ -127,7 +127,7 @@ def test_push_active_upsert_updates_state(monkeypatch):
         )
         assert resp.status_code == 200
         body = resp.json()
-        assert body == {"applied": 2, "cancelled": 0, "total_active": 2}
+        assert body == {"applied": 2, "cancelled": 0, "adopted": 0, "total_active": 2}
 
         by_id = {r.id: r for r in state.reservations}
         assert by_id.keys() == {1, 2}
@@ -173,9 +173,76 @@ def test_push_cancellation_evicts_admitted_pod(monkeypatch):
             headers={"Authorization": "Bearer secret"},
         )
         assert resp.status_code == 200
-        assert resp.json() == {"applied": 0, "cancelled": 1, "total_active": 0}
+        assert resp.json() == {"applied": 0, "cancelled": 1, "adopted": 0, "total_active": 0}
 
         assert deleted == [("pod-1", USERNAME)]         # pod evicted
         assert state.occupancy.get(1, {}) == {}         # budget freed
         assert 1 in state.cancelled_reservations        # capacity offered on-demand
         assert [r.id for r in state.reservations] == [] # dropped from active set
+
+
+def _booking(res_id, *, user_id, username, status="active"):
+    """An open (now-1h … now+1h) booking reservation with an explicit owner."""
+    from tests.conftest import reservation
+
+    now = datetime.now(timezone.utc)
+    return reservation(
+        res_id,
+        start_utc=now - timedelta(hours=1),
+        end_utc=now + timedelta(hours=1),
+        kind="booking",
+        user_id=user_id,
+        username=username,
+        status=status,
+        gpu_class_label=GPU_CLASS_LABEL,
+    )
+
+
+def test_push_owner_change_evicts_prior_owner_pod(monkeypatch):
+    main = _patched_main(monkeypatch, token="secret")
+
+    # Prior owner's admitted pod lives in the old namespace ("alice").
+    pod = ToleratedPodInfo(
+        namespace="alice", name="pod-1", uid="uid-1", gpu_class=GPU_CLASS_LABEL,
+        booking_reference="res-1", reservation_id=1, gpu_count=2,
+        phase="Running", scheduled_false=False,
+    )
+    deleted: list[tuple[str, str]] = []
+    events: list[str] = []
+
+    async def _snapshot(_key):
+        return [pod]
+
+    async def _delete(name, ns):
+        deleted.append((name, ns))
+
+    async def _read(name, ns):
+        return SimpleNamespace()
+
+    async def _emit(pod_obj, name, ns, desc):
+        events.append(desc)
+
+    monkeypatch.setattr(main, "snapshot_tolerated_pods", _snapshot)
+    monkeypatch.setattr(main, "delete_pod", _delete)
+    monkeypatch.setattr(main, "read_pod", _read)
+    monkeypatch.setattr(main, "emit_reservation_reassigned_event", _emit)
+
+    with TestClient(main.app) as client:
+        state = main.app.state.controller_state
+        state.reservations = [_booking(1, user_id=1, username="alice")]
+        state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
+        state.record_placement(1, "uid-1", 2)  # prior owner's pod occupies it
+
+        resp = client.post(
+            "/api/reservations/push",
+            json=_json(_booking(1, user_id=2, username="bob")),
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"applied": 1, "cancelled": 0, "adopted": 1, "total_active": 1}
+
+        assert deleted == [("pod-1", "alice")]          # prior owner's pod evicted
+        assert events == ["to bob"]
+        assert state.occupancy.get(1, {}) == {}         # budget freed for new owner
+        by_id = {r.id: r for r in state.reservations}
+        assert by_id[1].user.username == "bob"          # ownership transferred

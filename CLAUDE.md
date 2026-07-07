@@ -222,9 +222,14 @@ source of truth.
   `controller.py`); an entry whose `status` is not `"active"` drops that id from
   the active set, and an in-window cancellation evicts its admitted pod and
   reclaims capacity — the *same* path a mid-window cancellation takes on a fetch.
+  An entry that keeps its id but changes owner (**adoption** — a reservation
+  reassigned to a teammate) evicts the prior owner's admitted pod from its
+  namespace and releases the capacity, so the new owner can claim the
+  still-active window (`detect_owner_changed_in_window` + `_handle_owner_changes`).
 - **Shared reconciliation**: both the fetch loop and the push run
   `_reconcile_after_reservation_change` in `main.py` (label resolution, queue
-  reconcile, cancellation eviction, reclaim-merge re-apply).  The push passes
+  reconcile, cancellation eviction, owner-change eviction, reclaim-merge re-apply).
+  The push passes
   `update_fetch_stamp=False` so it does **not** advance
   `last_reservation_fetch_at` (that stamp anchors the reclaim-merge commitment
   guard; advancing it on partial data could race an unseen booking).

@@ -104,4 +104,5 @@ class ReservationPushResponse(BaseModel):
 
     applied: int        # entries upserted into the active set
     cancelled: int      # in-window cancellations evicted / reclaimed
+    adopted: int = 0    # in-window owner changes whose prior-owner pod was evicted
     total_active: int   # size of the active reservation set after the push

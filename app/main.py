@@ -48,6 +48,7 @@ from .k8s_client import (
     apply_toleration,
     delete_pod,
     emit_reservation_cancelled_event,
+    emit_reservation_reassigned_event,
     emit_runtime_capped_event,
     get_pod_active_deadline,
     get_pod_booking_reference,
@@ -119,6 +120,7 @@ async def _reconcile_after_reservation_change(
     config: Config,
     active_reservations: list[ReservationResponse],
     cancelled_in_window: list[ReservationResponse],
+    owner_changes: list[tuple[ReservationResponse, str]],
     now: datetime,
     *,
     update_fetch_stamp: bool,
@@ -130,10 +132,12 @@ async def _reconcile_after_reservation_change(
     set).  Resolves gpu_class_id → label_value for every referenced GPU class
     (rebuilt from scratch, reusing cached values), assigns the new reservation
     list and label map, reconciles the task queue, evicts pods for any in-window
-    cancellations, and re-applies reclaim-block merges.
+    cancellations or owner changes (adoption), and re-applies reclaim-block merges.
 
     The caller must already hold ``state.reservation_lock`` and must have computed
-    *cancelled_in_window*.  *update_fetch_stamp* is ``True`` only for a full fetch;
+    *cancelled_in_window* and *owner_changes* against the OLD reservation set (both
+    detectors compare the incoming entries with ``state.reservations`` before it is
+    replaced here).  *update_fetch_stamp* is ``True`` only for a full fetch;
     a partial push passes ``False`` so it does not advance
     ``last_reservation_fetch_at`` (the reclaim-merge commitment guard anchors on
     that stamp — advancing it on partial data could race an unseen booking).
@@ -175,6 +179,11 @@ async def _reconcile_after_reservation_change(
     if cancelled_in_window:
         await _handle_cancelled_reservations(state, cancelled_in_window)
 
+    # Handle owner changes (adoption): evict the prior owner's admitted pod so
+    # the new owner can claim the still-active reservation.
+    if owner_changes:
+        await _handle_owner_changes(state, owner_changes)
+
     # Re-apply persistent reclaim-block merges to the freshly loaded reservation
     # objects (and discover new ones) so a reload never re-exposes an absorbed
     # block.  Only meaningful when on-demand placement is enabled.
@@ -203,14 +212,17 @@ async def _refresh_reservations(
 
     now = datetime.now(timezone.utc)
     async with state.reservation_lock:
-        # Detect reservations cancelled mid-window before overwriting the state.
+        # Detect reservations cancelled mid-window or reassigned to a new owner
+        # before overwriting the state (both compare against the old owner set).
         cancelled_in_window = state.detect_cancelled_in_window(all_reservations, now)
+        owner_changes = state.detect_owner_changed_in_window(all_reservations, now)
         await _reconcile_after_reservation_change(
             state,
             client,
             config,
             active_reservations,
             cancelled_in_window,
+            owner_changes,
             now,
             update_fetch_stamp=True,
         )
@@ -279,6 +291,76 @@ async def _handle_cancelled_reservations(
 
         # Record immediately so on-demand candidates can use the freed capacity.
         state.record_cancelled_reservation(cancelled_res)
+
+
+async def _handle_owner_changes(
+    state: ControllerState,
+    owner_changes: list[tuple[ReservationResponse, str]],
+) -> None:
+    """Evict the prior owner's admitted pod for each reassigned reservation.
+
+    For each in-progress reservation whose owner changed (adoption), the pod
+    already admitted under it lives in the *prior* owner's namespace and can no
+    longer be legitimately matched to the reservation.  For each such change:
+    1. Snapshot live tolerated pods and filter those admitted under this
+       reservation id **in the prior owner's namespace** (the ``namespace ==
+       prior_username`` guard ensures a pod the new owner may already have had
+       admitted is never touched).
+    2. Emit a ReservationReassigned event on each pod, then delete it.
+    3. Release its capacity so the new owner's pod can be admitted under the same
+       still-active reservation on a subsequent tick / watch event.
+
+    Unlike cancellation, the reservation stays active — it is not recorded in
+    ``cancelled_reservations``; it simply changes hands.
+    """
+    # One pod snapshot serves the whole batch.
+    pod_snapshot = []
+    try:
+        pod_snapshot = await snapshot_tolerated_pods(TOLERATION_KEY)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not snapshot pods for owner-change eviction: %s", exc)
+
+    for res, prior_username in owner_changes:
+        new_owner = res.user.username if res.user else "another user"
+        new_owner_desc = f"to {new_owner}"
+
+        pods_for_res = [
+            p
+            for p in pod_snapshot
+            if p.reservation_id == res.id and p.namespace == prior_username
+        ]
+        if pods_for_res:
+            log.info(
+                "Reservation #%d reassigned from %s %s; evicting %d prior-owner pod(s)",
+                res.id,
+                prior_username,
+                new_owner_desc,
+                len(pods_for_res),
+            )
+        for pod_info in pods_for_res:
+            # Emit event before deletion so the event record survives.
+            try:
+                pod_obj = await read_pod(pod_info.name, pod_info.namespace)
+                await emit_reservation_reassigned_event(
+                    pod_obj, pod_info.name, pod_info.namespace, new_owner_desc
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Could not emit ReservationReassigned event for pod %s/%s: %s",
+                    pod_info.namespace,
+                    pod_info.name,
+                    exc,
+                )
+            try:
+                await delete_pod(pod_info.name, pod_info.namespace)
+                state.release_pod(pod_info.uid)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Could not delete pod %s/%s: %s",
+                    pod_info.namespace,
+                    pod_info.name,
+                    exc,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1097,7 +1179,10 @@ async def push_reservations(
     ``status`` is not ``"active"`` (e.g. a cancellation) drops the reservation
     from the active set, and any in-window cancellation evicts its admitted pod
     and reclaims the freed capacity — the same path a mid-window cancellation
-    takes on a normal fetch.  The next full pull remains the source of truth.
+    takes on a normal fetch.  An entry that keeps the same id but changes owner
+    (adoption) evicts the prior owner's admitted pod from its namespace so the
+    new owner can claim the still-active reservation.  The next full pull remains
+    the source of truth.
     """
     state: ControllerState = request.app.state.controller_state
     client: ReservationClient = request.app.state.reservation_client
@@ -1110,6 +1195,9 @@ async def push_reservations(
         # Evictable in-window cancellations carried by this push (idempotent:
         # detect_cancelled_in_window skips ids already recorded / declared no-show).
         cancelled_in_window = state.detect_cancelled_in_window(pushed, now)
+        # Owner changes (adoption) must be detected before apply_push_to_active
+        # upserts the new owner over the old one in state.reservations.
+        owner_changes = state.detect_owner_changed_in_window(pushed, now)
         merged_active = apply_push_to_active(state.reservations, pushed)
 
         await _reconcile_after_reservation_change(
@@ -1118,6 +1206,7 @@ async def push_reservations(
             config,
             merged_active,
             cancelled_in_window,
+            owner_changes,
             now,
             update_fetch_stamp=False,
         )
@@ -1134,15 +1223,17 @@ async def push_reservations(
 
     applied = sum(1 for r in pushed if r.status == "active")
     log.info(
-        "Push applied: %d active upsert(s), %d in-window cancellation(s); "
-        "%d active reservation(s) now tracked",
+        "Push applied: %d active upsert(s), %d in-window cancellation(s), "
+        "%d owner change(s); %d active reservation(s) now tracked",
         applied,
         len(cancelled_in_window),
+        len(owner_changes),
         len(state.reservations),
     )
     return ReservationPushResponse(
         applied=applied,
         cancelled=len(cancelled_in_window),
+        adopted=len(owner_changes),
         total_active=len(state.reservations),
     )
 
