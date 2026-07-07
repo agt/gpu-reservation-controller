@@ -570,6 +570,33 @@ async def emit_reservation_cancelled_event(
     )
 
 
+async def emit_reservation_reassigned_event(
+    pod,
+    pod_name: str,
+    namespace: str,
+    new_owner_desc: str,
+) -> None:
+    """Create a Kubernetes Event linked to *pod* with reason='ReservationReassigned'.
+
+    Emitted when a reservation is reassigned to a new owner ("adoption") and the
+    prior owner's admitted pod is evicted so the new owner can claim the window.
+    """
+    await _emit_pod_event(
+        pod,
+        pod_name,
+        namespace,
+        name_prefix="gpu-resadopt-",
+        reason="ReservationReassigned",
+        action="EvictPod",
+        message=f"Pod evicted: GPU reservation reassigned {new_owner_desc}.",
+    )
+    log.info(
+        "Emitted ReservationReassigned event for pod %s/%s",
+        namespace,
+        pod_name,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pod event stream
 # ---------------------------------------------------------------------------

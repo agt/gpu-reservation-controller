@@ -1110,6 +1110,46 @@ class ControllerState:
             and r.id not in self.cancelled_reservations
         ]
 
+    def detect_owner_changed_in_window(
+        self,
+        incoming: list[ReservationResponse],
+        now: datetime,
+    ) -> list[tuple[ReservationResponse, str]]:
+        """Identify in-progress reservations whose owner changed ("adoption").
+
+        The reservation app can reassign a booking to a new owner (a teammate)
+        while it stays ``status == "active"``.  Because ownership is coupled to
+        the Kubernetes namespace (``pod.namespace == reservation.user.username``),
+        the pod already admitted under the reservation lives in the *prior*
+        owner's namespace and can no longer be legitimately matched to it.
+
+        Compares each incoming active booking against the reservation of the same
+        id **currently stored** in ``self.reservations`` (this must be called
+        *before* the wholesale replace, while the old owner is still visible).  A
+        reservation is returned as ``(new_reservation, prior_username)`` when:
+        - incoming ``status == "active"``, ``kind == "booking"``, ``user`` set, AND
+        - a prior reservation of the same id exists with ``user``/``user_id`` set, AND
+        - the owner changed (``prior.user_id != r.user_id``), AND
+        - it is in progress: ``slot_start(r) <= now < slot_end(r)``.
+
+        *prior_username* (the old ``user.username``, i.e. the old namespace) is
+        what lets the caller locate the pod "under the prior name/namespace".
+        """
+        prior_by_id = {r.id: r for r in self.reservations}
+        changes: list[tuple[ReservationResponse, str]] = []
+        for r in incoming:
+            if r.status != "active" or r.kind != "booking" or r.user is None:
+                continue
+            prior = prior_by_id.get(r.id)
+            if prior is None or prior.user is None or prior.user_id is None:
+                continue
+            if prior.user_id == r.user_id:
+                continue
+            if not (slot_start(r) <= now < slot_end(r)):
+                continue
+            changes.append((r, prior.user.username))
+        return changes
+
     def record_cancelled_reservation(self, r: ReservationResponse) -> None:
         """Register *r* as a cancelled in-window reservation for on-demand use.
 
