@@ -11,9 +11,11 @@ A **Kubernetes controller daemon** — not a web application.  It has no
 database and no user-facing frontend.  It authenticates *outbound* to the GPU
 Reservation API using a long-lived service key, and *inbound* to Kubernetes
 using either a kubeconfig file or an in-cluster service account.  It also
-exposes a small optional **inbound push API** (`POST /api/reservations/push`)
-that the reservation app calls to propagate reservation updates faster than the
-poll interval; this endpoint is guarded by a single static bearer token and is
+exposes a small optional **inbound API** that the reservation app calls: a push
+endpoint (`POST /api/reservations/push`) to propagate reservation updates faster
+than the poll interval, and a take-back endpoint
+(`POST /api/reservations/take-back`) to reclaim idle reclaim blocks before
+re-booking them; both are guarded by a single static bearer token and are
 disabled unless that token is configured.
 
 ---
@@ -240,6 +242,58 @@ source of truth.
 - **RBAC**: unchanged — eviction reuses the existing `pods: delete` /
   `events: create` permissions.
 
+### Reclaim-block take-back API
+
+`POST /api/reservations/take-back` (`{"reclaim_ids": [id, …]}`) lets the
+reservation app **reclaim specific `kind="reclaim"` blocks from the controller**
+so it can re-book capacity that is already inside the preempt guard (the guard's
+one-way "committed, will not preempt" promise becomes a handshake: the app asks
+first, and only commits its tentative booking once the controller has ceded the
+blocks).  Guarded by the same `INBOUND_API_TOKEN` bearer as the push API.
+
+- **All-or-nothing**: every requested block must be idle or the whole request is
+  rejected with 409 and nothing is mutated.  "In use" means: a live pod is
+  admitted under the block's id (unified occupancy — the in-memory map is merged
+  with a fresh `snapshot_tolerated_pods` LIST so both in-flight optimistic
+  placements and pods from a prior controller lifetime count), the id is claimed
+  by a chained holder (defensive; holders never chain into reclaim blocks), or —
+  for a block absorbed into a reclaim merge — some pod on the merge's *subject*
+  **projects** past the block's start (`status.startTime +
+  spec.activeDeadlineSeconds`, captured in the snapshot; an unknowable deadline
+  counts as unbounded, failing safe).  A job admitted *before* the merge
+  (deadline ≤ the subject's own end) therefore never blocks a take-back.
+- **Merge detachment** (`ControllerState.take_back_blocks`): taking an absorbed
+  stub truncates its `ReclaimMerge` at the earliest taken position — earlier
+  stubs (which a running job's extended deadline may still reach) stay stubbed,
+  later untaken stubs detach back to standalone blocks (a taken block leaves a
+  hole, so they no longer abut).  Taking a provably idle merge *subject*
+  dissolves the record and detaches all untaken stubs.  Merge rediscovery is
+  deliberately not re-run inside the handler (wholesale dissolve-and-rediscover
+  would un-stub blocks under a *claimed* subject — the B4 case); the next
+  tick/refresh reconciles normally.
+- **Tombstones** (`ControllerState.taken_back`): granted ids are remembered
+  until their window's `end_utc` and **filtered from fetch results**
+  (`filter_taken_back`) — a fetch snapshot taken before the grant, or the app's
+  own DB until its replacement booking commits, must not resurrect ceded
+  capacity.  An explicit **push** of the id clears the tombstone
+  (`clear_taken_back`) — the sanctioned restore path when the app's booking
+  falls through.  An id the controller has never seen is granted (it can never
+  have placed pods on it), reported as `unknown`, and tombstoned with a
+  `2 × RESERVATION_FETCH_INTERVAL` fallback expiry that is pinned to the real
+  window the first time a fetch observes the id.
+- **Atomicity**: the handler holds `reservation_lock` and performs its single
+  `await` (the pod snapshot) *before* the check; check and mutation then run in
+  one synchronous section.  Both placement coroutines record occupancy
+  synchronously before their first `await`, so a placement either shows up in
+  the occupancy the check reads, or runs after the block is already gone.
+- **Fail closed**: a failed pod snapshot returns 503 and grants nothing.  A
+  non-reclaim id in the request returns 400 (`not-a-reclaim-block`).  Retries
+  are idempotent (already-granted ids report `already_taken_back`).
+- **Follow-up compatibility**: the planned "push a single reservation built from
+  taken-back blocks" needs no new surface — the existing push upserts new ids,
+  and tombstones never filter pushes.  The request/response envelopes leave room
+  for an atomic replacement field later.
+
 ### Startup behaviour
 
 On startup, the controller performs an initial reservation fetch and then issues
@@ -300,7 +354,7 @@ above applies.
 | `RESERVATION_LOOKAHEAD_DAYS` | `7` | Calendar days ahead to fetch reservations |
 | `KUBECONFIG` | *(absent = in-cluster)* | Path to kubeconfig file for out-of-cluster use |
 | `HEALTH_PORT` | `8000` | Port for `GET /health` (also serves `POST /api/reservations/push`) |
-| `INBOUND_API_TOKEN` | *(absent = push API disabled)* | Bearer token guarding `POST /api/reservations/push`; mount from a Kubernetes Secret. Unset ⇒ endpoint returns 503 |
+| `INBOUND_API_TOKEN` | *(absent = inbound API disabled)* | Bearer token guarding `POST /api/reservations/push` and `POST /api/reservations/take-back`; mount from a Kubernetes Secret. Unset ⇒ endpoints return 503 |
 | `TZ` | system default | Affects log timestamp display only; no longer required for window arithmetic |
 | `ONDEMAND_PLACEMENT_ENABLED` | `true` | Set to `false` to disable on-demand placement entirely |
 | `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show (legacy alias `NOSHOWN_TIMEOUT_MINUTES` still honored) |

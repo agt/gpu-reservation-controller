@@ -71,6 +71,8 @@ from .k8s_client import (
 )
 from .reservation_client import ReservationClient
 from .schemas import (
+    ReclaimTakeBackRequest,
+    ReclaimTakeBackResponse,
     ReservationPushRequest,
     ReservationPushResponse,
     ReservationResponse,
@@ -162,6 +164,13 @@ async def _reconcile_after_reservation_change(
                 cid,
             )
 
+    if update_fetch_stamp:
+        # A bulk fetch may predate a take-back grant (the HTTP GET runs outside
+        # the lock), and the app's DB keeps returning a relinquished block until
+        # its replacement booking commits — drop tombstoned ids so neither can
+        # resurrect ceded capacity.  Pushes are deliberate updates and instead
+        # clear the tombstone before applying (see push_reservations).
+        active_reservations = state.filter_taken_back(active_reservations, now)
     state.reservations = active_reservations
     state.gpu_class_labels = new_labels
     if update_fetch_stamp:
@@ -1140,9 +1149,9 @@ def _require_push_auth(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> None:
-    """Authenticate an inbound push via a static bearer token.
+    """Authenticate an inbound API call (push / take-back) via a static bearer token.
 
-    - 503 if ``INBOUND_API_TOKEN`` is unset — the push endpoint is opt-in and
+    - 503 if ``INBOUND_API_TOKEN`` is unset — the inbound API is opt-in and
       disabled by default, so existing deployments are unaffected.
     - 401 if the ``Authorization: Bearer <token>`` header is missing or does not
       match (constant-time compare).
@@ -1152,7 +1161,7 @@ def _require_push_auth(
     if not expected:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Inbound push API is disabled (INBOUND_API_TOKEN not set)",
+            detail="Inbound API is disabled (INBOUND_API_TOKEN not set)",
         )
     scheme, _, token = (authorization or "").partition(" ")
     if scheme.lower() != "bearer" or not secrets.compare_digest(token, expected):
@@ -1192,6 +1201,10 @@ async def push_reservations(
     now = datetime.now(timezone.utc)
 
     async with state.reservation_lock:
+        # An explicit active push of a taken-back id restores it — the app
+        # deliberately handing back relinquished capacity (e.g. its tentative
+        # booking fell through) — so lift tombstones before the upsert.
+        state.clear_taken_back({r.id for r in pushed if r.status == "active"})
         # Evictable in-window cancellations carried by this push (idempotent:
         # detect_cancelled_in_window skips ids already recorded / declared no-show).
         cancelled_in_window = state.detect_cancelled_in_window(pushed, now)
@@ -1234,6 +1247,120 @@ async def push_reservations(
         applied=applied,
         cancelled=len(cancelled_in_window),
         adopted=len(owner_changes),
+        total_active=len(state.reservations),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Inbound reclaim-block take-back API
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/reservations/take-back",
+    tags=["sync"],
+    response_model=ReclaimTakeBackResponse,
+    dependencies=[Depends(_require_push_auth)],
+)
+async def take_back_reclaim_blocks(
+    body: ReclaimTakeBackRequest, request: Request
+) -> ReclaimTakeBackResponse:
+    """Relinquish specific idle reclaim blocks so the reservation app can re-book them.
+
+    The app calls this before committing a booking built from capacity the
+    controller is holding (e.g. a tentative offer inside the preempt guard).
+    All-or-nothing: if any requested block is in use — a pod admitted on it, or
+    a merged extension a running job's deadline reaches into — the whole request
+    fails with 409 and nothing changes.  On success the blocks leave the
+    controller's scheduling universe immediately (absorbed blocks are detached
+    from their merge subject) and are tombstoned so a stale fetch cannot
+    resurrect them; pushing the id back (``POST /api/reservations/push``) is the
+    restore path if the booking falls through.  503 when idleness cannot be
+    verified (pod snapshot failed) — fail closed, nothing granted.
+    """
+    state: ControllerState = request.app.state.controller_state
+    config: Config = request.app.state.config
+
+    ids = set(body.reclaim_ids)
+    now = datetime.now(timezone.utc)
+
+    async with state.reservation_lock:
+        # Fail closed: idleness must be verified against live pods.
+        try:
+            snapshot = await snapshot_tolerated_pods(TOLERATION_KEY)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Take-back rejected: could not snapshot pods: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Cannot verify block idleness (pod snapshot failed); retry later",
+            )
+
+        # Projected end per live pod, keyed by the reservation id it occupies.
+        # None = unknown/unbounded (fail safe).  In-memory occupancy is merged
+        # in to cover pods whose admission patch is still in flight (recorded
+        # synchronously before any await) and thus not yet visible to the LIST.
+        # No await may occur between here and take_back_blocks: that keeps the
+        # check-and-mutate atomic against the placement coroutines.
+        pod_ends: dict[int, list[datetime | None]] = {}
+        seen_uids: set[str] = set()
+        for p in snapshot:
+            if p.phase not in ("Running", "Pending") or p.reservation_id is None:
+                continue
+            seen_uids.add(p.uid)
+            if p.active_deadline_seconds is not None and p.start_time is not None:
+                projected = p.start_time + timedelta(seconds=p.active_deadline_seconds)
+            else:
+                projected = None
+            pod_ends.setdefault(p.reservation_id, []).append(projected)
+        for rid, occupants in state.occupancy.items():
+            for uid in occupants:
+                if uid not in seen_uids:
+                    pod_ends.setdefault(rid, []).append(None)
+
+        result = state.take_back_blocks(
+            ids,
+            pod_ends,
+            now,
+            unknown_expiry=now
+            + timedelta(seconds=2 * config.reservation_fetch_interval),
+        )
+
+    if result.invalid:
+        log.info(
+            "Take-back rejected (400): invalid target(s) %s",
+            [(c.reservation_id, c.reason) for c in result.invalid],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "message": "One or more ids are not reclaim blocks; nothing was taken back",
+                "invalid": [
+                    {"id": c.reservation_id, "reason": c.reason}
+                    for c in result.invalid
+                ],
+            },
+        )
+    if result.conflicts:
+        log.info(
+            "Take-back rejected (409): in-use block(s) %s",
+            [(c.reservation_id, c.reason) for c in result.conflicts],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "One or more blocks are in use; nothing was taken back",
+                "in_use": [
+                    {"id": c.reservation_id, "reason": c.reason}
+                    for c in result.conflicts
+                ],
+            },
+        )
+
+    return ReclaimTakeBackResponse(
+        taken_back=result.taken_back,
+        already_taken_back=result.already_taken_back,
+        unknown=result.unknown,
+        detached=result.detached,
         total_active=len(state.reservations),
     )
 

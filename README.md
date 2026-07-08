@@ -285,7 +285,7 @@ All settings are supplied via environment variables.
 | `NOSHOW_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress (legacy alias `NOSHOWN_GRACE_MINUTES` still accepted) |
 | `POD_LIST_TICK_INTERVAL` | no | `300` | Seconds between queue-processor ticks (pod LIST frequency) |
 | `POD_SCHEDULING_GATE_NAME` | no | *(absent)* | Name of a SchedulingGate to remove from a pod after admitting it; unset disables scheduling-gate removal |
-| `INBOUND_API_TOKEN` | no | *(absent)* | Bearer token for the inbound push API (`POST /api/reservations/push`); mount from a Kubernetes Secret. Unset leaves the endpoint **disabled** (returns 503) |
+| `INBOUND_API_TOKEN` | no | *(absent)* | Bearer token for the inbound API (`POST /api/reservations/push` and `POST /api/reservations/take-back`); mount from a Kubernetes Secret. Unset leaves both endpoints **disabled** (returns 503) |
 | `LOG_LEVEL` | no | `INFO` | Python logging level for the controller |
 
 > **Note:** `reclaim_preempt_guard_minutes` (used by reclaim-block merging) is
@@ -359,6 +359,58 @@ curl -X POST http://localhost:8000/api/reservations/push \
 
 To enable it under Helm, point `inboundApiTokenSecret.name` at a Secret holding
 the token (see below). No additional RBAC is required.
+
+---
+
+## Reclaim-block take-back API
+
+Reclaim holds whose start falls inside the app's `reclaim_preempt_guard_minutes`
+are treated as **committed** to the controller — the app will not preempt them
+with a new booking. To let the app re-sell that near-term capacity anyway, it can
+ask the controller to **take back** specific reclaim blocks before committing a
+tentative booking built from them:
+
+```
+POST /api/reservations/take-back
+Authorization: Bearer <INBOUND_API_TOKEN>
+Content-Type: application/json
+
+{ "reclaim_ids": [123, 456] }
+```
+
+- **All-or-nothing**: the request succeeds only if *every* named block is idle.
+  A block is in use when a live pod is admitted on it, or when it was merged
+  into a running job's extended window and that job's deadline projects into it.
+  Any in-use block rejects the whole request and **nothing changes**.
+- On success the blocks immediately leave the controller's scheduling universe:
+  no further on-demand placement or merging can touch them, and a block absorbed
+  into a merge is detached from its subject (earlier absorbed blocks a running
+  job still reaches stay protected; later untaken blocks revert to standalone
+  capacity, reported in `detached`).
+- Granted ids are **tombstoned** until their window ends, so a poll that still
+  lists the block (a stale snapshot, or the app's DB before its replacement
+  booking commits) cannot resurrect it. If the booking falls through, **push the
+  block back** (`POST /api/reservations/push` with the entry active) — an
+  explicit push clears the tombstone and restores the capacity.
+- An id the controller has never seen (e.g. a hold created after its last poll)
+  is granted — the controller cannot have placed anything on it — tombstoned
+  defensively, and reported under `unknown`.
+- Responses: `200` (with `{"taken_back", "already_taken_back", "unknown",
+  "detached", "total_active"}`; retries are idempotent), `400` (an id is not a
+  reclaim block, listed under `detail.invalid`), `401` (missing/invalid bearer),
+  `409` (in-use block(s) listed under `detail.in_use` with reasons), or `503`
+  (endpoint disabled, or idleness could not be verified against live pods —
+  the controller fails closed and grants nothing).
+
+```bash
+curl -X POST http://localhost:8000/api/reservations/take-back \
+  -H "Authorization: Bearer $INBOUND_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reclaim_ids": [123]}'
+```
+
+Shares the `HEALTH_PORT` listener and `INBOUND_API_TOKEN` with the push API; no
+additional RBAC is required.
 
 ---
 
