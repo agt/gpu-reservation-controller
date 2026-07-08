@@ -307,6 +307,11 @@ class ToleratedPodInfo:
     gpu_count: int
     phase: str
     scheduled_false: bool  # PodScheduled condition present with status == "False"
+    # Deadline-projection inputs (take-back in-use checks): the pod's projected
+    # end is ``start_time + active_deadline_seconds``.  ``None`` when unset or
+    # not yet started — consumers must treat that as unbounded (fail safe).
+    active_deadline_seconds: Optional[int] = None
+    start_time: Optional[datetime] = None
 
 
 async def snapshot_tolerated_pods(toleration_key: str) -> list[ToleratedPodInfo]:
@@ -342,6 +347,8 @@ async def snapshot_tolerated_pods(toleration_key: str) -> list[ToleratedPodInfo]
                 gpu_count=get_pod_gpu_count(pod),
                 phase=get_pod_phase(pod),
                 scheduled_false=(scheduled is not None and scheduled.status == "False"),
+                active_deadline_seconds=get_pod_active_deadline(pod),
+                start_time=pod.status.start_time if pod.status else None,
             )
         )
     log.debug("k8s: tolerated snapshot returned %d pod(s)", len(out))

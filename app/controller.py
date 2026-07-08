@@ -140,6 +140,38 @@ class ReclaimMerge:
     extended_end: datetime     # slot_end of the last absorbed block
 
 
+@dataclass
+class TakeBackConflict:
+    """One requested block a take-back could not relinquish, and why.
+
+    ``reason`` is one of ``"occupied"`` / ``"claimed"`` / ``"extension-in-use"``
+    (conflicts), or ``"not-a-reclaim-block"`` (invalid target).
+    """
+
+    reservation_id: int
+    reason: str
+
+
+@dataclass
+class TakeBackResult:
+    """Outcome of ``ControllerState.take_back_blocks`` (all-or-nothing).
+
+    When ``conflicts`` or ``invalid`` is non-empty, **nothing was mutated** and
+    the grant fields describe only what would have been granted.
+    """
+
+    taken_back: list[int]          # known blocks removed from the active set
+    already_taken_back: list[int]  # ids already tombstoned (idempotent retry)
+    unknown: list[int]             # never-seen ids, granted defensively
+    detached: list[int]            # absorbed stubs released back to standalone
+    conflicts: list[TakeBackConflict]
+    invalid: list[TakeBackConflict]
+
+    @property
+    def granted(self) -> bool:
+        return not self.conflicts and not self.invalid
+
+
 # ---------------------------------------------------------------------------
 # Shared controller state
 # ---------------------------------------------------------------------------
@@ -237,6 +269,18 @@ class ControllerState:
         # Reclaim block ids absorbed into a subject (stubs).  Excluded from
         # on-demand placement so they are never independently double-booked.
         self.merged_stub_ids: set[int] = set()
+
+        # Reclaim blocks relinquished to the reservation app via the take-back
+        # API, mapped to each tombstone's expiry (the block's end_utc — after
+        # which placement is impossible anyway; a never-seen id carries a
+        # caller-supplied fallback until a fetch reveals its real window).  A
+        # fetched entry with a tombstoned id is dropped (filter_taken_back) so
+        # neither a stale fetch snapshot nor the app's own DB — which keeps
+        # returning the block until its replacement booking commits — can
+        # resurrect capacity the controller has already ceded.  An explicit
+        # *push* of the id clears the tombstone (clear_taken_back): that is the
+        # sanctioned restore path when the app aborts its booking.
+        self.taken_back: dict[int, datetime] = {}
 
         # Serialises reservation-state reconciliation between the fetch loop and
         # the inbound push endpoint.  Both mutate ``reservations`` and evict pods
@@ -1219,3 +1263,235 @@ class ControllerState:
                 n_res,
                 new_total,
             )
+
+    # ------------------------------------------------------------------
+    # Reclaim-block take-back (inbound API)
+    # ------------------------------------------------------------------
+
+    def take_back_blocks(
+        self,
+        ids: set[int],
+        pod_ends_by_reservation: dict[int, list[Optional[datetime]]],
+        now: datetime,
+        unknown_expiry: datetime,
+    ) -> TakeBackResult:
+        """Relinquish the requested reclaim blocks if every one of them is idle.
+
+        All-or-nothing and fully synchronous: the caller holds
+        ``reservation_lock`` and must not interleave an ``await`` between
+        building *pod_ends_by_reservation* and this call, so the check and the
+        mutation are atomic with respect to the placement coroutines (which
+        record occupancy synchronously before their first ``await``).
+
+        *pod_ends_by_reservation* maps reservation id → the projected end of
+        each live pod admitted under it (``None`` = unknown/unbounded, treated
+        as running forever — fail safe).  *unknown_expiry* is the tombstone
+        expiry for ids the controller has never seen: it can never have placed
+        pods on such a block, so the take-back is granted, and the tombstone is
+        pinned to the real window the first time a fetch observes the id
+        (``filter_taken_back``).
+
+        Conflict reasons: ``occupied`` (a live pod is admitted under the block
+        itself), ``claimed`` (a chained reserved holder occupies it — defensive;
+        holders never chain into reclaim blocks today), ``extension-in-use``
+        (the block was absorbed into a merge and a pod on the merge's subject
+        projects past the block's start).  A requested id resolving to a
+        non-reclaim reservation lands in ``invalid``.  Any conflict or invalid
+        id ⇒ nothing is mutated.
+
+        On success, an absorbed stub's merge record is truncated at the earliest
+        taken stub: earlier stubs stay stubbed (a running job's extended
+        deadline may still reach them), later untaken stubs detach back to
+        standalone blocks (reported in ``detached``) — a taken block leaves a
+        hole, so they no longer abut the subject.  Taking a merge *subject*
+        (provably idle, so no deadline extends anywhere) dissolves its record
+        and detaches all untaken stubs.  Merge rediscovery is deliberately NOT
+        run here: the overlay is already consistent after surgical truncation,
+        and the next tick / refresh runs ``reconcile_reclaim_merges`` anyway.
+        (Wholesale dissolve-and-rediscover would be unsafe: discovery skips a
+        claimed subject and would un-stub earlier absorbed blocks a still-running
+        extended job may occupy.)
+        """
+        by_id: dict[int, ReservationResponse] = {r.id: r for r in self.reservations}
+        for rid, r in self.cancelled_reservations.items():
+            by_id.setdefault(rid, r)
+
+        # Which merge subject absorbs a given stub id (a stub belongs to at
+        # most one record — discovery excludes already-stubbed ids).
+        subject_of_stub: dict[int, int] = {
+            aid: merge.subject_id
+            for merge in self.reclaim_merges.values()
+            for aid in merge.absorbed_ids
+        }
+
+        def _busy_past(reservation_id: int, cut: Optional[datetime]) -> bool:
+            """True if any live pod under *reservation_id* projects past *cut*
+            (``cut=None`` ⇒ any live pod at all)."""
+            for end in pod_ends_by_reservation.get(reservation_id, []):
+                if cut is None or end is None or end > cut:
+                    return True
+            return False
+
+        taken: list[int] = []
+        already: list[int] = []
+        unknown: list[int] = []
+        conflicts: list[TakeBackConflict] = []
+        invalid: list[TakeBackConflict] = []
+
+        for rid in sorted(ids):
+            if rid in self.taken_back:
+                already.append(rid)
+                continue
+            res = by_id.get(rid)
+            if res is not None and res.kind != "reclaim":
+                invalid.append(TakeBackConflict(rid, "not-a-reclaim-block"))
+                continue
+            # A live pod admitted directly under the block.  Checked for
+            # unknown ids too: occupancy rebuilt from pod annotations (e.g.
+            # after a controller restart) can reference ids the current
+            # reservation list does not.
+            if _busy_past(rid, None):
+                conflicts.append(TakeBackConflict(rid, "occupied"))
+                continue
+            if rid in self.claimed_reservation_ids:
+                conflicts.append(TakeBackConflict(rid, "claimed"))
+                continue
+            if res is None:
+                unknown.append(rid)
+                continue
+            subject_id = subject_of_stub.get(rid)
+            if subject_id is not None and _busy_past(subject_id, slot_start(res)):
+                conflicts.append(TakeBackConflict(rid, "extension-in-use"))
+                continue
+            taken.append(rid)
+
+        result = TakeBackResult(
+            taken_back=taken,
+            already_taken_back=already,
+            unknown=unknown,
+            detached=[],
+            conflicts=conflicts,
+            invalid=invalid,
+        )
+        if conflicts or invalid:
+            return result  # all-or-nothing: nothing mutated
+
+        taken_set = set(taken) | set(unknown)
+        detached: list[int] = []
+
+        # Surgically shrink affected merge records before dropping the blocks.
+        for subject_id, merge in list(self.reclaim_merges.items()):
+            if subject_id in taken_set:
+                # Subject relinquished — it was provably idle, so no deadline
+                # extends anywhere: dissolve the record; untaken stubs revert
+                # to standalone blocks.
+                for aid in merge.absorbed_ids:
+                    self.merged_stub_ids.discard(aid)
+                    if aid not in taken_set:
+                        detached.append(aid)
+                del self.reclaim_merges[subject_id]
+                continue
+            cut_index = next(
+                (i for i, aid in enumerate(merge.absorbed_ids) if aid in taken_set),
+                None,
+            )
+            if cut_index is None:
+                continue
+            kept = merge.absorbed_ids[:cut_index]
+            cut_block = by_id.get(merge.absorbed_ids[cut_index])
+            for aid in merge.absorbed_ids[cut_index:]:
+                self.merged_stub_ids.discard(aid)
+                if aid not in taken_set:
+                    detached.append(aid)
+            if kept and cut_block is not None:
+                merge.absorbed_ids = kept
+                # Windows abut, so the cut block's start == the kept tail's end.
+                merge.extended_end = slot_start(cut_block)
+                log.info(
+                    "Reclaim merge for subject #%d truncated by take-back: "
+                    "absorbed now %s, extended end %s",
+                    subject_id,
+                    kept,
+                    merge.extended_end.isoformat(),
+                )
+            else:
+                # Nothing kept (or a stale record whose cut block is already
+                # gone — the validation pass would drop it next cycle anyway).
+                for aid in kept:
+                    self.merged_stub_ids.discard(aid)
+                    detached.append(aid)
+                del self.reclaim_merges[subject_id]
+
+        for rid in taken:
+            self.merged_stub_ids.discard(rid)
+            self.cancelled_reservations.pop(rid, None)
+            self.taken_back[rid] = slot_end(by_id[rid])
+        if taken:
+            self.reservations = [r for r in self.reservations if r.id not in taken_set]
+        for rid in unknown:
+            self.taken_back[rid] = unknown_expiry
+
+        result.detached = sorted(detached)
+        log.info(
+            "Take-back granted: relinquished %s (already=%s, unknown=%s, "
+            "detached=%s); %d active reservation(s) remain",
+            taken,
+            already,
+            unknown,
+            result.detached,
+            len(self.reservations),
+        )
+        return result
+
+    def filter_taken_back(
+        self, entries: list[ReservationResponse], now: datetime
+    ) -> list[ReservationResponse]:
+        """Drop fetched entries whose id was relinquished via the take-back API.
+
+        Called on the **fetch** path only: a bulk fetch may predate a grant
+        (the HTTP GET runs outside ``reservation_lock``), and the app's own DB
+        keeps returning the block until its replacement booking commits.  A
+        *push* is a deliberate, targeted update and instead clears the tombstone
+        (``clear_taken_back``) — the sanctioned restore path.
+
+        Also does tombstone maintenance: an observed entry pins its tombstone to
+        the entry's real ``end_utc`` (a never-seen id starts with a fallback
+        expiry), and tombstones whose expiry has passed are pruned — the block's
+        window is over, so it can never be placed onto again.
+        """
+        for rid in [rid for rid, expiry in self.taken_back.items() if expiry <= now]:
+            del self.taken_back[rid]
+            log.info(
+                "Take-back tombstone for reservation #%d expired; id no longer filtered",
+                rid,
+            )
+        if not self.taken_back:
+            return entries
+        kept: list[ReservationResponse] = []
+        dropped: list[int] = []
+        for r in entries:
+            if r.id in self.taken_back:
+                self.taken_back[r.id] = slot_end(r)  # pin to the observed window
+                dropped.append(r.id)
+            else:
+                kept.append(r)
+        if dropped:
+            log.debug(
+                "Fetch filtered %d taken-back reservation(s): %s",
+                len(dropped),
+                dropped,
+            )
+        return kept
+
+    def clear_taken_back(self, ids: set[int]) -> None:
+        """Lift take-back tombstones for *ids* (push-path restore).
+
+        An explicit active push of a taken-back id is the reservation app
+        deliberately handing the capacity back (e.g. its tentative booking fell
+        through), so the tombstone must not suppress the upsert.
+        """
+        for rid in ids:
+            if self.taken_back.pop(rid, None) is not None:
+                log.info(
+                    "Take-back tombstone for reservation #%d cleared by push", rid
+                )
