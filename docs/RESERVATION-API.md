@@ -397,6 +397,14 @@ The guard is sized to comfortably exceed the controller's reservation poll
 interval, so a preempted hold always leaves the controller's view before it would
 be scheduled onto — no explicit coordination is needed.
 
+A within-guard block is committed *by default*, but not unconditionally: a
+controller that implements the take-back API (`POST /api/reservations/take-back`)
+may cede a specific idle within-guard block on request, at which point the app is
+free to book over it. This turns the guard's one-way promise into a handshake —
+see the take-back API's own documentation for the request/response contract. A
+controller that does not implement take-back is unaffected: it never receives
+such a request, and the guard's original one-way promise still holds.
+
 ---
 
 ## 5. Roster sync endpoints
