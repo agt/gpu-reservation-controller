@@ -492,23 +492,41 @@ async def remove_scheduling_gate(
     )
 
 
-async def set_active_deadline(pod_name: str, namespace: str, seconds: int) -> None:
-    """Patch pod's spec.activeDeadlineSeconds to *seconds* and record the limit
-    in the ``horae/pod-runtime-limit-seconds`` annotation."""
+async def annotate_runtime_guarantee(
+    pod_name: str, namespace: str, seconds: int, guaranteed_until: datetime
+) -> None:
+    """Annotate *pod_name* with its runtime guarantee.
+
+    Writes ``horae/pod-runtime-limit-seconds`` (legacy key; now the guaranteed
+    duration in seconds rather than a hard cap — still consumed by in-pod
+    countdown widgets) and ``horae/guaranteed-until`` (the same instant as an
+    absolute UTC ISO-8601 timestamp).  Informational only: unlike the retired
+    ``set_active_deadline``, this never patches ``spec.activeDeadlineSeconds``
+    — demand-driven preemption enforces nothing through a Kubernetes-side
+    deadline, and never reads these annotations back to make a decision; it
+    recomputes the guarantee live from reservation state
+    (``ControllerState.guarantee_end``).
+    """
+    until_str = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
     log.debug(
-        "k8s: patch_namespaced_pod %s/%s (activeDeadlineSeconds=%d)",
-        namespace, pod_name, seconds,
+        "k8s: patch_namespaced_pod %s/%s (runtime guarantee: %ds, until %s)",
+        namespace, pod_name, seconds, until_str,
     )
     patch = {
-        "metadata": {"annotations": {"horae/pod-runtime-limit-seconds": str(seconds)}},
-        "spec": {"activeDeadlineSeconds": seconds},
+        "metadata": {
+            "annotations": {
+                "horae/pod-runtime-limit-seconds": str(seconds),
+                "horae/guaranteed-until": until_str,
+            }
+        },
     }
     await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
     log.info(
-        "Set activeDeadlineSeconds=%d on pod %s/%s",
-        seconds,
+        "Recorded runtime guarantee on pod %s/%s: %ds (until %s)",
         namespace,
         pod_name,
+        seconds,
+        until_str,
     )
 
 
@@ -524,9 +542,10 @@ async def _emit_pod_event(
 ) -> None:
     """Create a ``Normal`` Kubernetes Event linked to *pod*.
 
-    Shared body for the runtime-cap and cancellation emitters (CODE-REVIEW D3c),
-    which differ only in *name_prefix* / *reason* / *action* / *message*.  Uses
-    ``generate_name`` so re-emitting for the same pod never 409s (B10).
+    Shared body for the runtime-guarantee, preemption, and cancellation
+    emitters (CODE-REVIEW D3c), which differ only in *name_prefix* / *reason*
+    / *action* / *message*.  Uses ``generate_name`` so re-emitting for the
+    same pod never 409s (B10).
     """
     now = datetime.now(timezone.utc)
     event = k8s_client.CoreV1Event(
@@ -556,37 +575,41 @@ async def _emit_pod_event(
     await _run(_core_v1.create_namespaced_event, namespace, event)
 
 
-async def emit_runtime_capped_event(
+async def emit_runtime_guaranteed_event(
     pod,
     pod_name: str,
     namespace: str,
-    deadline_seconds: int,
+    seconds: int,
+    guaranteed_until: datetime,
 ) -> None:
-    """Create a Kubernetes Event linked to *pod* with reason='RuntimeCapped'."""
-    minutes, secs = divmod(deadline_seconds, 60)
+    """Create a Kubernetes Event linked to *pod* with reason='RuntimeGuaranteed'."""
+    minutes, secs = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
     human = (
         f"{hours}h{minutes:02d}m{secs:02d}s"
         if hours
         else f"{minutes}m{secs:02d}s"
     )
+    until_str = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
     await _emit_pod_event(
         pod,
         pod_name,
         namespace,
-        name_prefix="gpu-runcap-",
-        reason="RuntimeCapped",
-        action="CapRuntime",
+        name_prefix="gpu-guarantee-",
+        reason="RuntimeGuaranteed",
+        action="GuaranteeRuntime",
         message=(
-            f"activeDeadlineSeconds set to {deadline_seconds} ({human}) "
-            f"to ensure the pod terminates within its GPU reservation window(s)."
+            f"GPU access guaranteed for {human}, until {until_str}. The pod may "
+            f"keep running after that, but can be preempted if reserved capacity "
+            f"is needed."
         ),
     )
     log.info(
-        "Emitted RuntimeCapped event for pod %s/%s (deadline=%ds)",
+        "Emitted RuntimeGuaranteed event for pod %s/%s (guaranteed=%ds, until=%s)",
         namespace,
         pod_name,
-        deadline_seconds,
+        seconds,
+        until_str,
     )
 
 

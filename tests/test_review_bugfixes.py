@@ -1,12 +1,18 @@
 """Focused regressions for CODE-REVIEW-2026-07 Part I bug fixes (pure logic).
 
-B3 — compute_max_deadline_seconds floors at 1 (Kubernetes rejects 0).
+B3 — the runtime-guarantee seconds annotation floors at 1, never 0 or negative
+     (originally a compute_max_deadline_seconds guard; the floor now lives in
+     main._record_guarantee's seconds conversion since guarantee_end/
+     compute_guaranteed_until deliberately return unfloored absolute instants —
+     see test_guarantees.py).
 B11 — _reservation_gpu_count / available_by_id consult cancelled-in-window blocks.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from app.controller import ControllerState
 from app.schemas import GpuClassBrief, ReservationResponse
@@ -23,15 +29,31 @@ def _res(res_id: int, start: datetime, end: datetime, *, gpu_count: int = 2,
     )
 
 
-def test_compute_max_deadline_floors_at_one_for_expired_window():
-    """B3: a window that expired between the now-check and enforcement must not
-    produce activeDeadlineSeconds: 0 (rejected by the API → pod runs uncapped)."""
-    now = datetime.now(timezone.utc)
-    expired = _res(1, now - timedelta(hours=2), now - timedelta(seconds=5), kind="booking")
-    state = ControllerState()
-    state.reservations = [expired]
+def test_record_guarantee_floors_at_one_second_for_past_guarantee(monkeypatch):
+    """B3: a guarantee whose absolute end already passed between the caller's
+    now-check and enforcement (a stale-data race) must never produce a 0 or
+    negative seconds annotation."""
+    monkeypatch.setenv("RESERVATION_API_URL", "http://localhost:9999")
+    monkeypatch.setenv("RESERVATION_API_KEY", "test-key-bugfix")
+    import app.main as main
 
-    assert state.compute_max_deadline_seconds(now, expired) == 1
+    calls = {}
+
+    async def fake_annotate(pod_name, namespace, seconds, guaranteed_until):
+        calls["seconds"] = seconds
+
+    async def fake_emit(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(main, "annotate_runtime_guarantee", fake_annotate)
+    monkeypatch.setattr(main, "emit_runtime_guaranteed_event", fake_emit)
+
+    now = datetime.now(timezone.utc)
+    guaranteed_until = now - timedelta(seconds=5)
+    fresh_pod = SimpleNamespace(metadata=SimpleNamespace(uid="uid-1"))
+    asyncio.run(main._record_guarantee("pod-1", "ns", fresh_pod, guaranteed_until, now))
+
+    assert calls["seconds"] == 1
 
 
 def test_reservation_gpu_count_consults_cancelled_blocks():

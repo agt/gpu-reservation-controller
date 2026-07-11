@@ -48,13 +48,13 @@ from .k8s_client import (
     BOOKING_KIND_RESERVED,
     TERMINAL_PHASES,
     PodWatcher,
+    annotate_runtime_guarantee,
     apply_toleration,
     delete_pod,
     emit_preempted_event,
     emit_reservation_cancelled_event,
     emit_reservation_reassigned_event,
-    emit_runtime_capped_event,
-    get_pod_active_deadline,
+    emit_runtime_guaranteed_event,
     get_pod_booking_reference,
     get_pod_creation_timestamp,
     get_pod_gpu_count,
@@ -70,7 +70,6 @@ from .k8s_client import (
     pod_has_toleration,
     read_pod,
     remove_scheduling_gate,
-    set_active_deadline,
     snapshot_node_gpu_capacity,
     snapshot_tolerated_pods,
 )
@@ -382,29 +381,34 @@ async def _handle_owner_changes(
 # ---------------------------------------------------------------------------
 
 
-async def _enforce_deadline(
-    pod_name: str, namespace: str, fresh_pod, max_seconds: int
+async def _record_guarantee(
+    pod_name: str, namespace: str, fresh_pod, guaranteed_until: datetime, now: datetime
 ) -> None:
-    """Cap the pod's activeDeadlineSeconds to *max_seconds* and emit an Event.
+    """Annotate the pod with its runtime guarantee and emit a RuntimeGuaranteed Event.
 
     Shared by both admission paths (CODE-REVIEW D1a); callers compute
-    *max_seconds* (the reserved path chains back-to-back windows, the on-demand
-    path uses the single block's remaining time).  Only patches when the current
-    deadline is unset or looser than *max_seconds*.
+    *guaranteed_until* (the reserved path chains back-to-back windows, the
+    on-demand path uses the single block's ``effective_end``).  Unlike the
+    retired hard deadline this sets no Kubernetes enforcement — no
+    ``spec.activeDeadlineSeconds`` is patched, so a pod may run past its
+    guarantee freely.  Demand-driven preemption recovers capacity from an
+    overstaying pod only when needed (see ``preemption_loop``), deciding by
+    recomputing the guarantee live from reservation state
+    (``ControllerState.guarantee_end``) — never by reading these annotations
+    back.
 
-    Best-effort: logs a warning on failure but does not raise, so a deadline
-    enforcement failure never rolls back an already-applied toleration.
+    Best-effort: logs a warning on failure but does not raise, so a failure to
+    record the guarantee never rolls back an already-applied toleration.
     """
     try:
-        current = get_pod_active_deadline(fresh_pod)
-        if current is None or current > max_seconds:
-            await set_active_deadline(pod_name, namespace, max_seconds)
-            await emit_runtime_capped_event(
-                fresh_pod, pod_name, namespace, max_seconds
-            )
+        seconds = max(1, int((guaranteed_until - now).total_seconds()))
+        await annotate_runtime_guarantee(pod_name, namespace, seconds, guaranteed_until)
+        await emit_runtime_guaranteed_event(
+            fresh_pod, pod_name, namespace, seconds, guaranteed_until
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning(
-            "Failed to enforce activeDeadlineSeconds on pod %s/%s: %s",
+            "Failed to record runtime guarantee on pod %s/%s: %s",
             namespace,
             pod_name,
             exc,
@@ -473,8 +477,8 @@ async def _try_apply_toleration(
         fresh_pod = await read_pod(entry.pod_name, entry.pod_namespace)
 
         # Drop a pod that completed while queued — mirrors the on-demand path's
-        # terminal-phase drop, so a finished pod is never tolerated / capped
-        # (which would only fail into the deadline warning path) (CODE-REVIEW D1c).
+        # terminal-phase drop, so a finished pod is never tolerated / stamped with
+        # a guarantee (which would only fail into the warning path) (CODE-REVIEW D1c).
         if is_terminal_phase(fresh_pod):
             log.info(
                 "Pod %s/%s is %s; dropping from queue",
@@ -503,16 +507,17 @@ async def _try_apply_toleration(
                 booking_reference,
             )
             now = datetime.now(timezone.utc)
-            max_secs = state.compute_max_deadline_seconds(now, entry.reservation)
-            await _enforce_deadline(
-                entry.pod_name, entry.pod_namespace, fresh_pod, max_secs
+            guaranteed_until = state.compute_guaranteed_until(now, entry.reservation)
+            await _record_guarantee(
+                entry.pod_name, entry.pod_namespace, fresh_pod, guaranteed_until, now
             )
             await _enforce_scheduling_gate_removal(
                 entry.pod_name, entry.pod_namespace, fresh_pod, scheduling_gate_name
             )
             log.info(
                 "Admitted pod %s/%s under reservation #%d "
-                "(gpu-class=%s, gpus=%d, %d/%d free after placement, cap=%ds)",
+                "(gpu-class=%s, gpus=%d, %d/%d free after placement, "
+                "guaranteed until %s)",
                 entry.pod_namespace,
                 entry.pod_name,
                 entry.reservation.id,
@@ -520,7 +525,7 @@ async def _try_apply_toleration(
                 entry.gpu_requested,
                 state.available(entry.reservation),
                 entry.reservation.gpu_count,
-                max_secs,
+                guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
             )
         return True
 
@@ -558,7 +563,7 @@ async def _try_place_ondemand(
        within the single-threaded event loop.
     3. Re-read the pod; if it is gone or terminal, roll back and drop.
     4. Apply toleration.
-    5. Cap runtime to the block's window end and emit a RuntimeCapped event.
+    5. Record the guarantee (block's window end) and emit a RuntimeGuaranteed event.
     """
     now = datetime.now(timezone.utc)
     block = state.find_ondemand_block(
@@ -657,20 +662,23 @@ async def _try_place_ondemand(
             booking_reference,
         )
 
-        # Cap runtime to the on-demand block's window end (no back-to-back
-        # chaining) BEFORE lifting the scheduling gate: on a block whose whole
-        # premise is "free only until slot_end", the pod must not be allowed to
-        # start running with no deadline if the cap patch fails (CODE-REVIEW D1b).
-        remaining = max(int((state.effective_end(block) - datetime.now(timezone.utc)).total_seconds()), 1)
-        await _enforce_deadline(
-            candidate.pod_name, candidate.pod_namespace, fresh_pod, remaining
+        # Record the guarantee (block's window end, no back-to-back chaining)
+        # BEFORE lifting the scheduling gate: the guarantee annotations should
+        # be visible to any in-pod widget from the moment the pod can start
+        # running (CODE-REVIEW D1b; no longer a safety cap — demand-driven
+        # preemption, not a Kubernetes deadline, is what bounds this pod now).
+        now = datetime.now(timezone.utc)
+        guaranteed_until = state.effective_end(block)
+        await _record_guarantee(
+            candidate.pod_name, candidate.pod_namespace, fresh_pod, guaranteed_until, now
         )
         await _enforce_scheduling_gate_removal(
             candidate.pod_name, candidate.pod_namespace, fresh_pod, scheduling_gate_name
         )
         log.info(
             "Placed on-demand pod %s/%s onto block #%d "
-            "(gpu-class=%s, gpus=%d, block has %d/%d free after placement, cap=%ds)",
+            "(gpu-class=%s, gpus=%d, block has %d/%d free after placement, "
+            "guaranteed until %s)",
             candidate.pod_namespace,
             candidate.pod_name,
             block.id,
@@ -678,7 +686,7 @@ async def _try_place_ondemand(
             candidate.gpu_requested,
             state.available(block),
             block.gpu_count,
-            remaining,
+            guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
 
         return True

@@ -96,6 +96,23 @@ class TestComputeGuaranteedUntil:
             2024, 1, 15, 10, 0, tzinfo=timezone.utc
         )
 
+    def test_different_username_breaks_chain(self):
+        res1 = _user_reservation(1, username="student1", slot_index=0, start_time="08:00:00", duration_minutes=120)
+        res2 = _user_reservation(2, username="student2", slot_index=1, start_time="08:00:00", duration_minutes=120)
+        state = _state(res1, res2)
+        assert state.compute_guaranteed_until(NOW, res1) == datetime(
+            2024, 1, 15, 10, 0, tzinfo=timezone.utc
+        )
+
+    def test_different_gpu_class_breaks_chain(self):
+        res1 = _user_reservation(1, gpu_class_id=GPU_CLASS_ID, slot_index=0, start_time="08:00:00", duration_minutes=120)
+        res2 = _user_reservation(2, gpu_class_id=OTHER_CLASS_ID, slot_index=1, start_time="08:00:00", duration_minutes=120)
+        state = _state(res1, res2)
+        state.gpu_class_labels[OTHER_CLASS_ID] = OTHER_CLASS_LABEL
+        assert state.compute_guaranteed_until(NOW, res1) == datetime(
+            2024, 1, 15, 10, 0, tzinfo=timezone.utc
+        )
+
 
 # ---------------------------------------------------------------------------
 # guarantee_end (live, restart-safe, dispatches on reserved_path)

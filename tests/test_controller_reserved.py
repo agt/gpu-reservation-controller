@@ -1,7 +1,8 @@
 """Unit tests for the reserved-path logic in controller.py.
 
 Covers slot_start/slot_end accessors, find_best_reservation, enqueue_pod,
-dequeue_pod, compute_max_deadline_seconds, and reconcile_queue.
+dequeue_pod, and reconcile_queue.  Guarantee arithmetic
+(compute_guaranteed_until) is covered in test_guarantees.py.
 
 No Kubernetes or HTTP calls are made.
 """
@@ -192,80 +193,6 @@ class TestEnqueueDequeue:
     def test_dequeue_unknown_uid_is_noop(self):
         state = ControllerState()
         state.dequeue_pod("ghost-uid")  # must not raise
-
-
-# ---------------------------------------------------------------------------
-# compute_max_deadline_seconds
-# ---------------------------------------------------------------------------
-
-
-class TestComputeMaxDeadline:
-    """
-    All tests use FIXED_DATE (2024-01-15) with an 08:00 UTC start so that `now`
-    can be constructed explicitly without depending on the real wall clock.
-    """
-
-    def test_no_chain_returns_remaining_time(self):
-        res = _user_reservation(1, start_time="08:00:00", duration_minutes=120)
-        state = _state(res)
-        now = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)  # 1 hour into the 2-hour window
-        assert state.compute_max_deadline_seconds(now, res) == 3600
-
-    def test_window_expired_floors_at_one(self):
-        # B3: an expired window must floor at 1, never 0 — Kubernetes rejects
-        # activeDeadlineSeconds: 0, which would leave the pod uncapped.
-        res = _user_reservation(1, start_time="08:00:00", duration_minutes=120)
-        state = _state(res)
-        now = datetime(2024, 1, 15, 11, 0, tzinfo=timezone.utc)  # 1 hour after window ended
-        assert state.compute_max_deadline_seconds(now, res) == 1
-
-    def test_one_backtoback_adds_full_duration(self):
-        # res1: 08:00–10:00  res2: 10:00–12:00 (slot_index=1, same policy params)
-        res1 = _user_reservation(1, slot_index=0, start_time="08:00:00", duration_minutes=120)
-        res2 = _user_reservation(2, slot_index=1, start_time="08:00:00", duration_minutes=120)
-        state = _state(res1, res2)
-        now = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)  # 1 h into res1 → 1 h remaining
-        # 3600 (remaining in res1) + 7200 (full res2) = 10800
-        assert state.compute_max_deadline_seconds(now, res1) == 10800
-
-    def test_two_backtoback_adds_both_durations(self):
-        res1 = _user_reservation(1, slot_index=0, start_time="08:00:00", duration_minutes=120)
-        res2 = _user_reservation(2, slot_index=1, start_time="08:00:00", duration_minutes=120)
-        res3 = _user_reservation(3, slot_index=2, start_time="08:00:00", duration_minutes=120)
-        state = _state(res1, res2, res3)
-        now = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)
-        # 3600 + 7200 + 7200 = 18000
-        assert state.compute_max_deadline_seconds(now, res1) == 18000
-
-    def test_gap_breaks_chain(self):
-        res1 = _user_reservation(1, start_time="08:00:00", duration_minutes=120)
-        # 10:05 start creates a 5-minute gap after res1's 10:00 end
-        res2 = _user_reservation(2, start_time="10:05:00", duration_minutes=120)
-        state = _state(res1, res2)
-        now = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)
-        assert state.compute_max_deadline_seconds(now, res1) == 3600
-
-    def test_different_gpu_count_breaks_chain(self):
-        res1 = _user_reservation(1, gpu_count=2, slot_index=0, start_time="08:00:00", duration_minutes=120)
-        res2 = _user_reservation(2, gpu_count=1, slot_index=1, start_time="08:00:00", duration_minutes=120)
-        state = _state(res1, res2)
-        now = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)
-        assert state.compute_max_deadline_seconds(now, res1) == 3600
-
-    def test_different_username_breaks_chain(self):
-        res1 = _user_reservation(1, username="student1", slot_index=0, start_time="08:00:00", duration_minutes=120)
-        res2 = _user_reservation(2, username="student2", slot_index=1, start_time="08:00:00", duration_minutes=120)
-        state = _state(res1, res2)
-        now = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)
-        assert state.compute_max_deadline_seconds(now, res1) == 3600
-
-    def test_different_gpu_class_breaks_chain(self):
-        res1 = _user_reservation(1, gpu_class_id=GPU_CLASS_ID, slot_index=0, start_time="08:00:00", duration_minutes=120)
-        res2 = _user_reservation(2, gpu_class_id=OTHER_CLASS_ID, slot_index=1, start_time="08:00:00", duration_minutes=120)
-        state = _state(res1, res2)
-        state.gpu_class_labels[OTHER_CLASS_ID] = OTHER_CLASS_LABEL
-        now = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)
-        assert state.compute_max_deadline_seconds(now, res1) == 3600
 
 
 # ---------------------------------------------------------------------------

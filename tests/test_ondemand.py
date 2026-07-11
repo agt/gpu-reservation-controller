@@ -319,13 +319,14 @@ class TestCandidateManagement:
 
 
 # ---------------------------------------------------------------------------
-# Deadline arithmetic (slot_end - now, not chained)
+# Guarantee arithmetic (slot_end - now, not chained; effective_end == slot_end
+# for an unmerged block, so this doubles as the on-demand guarantee-until math)
 # ---------------------------------------------------------------------------
 
 
-class TestDeadlineArithmetic:
+class TestGuaranteeArithmetic:
     def test_remaining_is_not_chained(self):
-        """On-demand deadline must not chain across blocks (unlike reserved path)."""
+        """On-demand guarantee must not chain across blocks (unlike reserved path)."""
         block = _ondemand_block(1, duration_minutes=60)
         now = _now_inside_block(block)
         remaining = int((slot_end(block) - now).total_seconds())

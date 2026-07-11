@@ -231,22 +231,24 @@ class TestTryApplyToleration:
             calls["booking"] = booking
             calls["value"] = value
 
-        async def fake_set_deadline(pod_name, namespace, seconds):
-            calls["deadline"] = seconds
+        async def fake_annotate(pod_name, namespace, seconds, guaranteed_until):
+            calls["seconds"] = seconds
+            calls["guaranteed_until"] = guaranteed_until
 
         async def fake_emit(*args, **kwargs):
             pass
 
         monkeypatch.setattr(m, "read_pod", fake_read_pod)
         monkeypatch.setattr(m, "apply_toleration", fake_apply)
-        monkeypatch.setattr(m, "set_active_deadline", fake_set_deadline)
-        monkeypatch.setattr(m, "emit_runtime_capped_event", fake_emit)
+        monkeypatch.setattr(m, "annotate_runtime_guarantee", fake_annotate)
+        monkeypatch.setattr(m, "emit_runtime_guaranteed_event", fake_emit)
         result = asyncio.run(m._try_apply_toleration(state, "uid-1", entry))
 
         assert result is True
         assert calls["booking"] == "res-1"       # make_booking_reference round-trip
         assert calls["value"] == GPU_CLASS_LABEL
-        assert calls["deadline"] > 0             # capped, never 0 (B3 floor)
+        assert calls["seconds"] > 0              # never 0 (B3 floor, now in _record_guarantee)
+        assert calls["guaranteed_until"] == res.end_utc  # no chain, window end
         assert state.available(res) == 1         # 1 GPU now recorded as used
 
     def test_already_tolerated_pod_is_dequeued_without_reapplying(self, monkeypatch):

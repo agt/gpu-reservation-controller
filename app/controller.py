@@ -658,7 +658,7 @@ class ControllerState:
         exactly when the previous window ends (``slot_start(next) ==
         slot_end(previous)``).  *reservation* itself is **not** included.
 
-        Shared by ``compute_max_deadline_seconds`` (runtime-cap arithmetic) and
+        Shared by ``compute_guaranteed_until`` (runtime-guarantee arithmetic) and
         ``reservations_claimed_by`` (no-show protection) so both agree on what a
         single holder pod's session spans.
         """
@@ -705,28 +705,6 @@ class ControllerState:
             visited.add(next_res.id)
         return chain
 
-    def compute_max_deadline_seconds(
-        self,
-        now: datetime,
-        current_reservation: ReservationResponse,
-    ) -> int:
-        """Return the maximum permitted pod lifetime in seconds, anchored to *now*.
-
-        Sums the remaining time in *current_reservation* plus the full duration of
-        any back-to-back future reservations that share the same namespace, GPU class,
-        and gpu_count — with no gap between consecutive windows.
-
-        "Back-to-back" means slot_start(next) == slot_end(previous) exactly.
-        """
-        prev_end = slot_end(current_reservation)
-        total = max(0.0, (prev_end - now).total_seconds())
-        for res in self._chain_for(current_reservation, now):
-            total += (slot_end(res) - slot_start(res)).total_seconds()
-        # Floor at 1: Kubernetes rejects activeDeadlineSeconds: 0, and if the
-        # window expired between the caller's now-check and here the total can be
-        # zero.  Mirrors the on-demand path's max(remaining, 1) (CODE-REVIEW B3).
-        return max(1, int(total))
-
     def compute_guaranteed_until(
         self,
         now: datetime,
@@ -737,13 +715,12 @@ class ControllerState:
 
         The guarantee is the end of *current_reservation*'s window, extended
         across any back-to-back future reservations that share the same
-        namespace, GPU class, and gpu_count (see ``_chain_for``).  Unlike
-        ``compute_max_deadline_seconds`` this is not anchored to *now* beyond
-        selecting which future reservations still qualify as "future" — it
-        returns the chain's absolute end, which callers write to the pod as an
-        informational annotation.  No flooring: an absolute end may equal or
-        even (in a stale-data race) precede *now*; callers convert to a
-        duration in seconds where a positive value is required.
+        namespace, GPU class, and gpu_count (see ``_chain_for``).  *now* is
+        used only to select which future reservations still qualify as
+        "future" — the result is an absolute instant, which callers write to
+        the pod as an informational annotation.  No flooring: an absolute end
+        may equal or even (in a stale-data race) precede *now*; callers
+        convert to a duration in seconds where a positive value is required.
         """
         chain = self._chain_for(current_reservation, now)
         return slot_end(chain[-1]) if chain else slot_end(current_reservation)
@@ -966,7 +943,8 @@ class ControllerState:
         (CODE-REVIEW D4a): a wholesale reservation reload needs no re-application,
         the API models stay effectively immutable, and any other consumer of
         ``end_utc`` still sees the value the API returned.  On-demand placement
-        and the on-demand deadline cap read window ends through this method.
+        and the on-demand runtime guarantee (``guarantee_end``) read window
+        ends through this method.
         """
         merge = self.reclaim_merges.get(r.id)
         return merge.extended_end if merge is not None else slot_end(r)
