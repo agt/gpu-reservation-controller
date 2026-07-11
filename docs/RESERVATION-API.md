@@ -3,8 +3,11 @@
 This document covers every endpoint needed to build two external daemons:
 
 - **Kubernetes controller** — reads active reservations and manages pod
-  scheduling by injecting GPU-reservation tolerations and enforcing runtime
-  caps (`activeDeadlineSeconds`) on admitted pods.
+  scheduling by injecting GPU-reservation tolerations and recording each
+  admitted pod's runtime guarantee (informational annotations only — no
+  `activeDeadlineSeconds` is set).  Capacity is instead recovered from
+  overstaying pods on demand, only when an incoming reservation needs it; see
+  the controller's README for the demand-driven preemption model.
 - **Roster sync daemon** — provisions user accounts and manages usage-group
   membership from an institutional directory.
 
@@ -303,11 +306,12 @@ Every `ReservationResponse` includes pre-computed UTC timestamps:
 Use these directly — no timezone knowledge required:
 
 ```python
-# Python example — compute activeDeadlineSeconds for the k8s controller
+# Python example — compute a pod's runtime guarantee for the k8s controller
+# (informational only; no activeDeadlineSeconds is set on the pod)
 from datetime import datetime, timezone
 
 end = datetime.strptime(reservation["end_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-active_deadline_seconds = max(0, int((end - datetime.now(timezone.utc)).total_seconds()))
+guaranteed_seconds = max(1, int((end - datetime.now(timezone.utc)).total_seconds()))
 ```
 
 **How they are computed.** The server converts the stored local-time `start_dt` /
@@ -793,7 +797,7 @@ Returned by `GET /api/groups/{group_id}/members`.
 | `end_dt` | datetime (local, no suffix) | Reservation end; ≤ 48h after `start_dt` for non-privileged members; no server-side cap for admins/managers |
 | `date` | date | Calendar date of `start_dt` (convenience for filtering) |
 | `start_utc` | string (ISO 8601, `Z`) | Reservation start converted to UTC; use this for time comparisons |
-| `end_utc` | string (ISO 8601, `Z`) | Reservation end converted to UTC; use this for `activeDeadlineSeconds` |
+| `end_utc` | string (ISO 8601, `Z`) | Reservation end converted to UTC; the controller uses this to compute a pod's runtime guarantee (no `activeDeadlineSeconds` is set) |
 | `gpu_count` | integer | Number of GPUs reserved |
 | `su_cost` | number | Total Service Units consumed (stored at creation) |
 | `kind` | `"booking"` \| `"reclaim"` | `"booking"` = normal user reservation; `"reclaim"` = admin-only capacity hold |
