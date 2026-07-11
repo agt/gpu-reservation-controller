@@ -82,11 +82,6 @@ def is_terminal_phase(pod) -> bool:
     return get_pod_phase(pod) in TERMINAL_PHASES
 
 
-def get_pod_active_deadline(pod) -> Optional[int]:
-    """Return the pod's ``spec.activeDeadlineSeconds``, or ``None`` if unset."""
-    return pod.spec.active_deadline_seconds if pod.spec else None
-
-
 def get_pod_creation_timestamp(pod) -> Optional[datetime]:
     """Return the pod's ``metadata.creationTimestamp``, or ``None`` if unset."""
     return pod.metadata.creation_timestamp
@@ -308,14 +303,6 @@ class ToleratedPodInfo:
     gpu_count: int
     phase: str
     scheduled_false: bool  # PodScheduled condition present with status == "False"
-    # Deadline-projection inputs (take-back in-use checks): the pod's projected
-    # end is ``start_time + active_deadline_seconds``.  ``None`` when unset or
-    # not yet started — consumers must treat that as unbounded (fail safe).
-    # TODO(preemption): retired once the take-back projection is re-based on
-    # ``ControllerState.guarantee_end`` (see docs/plan) — kept for now so the
-    # existing take-back handler keeps working until that cutover lands.
-    active_deadline_seconds: Optional[int] = None
-    start_time: Optional[datetime] = None
     # Set when the pod has been marked for deletion (``metadata.deletionTimestamp``).
     # A terminating pod is excluded from residency accounting (preemption
     # planning) and is never selected as a preemption victim (it is already on
@@ -356,8 +343,6 @@ async def snapshot_tolerated_pods(toleration_key: str) -> list[ToleratedPodInfo]
                 gpu_count=get_pod_gpu_count(pod),
                 phase=get_pod_phase(pod),
                 scheduled_false=(scheduled is not None and scheduled.status == "False"),
-                active_deadline_seconds=get_pod_active_deadline(pod),
-                start_time=pod.status.start_time if pod.status else None,
                 deletion_timestamp=pod.metadata.deletion_timestamp,
             )
         )

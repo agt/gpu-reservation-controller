@@ -1440,14 +1440,18 @@ async def take_back_reclaim_blocks(
 
     The app calls this before committing a booking built from capacity the
     controller is holding (e.g. a tentative offer inside the preempt guard).
-    All-or-nothing: if any requested block is in use — a pod admitted on it, or
-    a merged extension a running job's deadline reaches into — the whole request
-    fails with 409 and nothing changes.  On success the blocks leave the
-    controller's scheduling universe immediately (absorbed blocks are detached
-    from their merge subject) and are tombstoned so a stale fetch cannot
-    resurrect them; pushing the id back (``POST /api/reservations/push``) is the
-    restore path if the booking falls through.  503 when idleness cannot be
-    verified (pod snapshot failed) — fail closed, nothing granted.
+    All-or-nothing: if any requested block is in use — a pod still within its
+    runtime guarantee is admitted on it, or a merged extension a guaranteed
+    job reaches into — the whole request fails with 409 and nothing changes.
+    A pod *past* its runtime guarantee never blocks a take-back — a take-back
+    request is itself explicit demand for the capacity, so granting it deletes
+    such overstaying pods immediately rather than waiting for the next
+    preemption sweep.  On success the blocks leave the controller's scheduling
+    universe immediately (absorbed blocks are detached from their merge
+    subject) and are tombstoned so a stale fetch cannot resurrect them;
+    pushing the id back (``POST /api/reservations/push``) is the restore path
+    if the booking falls through.  503 when idleness cannot be verified (pod
+    snapshot failed) — fail closed, nothing granted.
     """
     state: ControllerState = request.app.state.controller_state
     config: Config = request.app.state.config
@@ -1466,23 +1470,30 @@ async def take_back_reclaim_blocks(
                 detail="Cannot verify block idleness (pod snapshot failed); retry later",
             )
 
-        # Projected end per live pod, keyed by the reservation id it occupies.
-        # None = unknown/unbounded (fail safe).  In-memory occupancy is merged
-        # in to cover pods whose admission patch is still in flight (recorded
-        # synchronously before any await) and thus not yet visible to the LIST.
-        # No await may occur between here and take_back_blocks: that keeps the
-        # check-and-mutate atomic against the placement coroutines.
+        # Runtime-guarantee end per live pod, keyed by the reservation id it
+        # occupies — recomputed live (no Kubernetes deadline is set any more)
+        # rather than read back from a frozen activeDeadlineSeconds.  A pod
+        # whose guarantee has already elapsed is mapped to *now* itself, never
+        # to None: None keeps exactly one meaning below (unknown/in-flight,
+        # unbounded, fail safe).  In-memory occupancy is merged in to cover
+        # pods whose admission patch is still in flight (recorded
+        # synchronously before any await) and thus not yet visible to the
+        # LIST.  No await may occur between here and take_back_blocks: that
+        # keeps the check-and-mutate atomic against the placement coroutines.
         pod_ends: dict[int, list[datetime | None]] = {}
         seen_uids: set[str] = set()
         for p in snapshot:
             if p.phase not in ("Running", "Pending") or p.reservation_id is None:
                 continue
             seen_uids.add(p.uid)
-            if p.active_deadline_seconds is not None and p.start_time is not None:
-                projected = p.start_time + timedelta(seconds=p.active_deadline_seconds)
-            else:
-                projected = None
-            pod_ends.setdefault(p.reservation_id, []).append(projected)
+            guarantee = state.guarantee_end(
+                p.reservation_id,
+                reserved_path=is_reserved_path(p.booking_reference),
+                now=now,
+            )
+            pod_ends.setdefault(p.reservation_id, []).append(
+                guarantee if guarantee is not None else now
+            )
         for rid, occupants in state.occupancy.items():
             for uid in occupants:
                 if uid not in seen_uids:
@@ -1495,6 +1506,26 @@ async def take_back_reclaim_blocks(
             unknown_expiry=now
             + timedelta(seconds=2 * config.reservation_fetch_interval),
         )
+
+        # On grant, delete any live pod still recorded under a granted id —
+        # the occupied check above already proved it is past its runtime
+        # guarantee, so this is a provable preemption, not a guess.  Runs
+        # under the same lock as the eviction paths above it (mirrors
+        # _handle_cancelled_reservations / the preemption sweep).
+        if result.granted:
+            granted_ids = set(result.taken_back) | set(result.unknown)
+            for p in snapshot:
+                if (
+                    p.reservation_id in granted_ids
+                    and p.phase in ("Running", "Pending")
+                    and p.deletion_timestamp is None
+                ):
+                    message = (
+                        f"Block #{p.reservation_id} taken back by the reservation "
+                        f"app to be re-booked; the pod had already run past its "
+                        f"runtime guarantee."
+                    )
+                    await _preempt_pod(state, p.namespace, p.name, p.uid, message)
 
     if result.invalid:
         log.info(

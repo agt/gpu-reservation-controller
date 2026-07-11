@@ -1396,34 +1396,41 @@ class ControllerState:
         mutation are atomic with respect to the placement coroutines (which
         record occupancy synchronously before their first ``await``).
 
-        *pod_ends_by_reservation* maps reservation id → the projected end of
-        each live pod admitted under it (``None`` = unknown/unbounded, treated
-        as running forever — fail safe).  *unknown_expiry* is the tombstone
-        expiry for ids the controller has never seen: it can never have placed
-        pods on such a block, so the take-back is granted, and the tombstone is
-        pinned to the real window the first time a fetch observes the id
+        *pod_ends_by_reservation* maps reservation id → the runtime-guarantee
+        end of each live pod admitted under it, computed by the caller via
+        ``guarantee_end`` (``None`` = unknown/unbounded — an in-flight
+        placement not yet visible to the pod snapshot — treated as running
+        forever, fail safe; a *resolved* pod past its guarantee is mapped to
+        some instant ``<= now``, never to ``None``, so it never trips the
+        fail-safe branch).  *unknown_expiry* is the tombstone expiry for ids
+        the controller has never seen: it can never have placed pods on such a
+        block, so the take-back is granted, and the tombstone is pinned to the
+        real window the first time a fetch observes the id
         (``filter_taken_back``).
 
-        Conflict reasons: ``occupied`` (a live pod is admitted under the block
-        itself), ``claimed`` (a chained reserved holder occupies it — defensive;
-        holders never chain into reclaim blocks today), ``extension-in-use``
-        (the block was absorbed into a merge and a pod on the merge's subject
-        projects past the block's start).  A requested id resolving to a
-        non-reclaim reservation lands in ``invalid``.  Any conflict or invalid
-        id ⇒ nothing is mutated.
+        Conflict reasons: ``occupied`` (a live pod under the block itself is
+        still within its runtime guarantee), ``claimed`` (a chained reserved
+        holder occupies it — defensive; holders never chain into reclaim
+        blocks today), ``extension-in-use`` (the block was absorbed into a
+        merge and a pod on the merge's subject is guaranteed past the block's
+        start).  A pod past its guarantee never counts as occupying or
+        extending into a block — it is a preemption candidate, not a blocker
+        (the caller deletes it once the grant is confirmed).  A requested id
+        resolving to a non-reclaim reservation lands in ``invalid``.  Any
+        conflict or invalid id ⇒ nothing is mutated.
 
         On success, an absorbed stub's merge record is truncated at the earliest
-        taken stub: earlier stubs stay stubbed (a running job's extended
-        deadline may still reach them), later untaken stubs detach back to
-        standalone blocks (reported in ``detached``) — a taken block leaves a
-        hole, so they no longer abut the subject.  Taking a merge *subject*
-        (provably idle, so no deadline extends anywhere) dissolves its record
-        and detaches all untaken stubs.  Merge rediscovery is deliberately NOT
+        taken stub: earlier stubs stay stubbed (a running job's guarantee may
+        still reach them), later untaken stubs detach back to standalone
+        blocks (reported in ``detached``) — a taken block leaves a hole, so
+        they no longer abut the subject.  Taking a merge *subject* (provably
+        idle, so no guarantee extends anywhere) dissolves its record and
+        detaches all untaken stubs.  Merge rediscovery is deliberately NOT
         run here: the overlay is already consistent after surgical truncation,
         and the next tick / refresh runs ``reconcile_reclaim_merges`` anyway.
         (Wholesale dissolve-and-rediscover would be unsafe: discovery skips a
         claimed subject and would un-stub earlier absorbed blocks a still-running
-        extended job may occupy.)
+        guaranteed job may occupy.)
         """
         by_id: dict[int, ReservationResponse] = {r.id: r for r in self.reservations}
         for rid, r in self.cancelled_reservations.items():
@@ -1437,11 +1444,11 @@ class ControllerState:
             for aid in merge.absorbed_ids
         }
 
-        def _busy_past(reservation_id: int, cut: Optional[datetime]) -> bool:
-            """True if any live pod under *reservation_id* projects past *cut*
-            (``cut=None`` ⇒ any live pod at all)."""
+        def _busy_past(reservation_id: int, cut: datetime) -> bool:
+            """True if any live pod under *reservation_id* is guaranteed past *cut*
+            (``end is None`` ⇒ unknown/in-flight, treated as unbounded — fail safe)."""
             for end in pod_ends_by_reservation.get(reservation_id, []):
-                if cut is None or end is None or end > cut:
+                if end is None or end > cut:
                     return True
             return False
 
@@ -1459,11 +1466,13 @@ class ControllerState:
             if res is not None and res.kind != "reclaim":
                 invalid.append(TakeBackConflict(rid, "not-a-reclaim-block"))
                 continue
-            # A live pod admitted directly under the block.  Checked for
-            # unknown ids too: occupancy rebuilt from pod annotations (e.g.
-            # after a controller restart) can reference ids the current
-            # reservation list does not.
-            if _busy_past(rid, None):
+            # A live pod admitted directly under the block, still within its
+            # runtime guarantee.  Checked for unknown ids too: occupancy
+            # rebuilt from pod annotations (e.g. after a controller restart)
+            # can reference ids the current reservation list does not.  A pod
+            # past its guarantee (mapped to some instant <= now, never None)
+            # does not trip this — it is provably preemptible, not a blocker.
+            if _busy_past(rid, now):
                 conflicts.append(TakeBackConflict(rid, "occupied"))
                 continue
             if rid in self.claimed_reservation_ids:
@@ -1473,7 +1482,11 @@ class ControllerState:
                 unknown.append(rid)
                 continue
             subject_id = subject_of_stub.get(rid)
-            if subject_id is not None and _busy_past(subject_id, slot_start(res)):
+            # The subject must be guaranteed past *both* the stub's start and
+            # the current instant: a subject occupant whose own guarantee has
+            # already elapsed must not block a take-back merely because the
+            # stub's window happens to have started in the past too.
+            if subject_id is not None and _busy_past(subject_id, max(slot_start(res), now)):
                 conflicts.append(TakeBackConflict(rid, "extension-in-use"))
                 continue
             taken.append(rid)

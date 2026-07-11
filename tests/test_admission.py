@@ -130,7 +130,7 @@ def _main_module(monkeypatch):
     return main_module
 
 
-def _pod(*, uid="uid-1", phase="Pending", tolerations=None, deadline=None):
+def _pod(*, uid="uid-1", phase="Pending", tolerations=None):
     return SimpleNamespace(
         metadata=SimpleNamespace(
             uid=uid, name="pod-1", namespace=USERNAME,
@@ -139,7 +139,6 @@ def _pod(*, uid="uid-1", phase="Pending", tolerations=None, deadline=None):
         status=SimpleNamespace(phase=phase, conditions=None),
         spec=SimpleNamespace(
             tolerations=tolerations if tolerations is not None else [],
-            active_deadline_seconds=deadline,
             containers=[],
             scheduling_gates=None,
         ),

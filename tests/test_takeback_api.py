@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
-from app.controller import ControllerState
+from app.controller import ControllerState, ReclaimMerge
 from app.k8s_client import ToleratedPodInfo
 from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, block as _block
 from tests.test_push_api import _patched_main
@@ -84,6 +84,82 @@ def test_occupied_block_conflicts_and_nothing_mutates():
     assert [(c.reservation_id, c.reason) for c in result.conflicts] == [(1, "occupied")]
     assert [r.id for r in state.reservations] == [1]
     assert state.taken_back == {}
+
+
+def test_past_guarantee_pod_never_blocks_occupied_check():
+    """A pod mapped to some instant <= now (a resolved, past-guarantee
+    occupant — never None, which retains its own "unknown/unbounded"
+    meaning) must not block the take-back: it is a preemption candidate,
+    not an occupant."""
+    now = datetime.now(timezone.utc)
+    b = _block(1, now - timedelta(hours=1), now + timedelta(hours=1))
+    state = _state(b)
+
+    result = state.take_back_blocks(
+        {1}, {1: [now - timedelta(minutes=5)]}, now, _expiry(now)
+    )
+
+    assert result.granted
+    assert result.taken_back == [1]
+
+
+def test_within_guarantee_pod_still_blocks_occupied_check():
+    now = datetime.now(timezone.utc)
+    b = _block(1, now - timedelta(hours=1), now + timedelta(hours=1))
+    state = _state(b)
+
+    result = state.take_back_blocks(
+        {1}, {1: [now + timedelta(minutes=5)]}, now, _expiry(now)
+    )
+
+    assert not result.granted
+    assert [(c.reservation_id, c.reason) for c in result.conflicts] == [(1, "occupied")]
+
+
+def test_extension_check_subject_past_guarantee_after_stub_started_grants():
+    """The extension-in-use cut is max(stub's slot_start, now): once the
+    stub's own window has begun, a subject pod whose guarantee has ALSO
+    elapsed (relative to *now*, not just relative to the stub's start) must
+    not block taking back the stub."""
+    now = datetime.now(timezone.utc)
+    t0 = now - timedelta(minutes=90)
+    t1 = now - timedelta(minutes=30)  # subject's own end / stub start: already begun
+    t2 = t1 + timedelta(minutes=90)  # stub end: still in the future
+    subject = _block(1, t0, t1)
+    stub = _block(2, t1, t2)
+    state = _state(subject, stub)
+    state.reclaim_merges[1] = ReclaimMerge(subject_id=1, absorbed_ids=[2], extended_end=t2)
+    state.merged_stub_ids = {2}
+    # With the old cut (slot_start(stub)=t1, itself already in the past) this
+    # pod's end would still have projected past it; with cut=max(t1, now)=now
+    # it does not, because the pod's own guarantee has also elapsed.
+    pod_ends = {1: [now - timedelta(minutes=5)]}
+
+    result = state.take_back_blocks({2}, pod_ends, now, _expiry(now))
+
+    assert result.granted and result.taken_back == [2]
+
+
+def test_extension_check_subject_still_guaranteed_after_stub_started_blocks():
+    """Same shape, but the subject pod's guarantee has not yet elapsed — the
+    stub must still be protected even though its own window already started."""
+    now = datetime.now(timezone.utc)
+    t0 = now - timedelta(minutes=90)
+    t1 = now - timedelta(minutes=30)
+    t2 = t1 + timedelta(minutes=90)
+    subject = _block(1, t0, t1)
+    stub = _block(2, t1, t2)
+    state = _state(subject, stub)
+    state.reclaim_merges[1] = ReclaimMerge(subject_id=1, absorbed_ids=[2], extended_end=t2)
+    state.merged_stub_ids = {2}
+    pod_ends = {1: [now + timedelta(minutes=5)]}
+
+    result = state.take_back_blocks({2}, pod_ends, now, _expiry(now))
+
+    assert not result.granted
+    assert [(c.reservation_id, c.reason) for c in result.conflicts] == [
+        (2, "extension-in-use")
+    ]
 
 
 def test_all_or_nothing_rejects_idle_blocks_too():
@@ -452,6 +528,55 @@ def test_takeback_occupied_returns_409(monkeypatch):
         assert resp.json()["detail"]["in_use"] == [{"id": 1, "reason": "occupied"}]
         assert [r.id for r in state.reservations] == [1]
         assert state.taken_back == {}
+
+
+def test_takeback_past_guarantee_occupant_granted_and_deleted(monkeypatch):
+    """The defining behavioral change: a pod still running past its block's
+    window (no Kubernetes deadline enforces vacating any more) never blocks a
+    take-back, and granting the request deletes it immediately rather than
+    waiting for the next preemption sweep."""
+    main = _patched_main(monkeypatch, token="secret")
+
+    pod = ToleratedPodInfo(
+        namespace="alice", name="pod-1", uid="uid-1", gpu_class=GPU_CLASS_LABEL,
+        booking_reference="ondemand-1", reservation_id=1, gpu_count=2,
+        phase="Running", scheduled_false=False,
+    )
+
+    async def _snapshot(_key):
+        return [pod]
+
+    deleted = []
+    events = []
+
+    async def _read_pod(name, namespace):
+        return object()
+
+    async def _delete_pod(name, namespace):
+        deleted.append((namespace, name))
+
+    async def _emit_preempted(pod_obj, name, namespace, message):
+        events.append((namespace, name, message))
+
+    monkeypatch.setattr(main, "snapshot_tolerated_pods", _snapshot)
+    monkeypatch.setattr(main, "read_pod", _read_pod)
+    monkeypatch.setattr(main, "delete_pod", _delete_pod)
+    monkeypatch.setattr(main, "emit_preempted_event", _emit_preempted)
+
+    with TestClient(main.app) as client:
+        state = main.app.state.controller_state
+        now = datetime.now(timezone.utc)
+        # The block's own window already ended — its occupant is overstaying.
+        expired_block = _block(1, now - timedelta(hours=2), now - timedelta(minutes=5))
+        state.reservations = [expired_block]
+
+        resp = _post(client, [1])
+
+        assert resp.status_code == 200
+        assert resp.json()["taken_back"] == [1]
+        assert deleted == [("alice", "pod-1")]
+        assert len(events) == 1
+        assert state.reservations == []
 
 
 def test_takeback_snapshot_failure_fails_closed_503(monkeypatch):
