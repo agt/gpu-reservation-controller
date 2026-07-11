@@ -659,6 +659,73 @@ class ControllerState:
         # zero.  Mirrors the on-demand path's max(remaining, 1) (CODE-REVIEW B3).
         return max(1, int(total))
 
+    def compute_guaranteed_until(
+        self,
+        now: datetime,
+        current_reservation: ReservationResponse,
+    ) -> datetime:
+        """Return the absolute UTC end of the runtime guarantee for a reserved-path
+        admission under *current_reservation*.
+
+        The guarantee is the end of *current_reservation*'s window, extended
+        across any back-to-back future reservations that share the same
+        namespace, GPU class, and gpu_count (see ``_chain_for``).  Unlike
+        ``compute_max_deadline_seconds`` this is not anchored to *now* beyond
+        selecting which future reservations still qualify as "future" — it
+        returns the chain's absolute end, which callers write to the pod as an
+        informational annotation.  No flooring: an absolute end may equal or
+        even (in a stale-data race) precede *now*; callers convert to a
+        duration in seconds where a positive value is required.
+        """
+        chain = self._chain_for(current_reservation, now)
+        return slot_end(chain[-1]) if chain else slot_end(current_reservation)
+
+    def guarantee_end(
+        self,
+        reservation_id: Optional[int],
+        *,
+        reserved_path: bool,
+        now: datetime,
+    ) -> Optional[datetime]:
+        """Return the absolute UTC end of the runtime guarantee for a pod admitted
+        under *reservation_id*, or ``None`` if no live guarantee can be resolved.
+
+        This is the live, restart-safe replacement for the frozen
+        ``activeDeadlineSeconds`` a pod used to be capped at: it is recomputed
+        from current window arithmetic on every call rather than read back from
+        the pod, so a pod's guarantee can grow (an abutting follow-on booking, a
+        landed reclaim merge) the way a Kubernetes deadline never could.
+
+        ``reserved_path=True`` (booking-reference prefix ``res-``): looks up
+        *reservation_id* in ``self.reservations`` and returns the end of its
+        back-to-back chain (``compute_guaranteed_until``).  ``None`` if the
+        reservation is no longer in the active list — its window is over and
+        the pod is unconditionally past guarantee.
+
+        ``reserved_path=False`` (``ondemand-`` / ``noshow-``): looks up
+        *reservation_id* in the active reservations or in
+        ``cancelled_reservations`` and returns ``effective_end`` (the
+        reclaim-merge-extended window end).  ``None`` if the block is in
+        neither — same "window is over" meaning.
+
+        ``reservation_id=None`` (a pod not admitted by this controller, or
+        whose booking-reference does not parse) always returns ``None``: it is
+        never "ours" to guarantee, and it is never a preemption victim.
+        """
+        if reservation_id is None:
+            return None
+        if reserved_path:
+            res = next((r for r in self.reservations if r.id == reservation_id), None)
+            if res is None:
+                return None
+            return self.compute_guaranteed_until(now, res)
+        res = next((r for r in self.reservations if r.id == reservation_id), None)
+        if res is None:
+            res = self.cancelled_reservations.get(reservation_id)
+        if res is None:
+            return None
+        return self.effective_end(res)
+
     def reservations_claimed_by(
         self,
         reservation_id: int,
