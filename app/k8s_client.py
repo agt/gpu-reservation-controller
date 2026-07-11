@@ -607,6 +607,35 @@ async def delete_pod(name: str, namespace: str) -> None:
         raise
 
 
+async def emit_preempted_event(
+    pod,
+    pod_name: str,
+    namespace: str,
+    message: str,
+) -> None:
+    """Create a Kubernetes Event linked to *pod* with reason='Preempted'.
+
+    Emitted when the preemption sweep or a take-back grant deletes a pod
+    running past its runtime guarantee to recover capacity.  The caller builds
+    *message* (it knows whether the trigger was boundary demand or a
+    take-back grant, and how long the pod overstayed).
+    """
+    await _emit_pod_event(
+        pod,
+        pod_name,
+        namespace,
+        name_prefix="gpu-preempt-",
+        reason="Preempted",
+        action="PreemptPod",
+        message=message,
+    )
+    log.info(
+        "Emitted Preempted event for pod %s/%s",
+        namespace,
+        pod_name,
+    )
+
+
 async def emit_reservation_cancelled_event(
     pod,
     pod_name: str,

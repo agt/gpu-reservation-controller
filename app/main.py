@@ -1,10 +1,12 @@
 """GPU Reservation Kubernetes Controller — entry point.
 
-Starts three background asyncio tasks inside a FastAPI lifespan:
+Starts four background asyncio tasks inside a FastAPI lifespan:
 
 1. reservation_fetch_loop  — periodically refreshes the reservation list
 2. pod_watch_loop          — streams pod events and updates the work queue
 3. queue_processor_loop    — applies tolerations when reservation windows open
+4. preemption_loop         — recovers capacity from overstaying pods near a
+                              reservation boundary (demand-driven preemption)
 
 Additionally, when a pod is detected arriving *inside* an already-open
 reservation window (e.g. a JupyterHub notebook pod), the pod-watch loop
@@ -24,7 +26,7 @@ import random
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 
@@ -33,6 +35,7 @@ from .controller import (
     TOLERATION_KEY,
     ControllerState,
     OnDemandCandidate,
+    PodRuntimeView,
     QueueEntry,
     apply_push_to_active,
     canceller_description,
@@ -47,6 +50,7 @@ from .k8s_client import (
     PodWatcher,
     apply_toleration,
     delete_pod,
+    emit_preempted_event,
     emit_reservation_cancelled_event,
     emit_reservation_reassigned_event,
     emit_runtime_capped_event,
@@ -67,6 +71,7 @@ from .k8s_client import (
     read_pod,
     remove_scheduling_gate,
     set_active_deadline,
+    snapshot_node_gpu_capacity,
     snapshot_tolerated_pods,
 )
 from .reservation_client import ReservationClient
@@ -1044,6 +1049,163 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Background loop 4: preemption sweep
+# ---------------------------------------------------------------------------
+
+
+def _pod_view(p) -> PodRuntimeView:
+    """Digest a ``k8s_client.ToleratedPodInfo`` into the plain view the pure
+    preemption-planning functions in controller.py operate on."""
+    return PodRuntimeView(
+        uid=p.uid,
+        namespace=p.namespace,
+        name=p.name,
+        gpu_class=p.gpu_class,
+        gpu_count=p.gpu_count,
+        reservation_id=p.reservation_id,
+        reserved_path=is_reserved_path(p.booking_reference),
+        node_resident=(p.phase == "Running" or (p.phase == "Pending" and not p.scheduled_false)),
+        terminating=p.deletion_timestamp is not None,
+    )
+
+
+def _preemption_message(
+    state: ControllerState, view: PodRuntimeView, boundary: datetime, now: datetime
+) -> str:
+    """Build the human-readable ``Preempted`` event message for *view*."""
+    end = state.guarantee_end(view.reservation_id, reserved_path=view.reserved_path, now=now)
+    if end is not None:
+        overstay = max(0, int((now - end).total_seconds()))
+        minutes, secs = divmod(overstay, 60)
+        hours, minutes = divmod(minutes, 60)
+        human = f"{hours}h{minutes:02d}m{secs:02d}s" if hours else f"{minutes}m{secs:02d}s"
+        guarantee_desc = f"overstayed its runtime guarantee by {human}"
+    else:
+        guarantee_desc = "its runtime guarantee could no longer be resolved (reservation no longer active)"
+    return (
+        f"Pod preempted to free capacity for reservation(s) starting "
+        f"{boundary.strftime('%Y-%m-%dT%H:%M:%SZ')}: {guarantee_desc}."
+    )
+
+
+async def _preempt_pod(
+    state: ControllerState, namespace: str, name: str, uid: str, message: str
+) -> None:
+    """Delete an overstaying pod to recover capacity.
+
+    Shared by the preemption sweep and the take-back grant path.  Mirrors
+    ``_handle_cancelled_reservations``'s shape exactly: emit the event before
+    deleting (best-effort — a failed emit does not block the delete), then
+    delete and release occupancy together (best-effort — if the delete fails,
+    occupancy is left as-is since the pod may still be there).
+    """
+    try:
+        pod_obj = await read_pod(name, namespace)
+        await emit_preempted_event(pod_obj, name, namespace, message)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Could not emit Preempted event for pod %s/%s: %s", namespace, name, exc
+        )
+    try:
+        await delete_pod(name, namespace)
+        state.release_pod(uid)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not delete pod %s/%s: %s", namespace, name, exc)
+
+
+async def _run_preemption_sweep(
+    state: ControllerState, config: Config, now: Optional[datetime] = None
+) -> None:
+    """One preemption-sweep evaluation: clear demand at any in-scope boundary.
+
+    For each slot boundary within ``PREEMPTION_LEAD_MINUTES`` of *now* whose
+    phase ("A" = lead-time, "B" = at-boundary) has not already been evaluated,
+    plan the kills needed to cover its demand and execute them.  The two
+    snapshots (pods, node capacity) are taken outside the lock; either
+    failing skips the whole sweep with a WARNING — the controller never kills
+    a pod based on unknown physical state.  Planning and the resulting
+    deletions run under ``reservation_lock`` (mirrors the take-back handler
+    and the cancellation/owner-change eviction paths); boundaries are
+    processed in ascending order with a running ``doomed`` set so one sweep
+    never double-selects a pod's GPUs across two boundaries.
+    """
+    now = now or datetime.now(timezone.utc)
+    lead = timedelta(minutes=config.preemption_lead_minutes)
+    state.prune_preemption_marks(now, lead)
+    boundaries = state.upcoming_boundaries(now, lead)
+    if not boundaries:
+        return
+
+    try:
+        snapshot = await snapshot_tolerated_pods(TOLERATION_KEY)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Preemption sweep: failed to snapshot pods: %s", exc, exc_info=True)
+        return
+    try:
+        capacity = await snapshot_node_gpu_capacity(TOLERATION_KEY)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Preemption sweep: failed to snapshot node GPU capacity: %s", exc, exc_info=True
+        )
+        return
+
+    async with state.reservation_lock:
+        pods = [_pod_view(p) for p in snapshot]
+        doomed: set[str] = set()
+        to_kill: list[tuple[PodRuntimeView, str]] = []
+        for boundary in boundaries:
+            phase = "B" if boundary <= now else "A"
+            fired = state.preemption_fired.setdefault(boundary, set())
+            if phase in fired:
+                continue
+            fired.add(phase)
+            available_pods = [p for p in pods if p.uid not in doomed]
+            plan = state.plan_boundary_preemption(boundary, capacity, available_pods, now)
+            if plan.demand_by_class:
+                log.info(
+                    "Preemption sweep boundary=%s phase=%s: demand=%s free=%s kills=%d",
+                    boundary.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    phase,
+                    plan.demand_by_class,
+                    plan.free_by_class,
+                    len(plan.victims),
+                )
+            for gpu_class, shortfall in plan.unmet_by_class.items():
+                log.warning(
+                    "Preemption sweep boundary=%s phase=%s: %d GPU(s) of gpu-class=%s "
+                    "still short after preempting all eligible overstayers",
+                    boundary.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    phase,
+                    shortfall,
+                    gpu_class,
+                )
+            for victim in plan.victims:
+                doomed.add(victim.uid)
+                to_kill.append((victim, _preemption_message(state, victim, boundary, now)))
+
+        for victim, message in to_kill:
+            log.info(
+                "Preempting pod %s/%s (gpu-class=%s, gpus=%d): %s",
+                victim.namespace,
+                victim.name,
+                victim.gpu_class,
+                victim.gpu_count,
+                message,
+            )
+            await _preempt_pod(state, victim.namespace, victim.name, victim.uid, message)
+
+
+async def preemption_loop(state: ControllerState, config: Config) -> None:
+    """Every ``config.preemption_check_interval`` s, run a preemption sweep."""
+    while True:
+        await asyncio.sleep(config.preemption_check_interval)
+        try:
+            await _run_preemption_sweep(state, config)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Preemption sweep failed: %s", exc, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 
@@ -1092,7 +1254,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             config.reservation_fetch_interval,
         )
 
-    # Launch the three background loops as asyncio tasks.
+    # Launch the four background loops as asyncio tasks.
     tasks = [
         asyncio.create_task(
             reservation_fetch_loop(state, client, config),
@@ -1100,6 +1262,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
         asyncio.create_task(pod_watch_loop(state, config), name="pod-watch"),
         asyncio.create_task(queue_processor_loop(state, config), name="queue-processor"),
+        asyncio.create_task(preemption_loop(state, config), name="preemption"),
     ]
     log.info("GPU reservation controller started")
 
