@@ -85,6 +85,12 @@ config:
   # needs capacity freed, and whether any just-expired blocks need cleanup).
   preemptionCheckInterval: 60
 
+  # Re-link an overstay pod (one running past its runtime guarantee) to a
+  # reservation the same user has since booked, so it is no longer treated as
+  # overstay.  Set to false to disable and leave such pods eligible for
+  # preemption.
+  overstayAdoptionEnabled: true
+
 # ---------------------------------------------------------------------------
 # ServiceAccount and RBAC
 # ---------------------------------------------------------------------------

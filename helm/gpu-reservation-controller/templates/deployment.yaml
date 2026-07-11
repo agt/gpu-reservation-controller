@@ -73,6 +73,8 @@ spec:
               value: {{ .Values.config.preemptionLeadMinutes | quote }}
             - name: PREEMPTION_CHECK_INTERVAL
               value: {{ .Values.config.preemptionCheckInterval | quote }}
+            - name: OVERSTAY_ADOPTION_ENABLED
+              value: {{ .Values.config.overstayAdoptionEnabled | quote }}
             {{- if .Values.inboundApiTokenSecret.name }}
             # Enables the inbound reservation-push API (POST /api/reservations/push).
             # Omit the secret to leave the endpoint disabled (returns 503).

@@ -584,6 +584,43 @@ class ControllerState:
             return None
         return min(candidates, key=slot_start)
 
+    def find_open_booking_for(
+        self,
+        namespace: str,
+        gpu_class_label: str,
+        now: datetime,
+        gpu_requested: int,
+        extra_used: Optional[dict[int, int]] = None,
+    ) -> Optional[ReservationResponse]:
+        """Find a *currently-open* booking *namespace* holds that can adopt a pod.
+
+        Used to re-link an overstay pod (one running past its runtime guarantee)
+        to a reservation the same user has since booked, so it is no longer a
+        preemption victim.  Unlike ``find_best_reservation`` this requires the
+        window to be **open right now** (``slot_start <= now < slot_end``) and to
+        have spare budget for *gpu_requested*.  *extra_used* lets a caller
+        planning several adoptions in one pass reserve budget it has already
+        assigned but not yet recorded (mirrors the ``available``-minus-running-tally
+        shape ``plan_boundary_preemption`` uses).  Among candidates the
+        latest-ending window wins (longest guarantee), ties broken by most free
+        capacity.
+        """
+        extra_used = extra_used or {}
+        candidates = [
+            r
+            for r in self.reservations
+            if r.kind == "booking"
+            and r.user is not None
+            and r.user.username == namespace
+            and self._effective_label(r) == gpu_class_label
+            and slot_start(r) <= now < slot_end(r)
+            and r.id not in self.noshow_reservation_ids
+            and self.available(r) - extra_used.get(r.id, 0) >= gpu_requested
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda r: (slot_end(r), self.available(r)))
+
     # ------------------------------------------------------------------
     # Queue management
     # ------------------------------------------------------------------
@@ -1212,6 +1249,19 @@ class ControllerState:
                 return reservation_id
         return None
 
+    def relink_occupancy(
+        self, pod_uid: str, new_reservation_id: int, gpu_count: int
+    ) -> None:
+        """Move *pod_uid*'s occupancy to *new_reservation_id* (release + record).
+
+        Used when an overstay pod is adopted into a reservation the same user
+        has since booked: the pod is unlinked from whatever id it was recorded
+        under and recorded against the new one, so budget accounting and
+        ``guarantee_end`` immediately reflect the new binding.
+        """
+        self.release_pod(pod_uid)
+        self.record_placement(new_reservation_id, pod_uid, gpu_count)
+
     def available_by_id(self, reservation_id: int) -> int:
         """GPU capacity remaining for *reservation_id* (0 if unknown)."""
         gpu_count = self._reservation_gpu_count(reservation_id)
@@ -1645,6 +1695,62 @@ class ControllerState:
         }
         return sorted(boundaries)
 
+    def _past_guarantee(self, view: PodRuntimeView, now: datetime) -> bool:
+        """Return True if *view*'s runtime guarantee is over (or unresolvable).
+
+        Shared by ``plan_boundary_preemption`` (victim eligibility) and
+        ``plan_overstay_adoptions`` (adoption eligibility) so both agree on what
+        "overstay" means: ``guarantee_end`` is ``None`` (not ours / no longer
+        active) or ``<= now``.
+        """
+        end = self.guarantee_end(
+            view.reservation_id, reserved_path=view.reserved_path, now=now
+        )
+        return end is None or end <= now
+
+    def plan_overstay_adoptions(
+        self,
+        pods: list[PodRuntimeView],
+        now: datetime,
+    ) -> list[tuple[PodRuntimeView, ReservationResponse]]:
+        """Plan (but do not execute) re-links of overstay pods to open bookings.
+
+        For each pod running **past its runtime guarantee** (``_past_guarantee``)
+        that this controller admitted (``reservation_id`` set), physically
+        present (``node_resident``, not ``terminating``, ``gpu_count > 0``), find
+        a currently-open booking the same user holds with spare budget
+        (``find_open_booking_for``) and, if it is a *different* reservation,
+        assign the pod to it.  This rescues a pod whose user re-booked capacity
+        the existing back-to-back chaining cannot reach (a non-abutting follow-on
+        window, a different ``gpu_count``, or an on-demand pod) before the
+        preemption sweep would reclaim it.
+
+        Budget is respected across the pass: a running per-reservation tally is
+        subtracted from ``available`` so several overstay pods cannot over-book
+        one reservation.  Pure — no I/O, no state mutation; the caller performs
+        the annotation patch and occupancy re-home.
+        """
+        assignments: list[tuple[PodRuntimeView, ReservationResponse]] = []
+        extra_used: dict[int, int] = {}
+        for p in pods:
+            if (
+                p.reservation_id is None
+                or not p.node_resident
+                or p.terminating
+                or p.gpu_count <= 0
+            ):
+                continue
+            if not self._past_guarantee(p, now):
+                continue
+            res = self.find_open_booking_for(
+                p.namespace, p.gpu_class, now, p.gpu_count, extra_used=extra_used
+            )
+            if res is None or res.id == p.reservation_id:
+                continue
+            assignments.append((p, res))
+            extra_used[res.id] = extra_used.get(res.id, 0) + p.gpu_count
+        return assignments
+
     def boundary_demand(
         self,
         boundary: datetime,
@@ -1728,10 +1834,6 @@ class ControllerState:
         demand = self.boundary_demand(boundary, pods, now)
         free = free_capacity_by_class(capacity_by_class, pods)
 
-        def is_past_guarantee(p: PodRuntimeView) -> bool:
-            end = self.guarantee_end(p.reservation_id, reserved_path=p.reserved_path, now=now)
-            return end is None or end <= now
-
         victims: list[PodRuntimeView] = []
         unmet: dict[str, int] = {}
         for gpu_class, need in demand.items():
@@ -1746,7 +1848,7 @@ class ControllerState:
                 and p.node_resident
                 and not p.terminating
                 and p.gpu_count > 0
-                and is_past_guarantee(p)
+                and self._past_guarantee(p, now)
             ]
             rng.shuffle(eligible)
             killed_gpus = 0

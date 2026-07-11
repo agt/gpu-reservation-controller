@@ -285,6 +285,20 @@ The take-back API below preempts too: a pod past its runtime guarantee never
 blocks a take-back, and granting one deletes such pods immediately rather
 than waiting for the next sweep.
 
+**Adopting overstay pods** (`OVERSTAY_ADOPTION_ENABLED`, default on). Because
+pods overrun, a user may book a *fresh* reservation (a new, distinct id) while
+their pod from the previous window is still running. If the new window abuts the
+old one (same owner, GPU class, and GPU count), the guarantee chaining above
+already extends the pod's guarantee onto it — no action needed. For the cases
+chaining cannot reach — a **non-abutting** follow-on window, a different **GPU
+count**, or an **on-demand** pod — the controller instead *re-links* the
+overstay pod: it re-annotates the pod's `horae/booking-reference` to the new
+reservation and moves the pod's occupancy accordingly, so the pod is no longer
+overstay and is credited against the new reservation. This runs before each
+preemption sweep plans any kills (so a just-re-booked pod is never a victim) and
+once per queue-processor tick. Re-linked pods get a Kubernetes Event with reason
+`OverstayRelinked`.
+
 ---
 
 ## Prerequisites
