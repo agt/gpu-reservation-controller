@@ -776,6 +776,17 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
             # Label key present but value is empty string — skip.
             continue
 
+        # Optional usage-group constraint (REQUIRED_GROUP_LABEL).  None both when
+        # the feature is disabled and when the pod lacks a (non-empty) value; the
+        # reserved-path matchers distinguish the two via state.required_group_label,
+        # so a labelless pod (feature on) matches no booking and falls through to
+        # the group-agnostic on-demand path.
+        group_label: str | None = (
+            labels.get(config.required_group_label) or None
+            if config.required_group_label
+            else None
+        )
+
         if event_type == "DELETED":
             # --- reserved path cleanup ---
             state.dequeue_pod(uid)
@@ -829,7 +840,9 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                 # A reserved-path holder vouches for every window its chained
                 # session spans; pass its booking id so all are cleared at once.
                 booking_id = parse_booking_reference(get_pod_booking_reference(pod))
-                state.mark_pod_seen_for_noshow(namespace, gpu_class_label, booking_id)
+                state.mark_pod_seen_for_noshow(
+                    namespace, gpu_class_label, booking_id, group_label
+                )
                 # Keep occupancy warm between ticks: record this admitted pod under
                 # its booking-reference id (covers reserved / on-demand / no-show
                 # alike), so capacity accounting survives a restart.
@@ -837,11 +850,15 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                     state.record_placement(booking_id, uid, get_pod_gpu_count(pod))
             else:
                 gpu_count = get_pod_gpu_count(pod)
-                reservation = state.find_best_reservation(namespace, gpu_class_label)
+                reservation = state.find_best_reservation(
+                    namespace, gpu_class_label, group_label
+                )
 
                 if reservation is not None:
                     # ---- reserved path ----
-                    state.enqueue_pod(uid, name, namespace, gpu_class_label, gpu_count)
+                    state.enqueue_pod(
+                        uid, name, namespace, gpu_class_label, gpu_count, group_label
+                    )
 
                     # Fast path: ADDED pod inside an open window — don't wait for
                     # the queue processor's POD_LIST_TICK_INTERVAL tick (default 300 s).
@@ -959,7 +976,9 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
         # dropping budget / no-show protection.
         snapshot = None
         try:
-            snapshot = await snapshot_tolerated_pods(TOLERATION_KEY)
+            snapshot = await snapshot_tolerated_pods(
+                TOLERATION_KEY, config.required_group_label
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("Failed to snapshot tolerated pods: %s", exc, exc_info=True)
 
@@ -1088,6 +1107,7 @@ def _pod_view(p) -> PodRuntimeView:
         reserved_path=is_reserved_path(p.booking_reference),
         node_resident=(p.phase == "Running" or (p.phase == "Pending" and not p.scheduled_false)),
         terminating=p.deletion_timestamp is not None,
+        group_label=p.group_label,
     )
 
 
@@ -1241,7 +1261,9 @@ async def _run_preemption_sweep(
         return
 
     try:
-        snapshot = await snapshot_tolerated_pods(TOLERATION_KEY)
+        snapshot = await snapshot_tolerated_pods(
+            TOLERATION_KEY, config.required_group_label
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("Preemption sweep: failed to snapshot pods: %s", exc, exc_info=True)
         return
@@ -1324,6 +1346,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     config: Config = app.state.config  # injected in create_app()
     client = ReservationClient(config)
     state = ControllerState()
+    # Enable the optional usage-group match constraint (REQUIRED_GROUP_LABEL).
+    # None keeps the group gate off, preserving prior behaviour.
+    state.required_group_label = config.required_group_label
 
     # Expose the shared state and client so request handlers (e.g. the inbound
     # push endpoint) can reach them; the background loops receive them as task

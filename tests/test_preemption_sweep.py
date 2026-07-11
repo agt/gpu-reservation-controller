@@ -69,7 +69,7 @@ def _pod(uid: str, *, booking_reference: str, reservation_id: int, gpu_count: in
 
 
 def _patch_snapshots(monkeypatch, m, *, pods, capacity, read_pod_ok=True):
-    async def _snapshot_pods(_key):
+    async def _snapshot_pods(_key, _group_label_key=None):
         return pods
 
     async def _snapshot_capacity(_key):
@@ -117,7 +117,7 @@ class TestNoBoundariesInScope:
 
         called = []
 
-        async def _boom(_key):
+        async def _boom(_key, _group_label_key=None):
             called.append(_key)
             raise AssertionError("should not be called")
 
@@ -134,7 +134,7 @@ class TestSnapshotFailureFailsSafe:
         state = _state(_boundary_reservation())
         config = _config()
 
-        async def _boom(_key):
+        async def _boom(_key, _group_label_key=None):
             raise RuntimeError("apiserver down")
 
         deleted = []
@@ -151,7 +151,7 @@ class TestSnapshotFailureFailsSafe:
         state = _state(_boundary_reservation())
         config = _config()
 
-        async def _ok_pods(_key):
+        async def _ok_pods(_key, _group_label_key=None):
             return []
 
         async def _boom(_key):

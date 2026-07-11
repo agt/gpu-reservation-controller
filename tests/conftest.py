@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 
 from app.controller import ControllerState
-from app.schemas import GpuClassBrief, ReservationResponse, UserBrief
+from app.schemas import GpuClassBrief, GroupBrief, ReservationResponse, UserBrief
 
 # ---------------------------------------------------------------------------
 # Shared constants
@@ -80,6 +80,8 @@ def reservation(
     status: str = "active",
     cancelled_by_id: int | None = None,
     cancelled_by: UserBrief | None = None,
+    group: str | None = None,
+    group_id: int | None = None,
     day: date | None = None,
 ) -> ReservationResponse:
     """Build a ``ReservationResponse`` with an explicit UTC window.
@@ -87,16 +89,24 @@ def reservation(
     A ``kind="booking"`` reservation carries a user by default; ``kind="reclaim"``
     carries none.  Pass ``with_user`` to override that coupling (a cancelled
     booking that keeps its user, or a reclaim owned by a user in a test).
+
+    Pass ``group`` (the usage-group name) to attach a ``GroupBrief`` for
+    REQUIRED_GROUP_LABEL tests; ``group_id`` defaults to ``res_id`` when a group
+    name is given so distinct groups get distinct ids for chaining tests.
     """
     if with_user is None:
         with_user = kind == "booking"
     user = UserBrief(id=user_id, username=username) if with_user else None
+    group_brief = None
+    if group is not None:
+        gid = group_id if group_id is not None else res_id
+        group_brief = GroupBrief(id=gid, name=group)
     return ReservationResponse(
         id=res_id,
         user_id=user_id if with_user else None,
         user=user,
-        group_id=None,
-        group=None,
+        group_id=group_brief.id if group_brief else group_id,
+        group=group_brief,
         gpu_class_id=gpu_class_id,
         gpu_class=GpuClassBrief(id=gpu_class_id, name="H100", label_value=gpu_class_label),
         date=day or start_utc.date(),
@@ -231,13 +241,16 @@ def block(
 def make_state(
     *reservations: ReservationResponse,
     labels: dict[int, str] | None = None,
+    required_group_label: str | None = None,
 ) -> ControllerState:
     """A ``ControllerState`` seeded with *reservations* and a gpu-class label map.
 
     Defaults the label map to ``{GPU_CLASS_ID: GPU_CLASS_LABEL}``; pass
-    ``labels={}`` to exercise the unresolved-class path.
+    ``labels={}`` to exercise the unresolved-class path.  Pass
+    ``required_group_label`` to enable the usage-group match constraint.
     """
     state = ControllerState()
     state.reservations = list(reservations)
     state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL} if labels is None else labels
+    state.required_group_label = required_group_label
     return state

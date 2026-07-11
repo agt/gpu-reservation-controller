@@ -308,9 +308,15 @@ class ToleratedPodInfo:
     # planning) and is never selected as a preemption victim (it is already on
     # its way out).
     deletion_timestamp: Optional[datetime] = None
+    # Value of the REQUIRED_GROUP_LABEL pod label (when the feature is enabled),
+    # carried so the adoption planner can enforce the same group constraint used
+    # at admission.  None when the feature is disabled or the label is absent.
+    group_label: Optional[str] = None
 
 
-async def snapshot_tolerated_pods(toleration_key: str) -> list[ToleratedPodInfo]:
+async def snapshot_tolerated_pods(
+    toleration_key: str, group_label_key: Optional[str] = None
+) -> list[ToleratedPodInfo]:
     """Return one ``ToleratedPodInfo`` per pod carrying a *toleration_key* toleration.
 
     Scans all ``gpu-class``-labelled pods (the same selector as ``PodWatcher`` —
@@ -318,6 +324,10 @@ async def snapshot_tolerated_pods(toleration_key: str) -> list[ToleratedPodInfo]
     controller needs.  One snapshot per queue-processor tick drives occupancy
     reconstruction, the claimed-reservation set, and guard 3, replacing the
     former per-attempt namespaced counts and the separate guard scans.
+
+    *group_label_key* (the configured REQUIRED_GROUP_LABEL, when enabled) names
+    an additional pod label whose value is captured into
+    ``ToleratedPodInfo.group_label``; unset ⇒ the field stays None.
     """
     log.debug(
         "k8s: list_pod_for_all_namespaces selector=gpu-class (tolerated snapshot)"
@@ -332,18 +342,22 @@ async def snapshot_tolerated_pods(toleration_key: str) -> list[ToleratedPodInfo]
         conditions = (pod.status.conditions or []) if pod.status else []
         scheduled = next((c for c in conditions if c.type == "PodScheduled"), None)
         booking = get_pod_booking_reference(pod)
+        labels = pod.metadata.labels or {}
         out.append(
             ToleratedPodInfo(
                 namespace=pod.metadata.namespace,
                 name=pod.metadata.name,
                 uid=pod.metadata.uid,
-                gpu_class=(pod.metadata.labels or {}).get("gpu-class", ""),
+                gpu_class=labels.get("gpu-class", ""),
                 booking_reference=booking,
                 reservation_id=parse_booking_reference(booking),
                 gpu_count=get_pod_gpu_count(pod),
                 phase=get_pod_phase(pod),
                 scheduled_false=(scheduled is not None and scheduled.status == "False"),
                 deletion_timestamp=pod.metadata.deletion_timestamp,
+                group_label=(
+                    labels.get(group_label_key) if group_label_key else None
+                ),
             )
         )
     log.debug("k8s: tolerated snapshot returned %d pod(s)", len(out))
