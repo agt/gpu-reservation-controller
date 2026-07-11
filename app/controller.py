@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -88,6 +89,32 @@ def apply_push_to_active(
     return list(by_id.values())
 
 
+def free_capacity_by_class(
+    capacity_by_class: dict[str, int],
+    pods: "list[PodRuntimeView]",
+) -> dict[str, int]:
+    """Return free GPUs per class: physical capacity minus node-resident use.
+
+    Only pods that are ``node_resident`` and not ``terminating`` count against
+    capacity — a terminating pod's GPUs are already being recovered by
+    Kubernetes and are treated as free for planning purposes.  A class absent
+    from *capacity_by_class* (unknown physical capacity) is not included in
+    the result.  A returned value may be negative, signalling an
+    over-committed class (more GPUs in use than the snapshot says exist).
+    """
+    used: dict[str, int] = {}
+    for p in pods:
+        if not p.node_resident or p.terminating:
+            continue
+        if p.gpu_class not in capacity_by_class:
+            continue
+        used[p.gpu_class] = used.get(p.gpu_class, 0) + p.gpu_count
+    return {
+        gpu_class: capacity - used.get(gpu_class, 0)
+        for gpu_class, capacity in capacity_by_class.items()
+    }
+
+
 # ---------------------------------------------------------------------------
 # Task queue entry
 # ---------------------------------------------------------------------------
@@ -123,6 +150,38 @@ class OnDemandCandidate:
     min_runtime_seconds: int  # horae/minimum-runtime-seconds annotation value
     pod_created_at: datetime  # metadata.creationTimestamp; used for FIFO ordering
     next_attempt_at: datetime  # earliest time to try placement
+
+
+@dataclass(frozen=True)
+class PodRuntimeView:
+    """Preemption-planning view of one live tolerated pod.
+
+    Built by main.py from a ``k8s_client.ToleratedPodInfo`` (digesting the
+    Kubernetes-shaped snapshot into the plain fields the pure planning
+    functions below need) — keeping this module free of Kubernetes imports.
+    """
+
+    uid: str
+    namespace: str
+    name: str
+    gpu_class: str
+    gpu_count: int
+    reservation_id: Optional[int]  # parsed booking-reference id; None = not ours
+    reserved_path: bool            # booking-reference had the "res-" prefix
+    node_resident: bool            # Running, or (Pending and not scheduled_false)
+    terminating: bool              # metadata.deletionTimestamp is set
+
+
+@dataclass
+class PreemptionPlan:
+    """Outcome of ``ControllerState.plan_boundary_preemption`` for one boundary/phase."""
+
+    boundary: datetime
+    phase: str                       # "A" (lead-time) or "B" (at-boundary)
+    demand_by_class: dict[str, int]
+    free_by_class: dict[str, int]
+    victims: list[PodRuntimeView]
+    unmet_by_class: dict[str, int]    # shortfall remaining after all eligible kills
 
 
 @dataclass
@@ -281,6 +340,15 @@ class ControllerState:
         # *push* of the id clears the tombstone (clear_taken_back): that is the
         # sanctioned restore path when the app aborts its booking.
         self.taken_back: dict[int, datetime] = {}
+
+        # Preemption sweep bookkeeping: for each upcoming slot boundary,
+        # which phase(s) ("A" = lead-time, "B" = at-boundary) have already
+        # been evaluated.  Prevents a flapping snapshot from re-planning (and
+        # potentially re-selecting fresh victims) within the same phase
+        # window; a restart simply loses the marks and re-evaluates once,
+        # which is safe because recomputation is idempotent (a killed pod
+        # shows as Terminating or gone).  Pruned by ``prune_preemption_marks``.
+        self.preemption_fired: dict[datetime, set[str]] = {}
 
         # Serialises reservation-state reconciliation between the fetch loop and
         # the inbound push endpoint.  Both mutate ``reservations`` and evict pods
@@ -1562,3 +1630,158 @@ class ControllerState:
                 log.info(
                     "Take-back tombstone for reservation #%d cleared by push", rid
                 )
+
+    # ------------------------------------------------------------------
+    # Preemption planning (demand-driven capacity recovery)
+    # ------------------------------------------------------------------
+
+    def upcoming_boundaries(self, now: datetime, lead: timedelta) -> list[datetime]:
+        """Return distinct booking start times within *lead* of *now*, ascending.
+
+        A boundary ``S`` is in scope while ``now - lead < S <= now + lead``: it
+        enters phase A (proactive) as soon as it is within the lead window
+        before it opens, and stays in scope through phase B (at-boundary,
+        ``S <= now``) for one more *lead*-sized window after it opens — long
+        enough for a delayed sweep or a post-restart re-evaluation to still
+        catch it.  Data-driven (distinct ``slot_start`` values of active
+        bookings): hour alignment and DST are the reservation app's concern,
+        not this arithmetic's.
+        """
+        boundaries = {
+            slot_start(r)
+            for r in self.reservations
+            if r.kind == "booking" and now - lead < slot_start(r) <= now + lead
+        }
+        return sorted(boundaries)
+
+    def boundary_demand(
+        self,
+        boundary: datetime,
+        pods: list[PodRuntimeView],
+        now: datetime,
+    ) -> dict[str, int]:
+        """Return GPUs still needed per GPU-class label for bookings starting at *boundary*.
+
+        For each active ``kind == "booking"`` reservation whose window starts
+        exactly at *boundary*, the demand is its remaining budget
+        (``available``) minus the GPUs already supplied by a live reserved-path
+        holder whose back-to-back chain covers it (``reservations_claimed_by``)
+        — a chained holder needs no new capacity for the window it already
+        physically occupies.  Subtracting per-reservation rather than excluding
+        a whole claimed reservation from demand avoids under-counting a
+        partially-chained multi-GPU reservation (a 1-GPU holder chaining into a
+        4-GPU booking still leaves 3 GPUs of genuine demand).  A no-show
+        reservation contributes no demand — its capacity is already on-demand
+        pool territory. Reservations whose GPU-class label cannot be resolved
+        are skipped (logged at debug).
+        """
+        chained_gpus: dict[int, int] = {}
+        for p in pods:
+            if (
+                not p.reserved_path
+                or not p.node_resident
+                or p.terminating
+                or p.reservation_id is None
+            ):
+                continue
+            for rid in self.reservations_claimed_by(p.reservation_id, now):
+                chained_gpus[rid] = chained_gpus.get(rid, 0) + p.gpu_count
+
+        demand: dict[str, int] = {}
+        for r in self.reservations:
+            if r.kind != "booking" or r.user is None:
+                continue
+            if slot_start(r) != boundary:
+                continue
+            if r.id in self.noshow_reservation_ids:
+                continue
+            label = self._effective_label(r)
+            if label is None:
+                log.debug(
+                    "Boundary demand: reservation #%d has no resolvable "
+                    "gpu-class label; skipping",
+                    r.id,
+                )
+                continue
+            need = max(0, self.available(r) - chained_gpus.get(r.id, 0))
+            if need:
+                demand[label] = demand.get(label, 0) + need
+        return demand
+
+    def plan_boundary_preemption(
+        self,
+        boundary: datetime,
+        capacity_by_class: dict[str, int],
+        pods: list[PodRuntimeView],
+        now: datetime,
+        rng: Optional[random.Random] = None,
+    ) -> PreemptionPlan:
+        """Plan (but do not execute) the kills needed to clear *boundary*'s demand.
+
+        Per GPU class: ``kills_needed = max(0, demand - free)``.  Eligible
+        victims are pods of that class admitted by this controller
+        (``reservation_id`` set), physically running or about to
+        (``node_resident``), not already ``terminating``, requesting at least
+        one GPU, and past their runtime guarantee (``guarantee_end`` is
+        ``None`` — unresolvable, treated as already over — or ``<= now``).  A
+        pod within its guarantee is never selected, regardless of shortfall.
+        Selection is uniform-random among eligible victims (priority ranking
+        is future work) and greedy — it stops once enough GPUs are covered,
+        which may overshoot when victims aren't exactly the shortfall size.
+        Classes are planned independently; a victim from one class's plan
+        cannot be re-selected for another (they don't share a GPU class, so
+        this only matters for bookkeeping clarity).  Pure — no I/O, no state
+        mutation; the caller executes the deletions and marks bookkeeping.
+        """
+        rng = rng or random.Random()
+        demand = self.boundary_demand(boundary, pods, now)
+        free = free_capacity_by_class(capacity_by_class, pods)
+
+        def is_past_guarantee(p: PodRuntimeView) -> bool:
+            end = self.guarantee_end(p.reservation_id, reserved_path=p.reserved_path, now=now)
+            return end is None or end <= now
+
+        victims: list[PodRuntimeView] = []
+        unmet: dict[str, int] = {}
+        for gpu_class, need in demand.items():
+            kills_needed = max(0, need - free.get(gpu_class, 0))
+            if kills_needed == 0:
+                continue
+            eligible = [
+                p
+                for p in pods
+                if p.gpu_class == gpu_class
+                and p.reservation_id is not None
+                and p.node_resident
+                and not p.terminating
+                and p.gpu_count > 0
+                and is_past_guarantee(p)
+            ]
+            rng.shuffle(eligible)
+            killed_gpus = 0
+            for p in eligible:
+                if killed_gpus >= kills_needed:
+                    break
+                victims.append(p)
+                killed_gpus += p.gpu_count
+            if killed_gpus < kills_needed:
+                unmet[gpu_class] = kills_needed - killed_gpus
+
+        return PreemptionPlan(
+            boundary=boundary,
+            phase="B" if boundary <= now else "A",
+            demand_by_class=demand,
+            free_by_class=free,
+            victims=victims,
+            unmet_by_class=unmet,
+        )
+
+    def prune_preemption_marks(self, now: datetime, lead: timedelta) -> None:
+        """Drop boundary bookkeeping once phase B's grace window has closed.
+
+        Called at the start of every preemption sweep, mirroring
+        ``reconcile_noshow``'s prune-then-act shape.
+        """
+        stale = [b for b in self.preemption_fired if b <= now - lead]
+        for b in stale:
+            del self.preemption_fired[b]
