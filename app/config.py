@@ -23,6 +23,7 @@ class Config:
     inbound_api_token: Optional[str]  # bearer token for the inbound push API; None = endpoint disabled
     preemption_lead_minutes: int   # lead time before a slot boundary for phase-A preemption
     preemption_check_interval: int  # seconds between preemption sweeps
+    pod_adoption_enabled: bool = True  # re-link overstay/on-demand pods to a user's new booking
     log_level: str = "INFO"        # root log level (LOG_LEVEL)
 
     @classmethod
@@ -75,5 +76,9 @@ class Config:
             preemption_check_interval=int(
                 os.environ.get("PREEMPTION_CHECK_INTERVAL", "60")
             ),
+            pod_adoption_enabled=os.environ.get(
+                "POD_ADOPTION_ENABLED", "true"
+            ).lower()
+            not in ("false", "0", "no"),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
         )

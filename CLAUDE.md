@@ -210,6 +210,60 @@ explicit demand.
 **RBAC**: the controller's ServiceAccount must have `create` on `events` and
 `get`/`list` on `nodes`, in addition to the existing pod permissions.
 
+### Adopting pods into a re-booked reservation
+
+Because pods may overrun, a user can book a **fresh** reservation (a new,
+distinct id) while their pod from the previous window is still running.  The
+running pod should continue under the new reservation rather than be preempted.
+The same mechanism also proactively upgrades an **on-demand** job to a
+guaranteed reservation the moment one is booked, without waiting for it to
+overstay.
+
+When the new window **abuts** the old one (`slot_start(new) == slot_end(old)`),
+same user, GPU class, and `gpu_count`, the existing back-to-back **chaining**
+(`_chain_for` / `compute_guaranteed_until`) already covers this for a reserved
+holder: the old reservation stays in the fetched set (status is only
+`active`/`cancelled`, and `fetch_reservations` widens `date_start` to
+`today − 1`), so `guarantee_end` recomputes live and grows to the new window's
+end, and `boundary_demand` credits the pod via `reservations_claimed_by` — no
+re-link needed.
+
+**Adoption** (`POD_ADOPTION_ENABLED`, default on) covers what chaining cannot,
+via `ControllerState.plan_pod_adoptions` (pure), which pairs an eligible pod
+with a currently-open booking the same user holds that has spare budget
+(`find_open_booking_for`).  Eligibility is gated differently by admission path:
+
+- **Reserved-path** pods (`res-<id>`) are only rescued once **past their
+  runtime guarantee** (`_past_guarantee`, shared with the preemption planner):
+  a **non-abutting** follow-on window (a gap, or one that starts at "now") or a
+  **different `gpu_count`** that chaining cannot reach.
+- **On-demand-path** pods (`ondemand-<id>` / `noshow-<id>`) are eligible **any
+  time**, not just once past guarantee — the moment the same user has a
+  matching open booking, the on-demand job is proactively upgraded rather than
+  waiting for it to overstay its own on-demand block.  This is unconditional:
+  there is no "shrink guard" — the upgrade happens even if the new booking's
+  own guarantee would end sooner than the on-demand block's current (possibly
+  merge-extended) guarantee.
+
+`_adopt_pods` in `main.py` then re-annotates the pod's `horae/booking-reference`
+to `res-<new id>` (the toleration is already present, so this patch only
+rewrites the annotation) and, **only on patch success**, re-homes occupancy
+(`relink_occupancy`) and refreshes the in-memory `PodRuntimeView`.  It emits an
+`OverstayRelinked` event for a rescue or an `OnDemandUpgraded` event for a
+proactive upgrade, and re-records the runtime guarantee.  Either way the pod
+becomes a reserved-path holder (its ref gains the `res-` prefix), so chaining
+applies from then on.
+
+Adoption runs in two places, both under `reservation_lock`: inside
+`_run_preemption_sweep` **before** victims are planned — so a pod the user has
+just re-booked is re-homed (zeroing that boundary's demand) and can never be
+selected as a victim — and once per **queue-processor tick** as a lazy tidy-up
+that re-links pods even when no boundary is near.  A pod with no open booking to
+adopt is left untouched (an on-demand pod stays on-demand; a reserved-path pod
+stays legitimately overstay).  The no-show race (a new booking declared no-show
+before adoption) is not handled — the 60 s sweep cadence beats the default
+30 min no-show grace.
+
 ### Timezone
 
 All reservation window arithmetic uses **UTC-aware `datetime` objects** (`timezone.utc`).
@@ -447,6 +501,7 @@ above applies.
 | `POD_SCHEDULING_GATE_NAME` | *(absent)* | Name of the SchedulingGate to remove after admitting a pod; unset = disabled |
 | `PREEMPTION_LEAD_MINUTES` | `15` | Minutes before a reservation slot boundary that phase-A preemption runs |
 | `PREEMPTION_CHECK_INTERVAL` | `60` | Seconds between preemption sweeps |
+| `POD_ADOPTION_ENABLED` | `true` | Re-link an overstay pod, or proactively upgrade a within-guarantee on-demand pod, to a reservation its user has since booked (see **Adopting pods into a re-booked reservation**); `false` disables |
 | `LOG_LEVEL` | `INFO` | Root Python logging level (parsed by `config.py`) |
 
 ---

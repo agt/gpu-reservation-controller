@@ -694,6 +694,80 @@ async def emit_reservation_reassigned_event(
     )
 
 
+async def emit_overstay_relinked_event(
+    pod,
+    pod_name: str,
+    namespace: str,
+    reservation_id: int,
+    guaranteed_until: datetime,
+) -> None:
+    """Create a Kubernetes Event linked to *pod* with reason='OverstayRelinked'.
+
+    Emitted when an overstay pod (running past its runtime guarantee) is re-linked
+    to a reservation the same user has since booked, so it is no longer treated as
+    overstay.  Distinct from ReservationReassigned (which evicts a pod on an
+    owner change) — here the *same* pod keeps running under a new reservation id.
+    """
+    until_str = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+    await _emit_pod_event(
+        pod,
+        pod_name,
+        namespace,
+        name_prefix="gpu-relink-",
+        reason="OverstayRelinked",
+        action="RelinkPod",
+        message=(
+            f"Pod re-linked to GPU reservation #{reservation_id}; no longer "
+            f"overstay. GPU access guaranteed until {until_str}."
+        ),
+    )
+    log.info(
+        "Emitted OverstayRelinked event for pod %s/%s (reservation=#%d, until=%s)",
+        namespace,
+        pod_name,
+        reservation_id,
+        until_str,
+    )
+
+
+async def emit_ondemand_upgraded_event(
+    pod,
+    pod_name: str,
+    namespace: str,
+    reservation_id: int,
+    guaranteed_until: datetime,
+) -> None:
+    """Create a Kubernetes Event linked to *pod* with reason='OnDemandUpgraded'.
+
+    Emitted when an on-demand pod, still within its own on-demand guarantee, is
+    proactively re-linked to a reservation the same user has since booked —
+    distinct from ``OverstayRelinked`` (which rescues a pod already past
+    guarantee): here the pod was never overstay, it is simply upgraded from
+    opportunistic on-demand placement to a guaranteed reservation as soon as
+    one becomes available.
+    """
+    until_str = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+    await _emit_pod_event(
+        pod,
+        pod_name,
+        namespace,
+        name_prefix="gpu-upgrade-",
+        reason="OnDemandUpgraded",
+        action="UpgradePod",
+        message=(
+            f"Pod upgraded from on-demand placement to GPU reservation "
+            f"#{reservation_id}. GPU access now guaranteed until {until_str}."
+        ),
+    )
+    log.info(
+        "Emitted OnDemandUpgraded event for pod %s/%s (reservation=#%d, until=%s)",
+        namespace,
+        pod_name,
+        reservation_id,
+        until_str,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pod event stream
 # ---------------------------------------------------------------------------
