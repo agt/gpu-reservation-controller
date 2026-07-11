@@ -20,7 +20,7 @@ Emitted once at process start and stop.  Source: `app/main.py` (`lifespan`).
 | INFO | `Initial fetch complete: N reservation(s), N GPU class(es) resolved` | Initial fetch succeeded; shows active reservation and resolved GPU-class counts. |
 | INFO | `No-show tracking initialised: N reservation(s) watched` | No-show deadline tracking armed for N user reservations. |
 | ERROR | `Initial reservation fetch failed (…); controller will retry in N s, pod matching may be delayed` | Startup fetch failed; controller continues but pod matching is degraded until the next retry succeeds. |
-| INFO | `GPU reservation controller started` | All three background loops are running. |
+| INFO | `GPU reservation controller started` | All four background loops are running. |
 | INFO | `Shutting down GPU reservation controller…` | SIGTERM or lifespan exit received; background tasks being cancelled. |
 | INFO | `Controller stopped` | All tasks have exited cleanly. |
 | INFO | `Kubernetes: loaded kubeconfig from <path>` | Out-of-cluster mode: kubeconfig loaded from the given path. |
@@ -85,7 +85,7 @@ Source: `app/controller.py` (`initialize_noshow_tracking`, `update_noshow_tracki
 ## Reserved-path pod admission
 
 Emitted as pods are matched to reservations, queued, and admitted.
-Sources: `app/controller.py` (`enqueue_pod`, `dequeue_pod`, `reconcile_queue`), `app/main.py` (`pod_watch_loop`, `_try_apply_toleration`, `_enforce_deadline`, `queue_processor_loop`), `app/k8s_client.py` (`apply_toleration`, `set_active_deadline`, `emit_runtime_capped_event`).
+Sources: `app/controller.py` (`enqueue_pod`, `dequeue_pod`, `reconcile_queue`), `app/main.py` (`pod_watch_loop`, `_try_apply_toleration`, `_record_guarantee`, `queue_processor_loop`), `app/k8s_client.py` (`apply_toleration`, `annotate_runtime_guarantee`, `emit_runtime_guaranteed_event`).
 
 | Level | Message | Description |
 |-------|---------|-------------|
@@ -94,9 +94,9 @@ Sources: `app/controller.py` (`enqueue_pod`, `dequeue_pod`, `reconcile_queue`), 
 | DEBUG | `Pod ns/name: GPU budget full (N requested > N available of N reserved); retry in N s` | Toleration not applied because the reservation's GPU budget is exhausted; will retry after a 2–5 min jitter delay. |
 | INFO | `Pod ns/name already has toleration; dequeuing` | The pod was already carrying the toleration (applied externally or by a previous attempt); removed from the queue. |
 | INFO | `Applied toleration key=value:NoSchedule to pod ns/name (booking=ref)` | Toleration patch succeeded; pod is now admitted under the given booking reference. |
-| INFO | `Set activeDeadlineSeconds=N on pod ns/name` | `spec.activeDeadlineSeconds` has been patched to cap the pod's runtime to its reservation window(s). |
-| INFO | `Emitted RuntimeCapped event for pod ns/name (deadline=Ns)` | A `RuntimeCapped` Kubernetes event has been created on the pod explaining the deadline. |
-| WARNING | `Failed to enforce activeDeadlineSeconds on pod ns/name: <exception>` | Deadline enforcement failed after the toleration was already applied; best-effort, toleration is not revoked. |
+| INFO | `Recorded runtime guarantee on pod ns/name: Ns (until <time>)` | The pod's runtime guarantee has been annotated (`horae/pod-runtime-limit-seconds`, `horae/guaranteed-until`). No `spec.activeDeadlineSeconds` is patched — the guarantee is informational only. |
+| INFO | `Emitted RuntimeGuaranteed event for pod ns/name (guaranteed=Ns, until=<time>)` | A `RuntimeGuaranteed` Kubernetes event has been created on the pod explaining when the guarantee ends. |
+| WARNING | `Failed to record runtime guarantee on pod ns/name: <exception>` | Recording the guarantee failed after the toleration was already applied; best-effort, toleration is not revoked. |
 | WARNING | `Error processing pod ns/name: <exception>; retry in N s` | Toleration patch or pod re-read failed with a transient error; the optimistic occupancy record was rolled back and the entry remains in the queue. |
 | INFO | `Reservation #N window expired; removing pod ns/name from queue` | The reservation window closed before the pod could be admitted; the entry is dropped from the queue. |
 | INFO | `Pod ns/name re-queued: reservation #N cancelled, now targeting reservation #N` | A queue entry's reservation was cancelled; the pod has been re-matched to a new reservation. |
@@ -122,7 +122,7 @@ Sources: `app/main.py` (`pod_watch_loop`), `app/controller.py` (`add_ondemand_ca
 ## On-demand placement
 
 Emitted during each attempt to place an on-demand candidate onto a reclaim/no-show block.
-Sources: `app/main.py` (`_try_place_ondemand`, `_recycle_ondemand_block`, `queue_processor_loop`), `app/controller.py` (`find_ondemand_block`), `app/k8s_client.py` (`apply_toleration`, `set_active_deadline`, `emit_runtime_capped_event`).
+Sources: `app/main.py` (`_try_place_ondemand`, `_recycle_ondemand_block`, `queue_processor_loop`), `app/controller.py` (`find_ondemand_block`), `app/k8s_client.py` (`apply_toleration`, `annotate_runtime_guarantee`, `emit_runtime_guaranteed_event`).
 
 | Level | Message | Description |
 |-------|---------|-------------|
@@ -133,8 +133,8 @@ Sources: `app/main.py` (`_try_place_ondemand`, `_recycle_ondemand_block`, `queue
 | INFO | `On-demand candidate ns/name is <phase>; dropping` | Pod reached a terminal phase (Succeeded/Failed/Unknown) before placement; candidate is removed. |
 | INFO | `On-demand candidate ns/name: not GPU-only-pending ('…'); dropping` | Pod is Pending for a non-GPU reason; the controller's toleration cannot unblock it, so the candidate is dropped. |
 | INFO | `On-demand pod ns/name already has toleration; recording as placed on block #N` | Pod acquired the toleration by some other means; the controller records the occupancy and removes the candidate. |
-| INFO | `Placed on-demand pod ns/name onto block #N (gpu-class=c, gpus=N, block has N/N free after placement)` | Toleration applied successfully; pod is now on-demand-admitted under block #N. |
-| WARNING | `Failed to enforce activeDeadlineSeconds on on-demand pod ns/name: <exception>` | Deadline cap after on-demand placement failed; best-effort, toleration is not revoked. |
+| INFO | `Placed on-demand pod ns/name onto block #N (gpu-class=c, gpus=N, block has N/N free after placement, guaranteed until <time>)` | Toleration applied successfully; pod is now on-demand-admitted under block #N with its runtime guarantee recorded. |
+| WARNING | `Failed to record runtime guarantee on on-demand pod ns/name: <exception>` | Recording the guarantee after on-demand placement failed; best-effort, toleration is not revoked. |
 | WARNING | `Error placing on-demand pod ns/name: <exception>; retry in N s` | On-demand placement failed with a transient error; optimistic occupancy record rolled back, candidate will retry. |
 | DEBUG † | `Recycling on-demand block for gpu-class=c: N candidate(s) eligible` | A pod vacated an on-demand block; N waiting candidates of the same GPU class are being considered for immediate placement. |
 | DEBUG † | `Queue processor tick: N reserved queue entr(ies), N on-demand candidate(s)` | End-of-tick summary showing how many entries remain in each queue after processing. |
@@ -164,7 +164,7 @@ Source: `app/controller.py` (`reconcile_reclaim_merges`).
 
 | Level | Message | Description |
 |-------|---------|-------------|
-| INFO | `Merged reclaim block(s) [N, …] into subject reservation #N (gpu-class=c, gpu_count=N); window extended to <time>` | New future reclaim block(s) have been absorbed into a subject block; the subject's effective window is now longer, extending on-demand pod deadlines. |
+| INFO | `Merged reclaim block(s) [N, …] into subject reservation #N (gpu-class=c, gpu_count=N); window extended to <time>` | New future reclaim block(s) have been absorbed into a subject block; the subject's effective window is now longer, extending on-demand pod runtime guarantees. |
 | DEBUG † | `Re-applied reclaim merge: subject #N extended to <time> (absorbed: [N, …])` | A previously-created merge survived a reservation reload and has been re-applied to the freshly loaded reservation objects. |
 | INFO † | `Reclaim merge for subject #N dropped: reservation no longer active or window ended` | A persisted merge was discarded because its subject reservation is gone or the entire merged span has ended. |
 | INFO † | `Reclaim merge for subject #N: absorbed block(s) [N, …] no longer active; merge dropped` | A persisted merge was discarded because one or more of its absorbed reclaim blocks were preempted (no longer in the active list). |
@@ -180,6 +180,32 @@ Source: `app/main.py` (`queue_processor_loop`).
 |-------|---------|-------------|
 | WARNING | `Safety interlock activated for gpu-class=c: N reservation-holder pod(s) stuck Pending (ns/name, …); on-demand placement for this class held` | One or more holder pods are stuck Pending on this GPU class; on-demand placement is suspended for the class until they schedule. |
 | INFO | `Safety interlock cleared for gpu-class=c: on-demand placement resumed` | All holder pods for this GPU class have scheduled; on-demand placement is re-enabled. |
+
+---
+
+## Preemption sweep †
+
+Emitted by the periodic capacity-recovery sweep that recovers GPUs from pods
+running past their runtime guarantee. Sources: `app/main.py`
+(`preemption_loop`, `_run_preemption_sweep`, `_preempt_pod`), `app/k8s_client.py`
+(`snapshot_node_gpu_capacity`, `delete_pod`, `emit_preempted_event`).
+
+| Level | Message | Description |
+|-------|---------|-------------|
+| WARNING | `Preemption sweep: failed to snapshot pods: <exception>` | The pod LIST needed to plan preemption failed; the entire sweep is skipped — no kill is ever made on unknown state. |
+| WARNING | `Preemption sweep: failed to snapshot node GPU capacity: <exception>` | The node LIST needed to compute physical capacity failed; the entire sweep is skipped. |
+| INFO | `Preemption sweep boundary=<time> phase=A/B: demand={class: N, …} free={class: N, …} kills=N` | A boundary/phase was evaluated; shows the per-class demand and free-capacity maps and how many victims were selected. Only logged when there is nonzero demand at the boundary. |
+| WARNING | `Preemption sweep boundary=<time> phase=A/B: N GPU(s) of gpu-class=c still short after preempting all eligible overstayers` | Even after preempting every eligible past-guarantee pod of this class, demand could not be fully covered — a signal that no in-hour recovery exists beyond this sweep (see README's *Runtime guarantees and demand-driven preemption*). |
+| INFO | `Preempting pod ns/name (gpu-class=c, gpus=N): <message>` | About to delete a selected victim; `<message>` explains the overstay duration and which boundary's demand triggered it. |
+| INFO | `Emitted Preempted event for pod ns/name` | A `Preempted` Kubernetes event has been created on the pod, immediately before deletion. |
+| INFO | `Deleted pod ns/name` | Pod deletion succeeded (shared log line with cancellation/owner-change eviction and take-back grant deletions — see *Kubernetes API traces*). |
+| WARNING | `Could not emit Preempted event for pod ns/name: <exception>` | Best-effort event emission failed; pod deletion will still be attempted. |
+| WARNING | `Could not delete pod ns/name: <exception>` | Pod deletion failed; the pod will persist until manually removed or the next sweep. |
+
+Take-back grants (`POST /api/reservations/take-back`) reuse the same
+`_preempt_pod` path and log lines above for any past-guarantee pod deleted as
+part of a grant — there is no separate log line distinguishing a sweep-driven
+preemption from a take-back-driven one beyond the message text.
 
 ---
 
@@ -208,10 +234,13 @@ Low-level traces of every outbound Kubernetes API call.  Visible only at
 | DEBUG | `k8s: list_pod_for_all_namespaces selector=gpu-class (tolerated snapshot)` | About to LIST all GPU-class pods to rebuild the tolerated-pod snapshot. |
 | DEBUG | `k8s: tolerated snapshot returned N pod(s)` | LIST completed; N pods carry the controller's toleration. |
 | DEBUG | `k8s: patch_namespaced_pod ns/name (add toleration key=value:NoSchedule, booking=ref)` | About to PATCH a pod to add the reservation toleration and booking-reference annotation. |
-| DEBUG | `k8s: patch_namespaced_pod ns/name (activeDeadlineSeconds=N)` | About to PATCH a pod to set its runtime deadline. |
-| DEBUG | `k8s: create_namespaced_event ns (pod=name, reason=RuntimeCapped)` | About to create a `RuntimeCapped` event on the pod. |
+| DEBUG † | `k8s: patch_namespaced_pod ns/name (runtime guarantee: Ns, until <time>)` | About to PATCH a pod's `horae/pod-runtime-limit-seconds` / `horae/guaranteed-until` annotations. No `spec.activeDeadlineSeconds` patch is ever issued. |
+| DEBUG | `k8s: create_namespaced_event ns (pod=name, reason=RuntimeGuaranteed)` | About to create a `RuntimeGuaranteed` event on the pod. |
+| DEBUG | `k8s: create_namespaced_event ns (pod=name, reason=Preempted)` † | About to create a `Preempted` event on a pod being deleted to recover capacity. |
 | DEBUG | `k8s: create_namespaced_event ns (pod=name, reason=ReservationCancelled)` | About to create a `ReservationCancelled` event on the pod. |
-| DEBUG | `k8s: delete_namespaced_pod ns/name` | About to DELETE a pod (reservation cancellation eviction). |
+| DEBUG † | `k8s: list_node (gpu capacity snapshot)` | About to LIST all nodes to compute physical GPU capacity per class (`snapshot_node_gpu_capacity`). |
+| DEBUG † | `k8s: node gpu capacity snapshot: {class: N, …}` | Node LIST completed; shows total allocatable GPUs summed per `gpu-class-reservation` taint value. |
+| DEBUG | `k8s: delete_namespaced_pod ns/name` | About to DELETE a pod (reservation cancellation eviction, preemption sweep, or take-back grant). |
 | INFO | `Deleted pod ns/name` | Pod deletion succeeded. |
 | DEBUG | `Pod ns/name already gone (404)` | DELETE returned 404; pod had already been removed. |
 | INFO | `Emitted ReservationCancelled event for pod ns/name` | `ReservationCancelled` event created on the pod. |

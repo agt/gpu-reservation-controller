@@ -3,8 +3,8 @@
 Covers: update_noshow_tracking (init + new), reconcile_noshow,
 check_noshow_deadlines, mark_pod_seen_for_noshow, enqueue_pod deadline clearing,
 find_best_reservation skipping no-shows, find_ondemand_block including no-shows,
-reconcile_occupancy including no-shows, and compute_max_deadline_seconds skipping
-no-shows.
+and reconcile_occupancy including no-shows.  Guarantee-arithmetic no-show
+skipping (compute_guaranteed_until) is covered in test_guarantees.py.
 
 No Kubernetes or HTTP calls are made.
 """
@@ -427,32 +427,3 @@ class TestReconcileOccupancyNoshow:
         state.occupancy[1] = {"uid-gone": 1}
         state.reconcile_occupancy([(1, "uid-a", 1)])
         assert state.occupancy == {1: {"uid-a": 1}}
-
-
-# ---------------------------------------------------------------------------
-# TestComputeMaxDeadlineSkipsNoshow
-# ---------------------------------------------------------------------------
-
-
-class TestComputeMaxDeadlineSkipsNoshow:
-    def test_noshow_back_to_back_not_chained(self):
-        # r1: 08:00–10:00 UTC, r2: 10:00–12:00 UTC (directly back-to-back)
-        r1 = _user_reservation(1, slot_index=0, duration_minutes=120, reservation_date=FUTURE_DATE)
-        r2 = _user_reservation(2, slot_index=1, duration_minutes=120, reservation_date=FUTURE_DATE)
-        state = _state(r1, r2)
-        state.noshow_reservation_ids.add(2)
-        now = slot_start(r1) + timedelta(minutes=1)
-        result = state.compute_max_deadline_seconds(now, r1)
-        # Only r1's remaining time — r2 is no-show
-        expected = int((slot_end(r1) - now).total_seconds())
-        assert result == expected
-
-    def test_non_noshow_back_to_back_still_chained(self):
-        r1 = _user_reservation(1, slot_index=0, duration_minutes=120, reservation_date=FUTURE_DATE)
-        r2 = _user_reservation(2, slot_index=1, duration_minutes=120, reservation_date=FUTURE_DATE)
-        state = _state(r1, r2)
-        # r2 is NOT a no-show — should chain
-        now = slot_start(r1) + timedelta(minutes=1)
-        result = state.compute_max_deadline_seconds(now, r1)
-        expected = int((slot_end(r1) - now).total_seconds()) + 120 * 60
-        assert result == expected

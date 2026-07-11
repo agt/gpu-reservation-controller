@@ -69,6 +69,10 @@ spec:
             - name: POD_SCHEDULING_GATE_NAME
               value: {{ .Values.config.podSchedulingGateName | quote }}
             {{- end }}
+            - name: PREEMPTION_LEAD_MINUTES
+              value: {{ .Values.config.preemptionLeadMinutes | quote }}
+            - name: PREEMPTION_CHECK_INTERVAL
+              value: {{ .Values.config.preemptionCheckInterval | quote }}
             {{- if .Values.inboundApiTokenSecret.name }}
             # Enables the inbound reservation-push API (POST /api/reservations/push).
             # Omit the secret to leave the endpoint disabled (returns 503).

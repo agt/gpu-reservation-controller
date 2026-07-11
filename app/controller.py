@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -88,6 +89,32 @@ def apply_push_to_active(
     return list(by_id.values())
 
 
+def free_capacity_by_class(
+    capacity_by_class: dict[str, int],
+    pods: "list[PodRuntimeView]",
+) -> dict[str, int]:
+    """Return free GPUs per class: physical capacity minus node-resident use.
+
+    Only pods that are ``node_resident`` and not ``terminating`` count against
+    capacity — a terminating pod's GPUs are already being recovered by
+    Kubernetes and are treated as free for planning purposes.  A class absent
+    from *capacity_by_class* (unknown physical capacity) is not included in
+    the result.  A returned value may be negative, signalling an
+    over-committed class (more GPUs in use than the snapshot says exist).
+    """
+    used: dict[str, int] = {}
+    for p in pods:
+        if not p.node_resident or p.terminating:
+            continue
+        if p.gpu_class not in capacity_by_class:
+            continue
+        used[p.gpu_class] = used.get(p.gpu_class, 0) + p.gpu_count
+    return {
+        gpu_class: capacity - used.get(gpu_class, 0)
+        for gpu_class, capacity in capacity_by_class.items()
+    }
+
+
 # ---------------------------------------------------------------------------
 # Task queue entry
 # ---------------------------------------------------------------------------
@@ -123,6 +150,38 @@ class OnDemandCandidate:
     min_runtime_seconds: int  # horae/minimum-runtime-seconds annotation value
     pod_created_at: datetime  # metadata.creationTimestamp; used for FIFO ordering
     next_attempt_at: datetime  # earliest time to try placement
+
+
+@dataclass(frozen=True)
+class PodRuntimeView:
+    """Preemption-planning view of one live tolerated pod.
+
+    Built by main.py from a ``k8s_client.ToleratedPodInfo`` (digesting the
+    Kubernetes-shaped snapshot into the plain fields the pure planning
+    functions below need) — keeping this module free of Kubernetes imports.
+    """
+
+    uid: str
+    namespace: str
+    name: str
+    gpu_class: str
+    gpu_count: int
+    reservation_id: Optional[int]  # parsed booking-reference id; None = not ours
+    reserved_path: bool            # booking-reference had the "res-" prefix
+    node_resident: bool            # Running, or (Pending and not scheduled_false)
+    terminating: bool              # metadata.deletionTimestamp is set
+
+
+@dataclass
+class PreemptionPlan:
+    """Outcome of ``ControllerState.plan_boundary_preemption`` for one boundary/phase."""
+
+    boundary: datetime
+    phase: str                       # "A" (lead-time) or "B" (at-boundary)
+    demand_by_class: dict[str, int]
+    free_by_class: dict[str, int]
+    victims: list[PodRuntimeView]
+    unmet_by_class: dict[str, int]    # shortfall remaining after all eligible kills
 
 
 @dataclass
@@ -281,6 +340,15 @@ class ControllerState:
         # *push* of the id clears the tombstone (clear_taken_back): that is the
         # sanctioned restore path when the app aborts its booking.
         self.taken_back: dict[int, datetime] = {}
+
+        # Preemption sweep bookkeeping: for each upcoming slot boundary,
+        # which phase(s) ("A" = lead-time, "B" = at-boundary) have already
+        # been evaluated.  Prevents a flapping snapshot from re-planning (and
+        # potentially re-selecting fresh victims) within the same phase
+        # window; a restart simply loses the marks and re-evaluates once,
+        # which is safe because recomputation is idempotent (a killed pod
+        # shows as Terminating or gone).  Pruned by ``prune_preemption_marks``.
+        self.preemption_fired: dict[datetime, set[str]] = {}
 
         # Serialises reservation-state reconciliation between the fetch loop and
         # the inbound push endpoint.  Both mutate ``reservations`` and evict pods
@@ -590,7 +658,7 @@ class ControllerState:
         exactly when the previous window ends (``slot_start(next) ==
         slot_end(previous)``).  *reservation* itself is **not** included.
 
-        Shared by ``compute_max_deadline_seconds`` (runtime-cap arithmetic) and
+        Shared by ``compute_guaranteed_until`` (runtime-guarantee arithmetic) and
         ``reservations_claimed_by`` (no-show protection) so both agree on what a
         single holder pod's session spans.
         """
@@ -637,27 +705,71 @@ class ControllerState:
             visited.add(next_res.id)
         return chain
 
-    def compute_max_deadline_seconds(
+    def compute_guaranteed_until(
         self,
         now: datetime,
         current_reservation: ReservationResponse,
-    ) -> int:
-        """Return the maximum permitted pod lifetime in seconds, anchored to *now*.
+    ) -> datetime:
+        """Return the absolute UTC end of the runtime guarantee for a reserved-path
+        admission under *current_reservation*.
 
-        Sums the remaining time in *current_reservation* plus the full duration of
-        any back-to-back future reservations that share the same namespace, GPU class,
-        and gpu_count — with no gap between consecutive windows.
-
-        "Back-to-back" means slot_start(next) == slot_end(previous) exactly.
+        The guarantee is the end of *current_reservation*'s window, extended
+        across any back-to-back future reservations that share the same
+        namespace, GPU class, and gpu_count (see ``_chain_for``).  *now* is
+        used only to select which future reservations still qualify as
+        "future" — the result is an absolute instant, which callers write to
+        the pod as an informational annotation.  No flooring: an absolute end
+        may equal or even (in a stale-data race) precede *now*; callers
+        convert to a duration in seconds where a positive value is required.
         """
-        prev_end = slot_end(current_reservation)
-        total = max(0.0, (prev_end - now).total_seconds())
-        for res in self._chain_for(current_reservation, now):
-            total += (slot_end(res) - slot_start(res)).total_seconds()
-        # Floor at 1: Kubernetes rejects activeDeadlineSeconds: 0, and if the
-        # window expired between the caller's now-check and here the total can be
-        # zero.  Mirrors the on-demand path's max(remaining, 1) (CODE-REVIEW B3).
-        return max(1, int(total))
+        chain = self._chain_for(current_reservation, now)
+        return slot_end(chain[-1]) if chain else slot_end(current_reservation)
+
+    def guarantee_end(
+        self,
+        reservation_id: Optional[int],
+        *,
+        reserved_path: bool,
+        now: datetime,
+    ) -> Optional[datetime]:
+        """Return the absolute UTC end of the runtime guarantee for a pod admitted
+        under *reservation_id*, or ``None`` if no live guarantee can be resolved.
+
+        This is the live, restart-safe replacement for the frozen
+        ``activeDeadlineSeconds`` a pod used to be capped at: it is recomputed
+        from current window arithmetic on every call rather than read back from
+        the pod, so a pod's guarantee can grow (an abutting follow-on booking, a
+        landed reclaim merge) the way a Kubernetes deadline never could.
+
+        ``reserved_path=True`` (booking-reference prefix ``res-``): looks up
+        *reservation_id* in ``self.reservations`` and returns the end of its
+        back-to-back chain (``compute_guaranteed_until``).  ``None`` if the
+        reservation is no longer in the active list — its window is over and
+        the pod is unconditionally past guarantee.
+
+        ``reserved_path=False`` (``ondemand-`` / ``noshow-``): looks up
+        *reservation_id* in the active reservations or in
+        ``cancelled_reservations`` and returns ``effective_end`` (the
+        reclaim-merge-extended window end).  ``None`` if the block is in
+        neither — same "window is over" meaning.
+
+        ``reservation_id=None`` (a pod not admitted by this controller, or
+        whose booking-reference does not parse) always returns ``None``: it is
+        never "ours" to guarantee, and it is never a preemption victim.
+        """
+        if reservation_id is None:
+            return None
+        if reserved_path:
+            res = next((r for r in self.reservations if r.id == reservation_id), None)
+            if res is None:
+                return None
+            return self.compute_guaranteed_until(now, res)
+        res = next((r for r in self.reservations if r.id == reservation_id), None)
+        if res is None:
+            res = self.cancelled_reservations.get(reservation_id)
+        if res is None:
+            return None
+        return self.effective_end(res)
 
     def reservations_claimed_by(
         self,
@@ -831,7 +943,8 @@ class ControllerState:
         (CODE-REVIEW D4a): a wholesale reservation reload needs no re-application,
         the API models stay effectively immutable, and any other consumer of
         ``end_utc`` still sees the value the API returned.  On-demand placement
-        and the on-demand deadline cap read window ends through this method.
+        and the on-demand runtime guarantee (``guarantee_end``) read window
+        ends through this method.
         """
         merge = self.reclaim_merges.get(r.id)
         return merge.extended_end if merge is not None else slot_end(r)
@@ -1283,34 +1396,41 @@ class ControllerState:
         mutation are atomic with respect to the placement coroutines (which
         record occupancy synchronously before their first ``await``).
 
-        *pod_ends_by_reservation* maps reservation id → the projected end of
-        each live pod admitted under it (``None`` = unknown/unbounded, treated
-        as running forever — fail safe).  *unknown_expiry* is the tombstone
-        expiry for ids the controller has never seen: it can never have placed
-        pods on such a block, so the take-back is granted, and the tombstone is
-        pinned to the real window the first time a fetch observes the id
+        *pod_ends_by_reservation* maps reservation id → the runtime-guarantee
+        end of each live pod admitted under it, computed by the caller via
+        ``guarantee_end`` (``None`` = unknown/unbounded — an in-flight
+        placement not yet visible to the pod snapshot — treated as running
+        forever, fail safe; a *resolved* pod past its guarantee is mapped to
+        some instant ``<= now``, never to ``None``, so it never trips the
+        fail-safe branch).  *unknown_expiry* is the tombstone expiry for ids
+        the controller has never seen: it can never have placed pods on such a
+        block, so the take-back is granted, and the tombstone is pinned to the
+        real window the first time a fetch observes the id
         (``filter_taken_back``).
 
-        Conflict reasons: ``occupied`` (a live pod is admitted under the block
-        itself), ``claimed`` (a chained reserved holder occupies it — defensive;
-        holders never chain into reclaim blocks today), ``extension-in-use``
-        (the block was absorbed into a merge and a pod on the merge's subject
-        projects past the block's start).  A requested id resolving to a
-        non-reclaim reservation lands in ``invalid``.  Any conflict or invalid
-        id ⇒ nothing is mutated.
+        Conflict reasons: ``occupied`` (a live pod under the block itself is
+        still within its runtime guarantee), ``claimed`` (a chained reserved
+        holder occupies it — defensive; holders never chain into reclaim
+        blocks today), ``extension-in-use`` (the block was absorbed into a
+        merge and a pod on the merge's subject is guaranteed past the block's
+        start).  A pod past its guarantee never counts as occupying or
+        extending into a block — it is a preemption candidate, not a blocker
+        (the caller deletes it once the grant is confirmed).  A requested id
+        resolving to a non-reclaim reservation lands in ``invalid``.  Any
+        conflict or invalid id ⇒ nothing is mutated.
 
         On success, an absorbed stub's merge record is truncated at the earliest
-        taken stub: earlier stubs stay stubbed (a running job's extended
-        deadline may still reach them), later untaken stubs detach back to
-        standalone blocks (reported in ``detached``) — a taken block leaves a
-        hole, so they no longer abut the subject.  Taking a merge *subject*
-        (provably idle, so no deadline extends anywhere) dissolves its record
-        and detaches all untaken stubs.  Merge rediscovery is deliberately NOT
+        taken stub: earlier stubs stay stubbed (a running job's guarantee may
+        still reach them), later untaken stubs detach back to standalone
+        blocks (reported in ``detached``) — a taken block leaves a hole, so
+        they no longer abut the subject.  Taking a merge *subject* (provably
+        idle, so no guarantee extends anywhere) dissolves its record and
+        detaches all untaken stubs.  Merge rediscovery is deliberately NOT
         run here: the overlay is already consistent after surgical truncation,
         and the next tick / refresh runs ``reconcile_reclaim_merges`` anyway.
         (Wholesale dissolve-and-rediscover would be unsafe: discovery skips a
         claimed subject and would un-stub earlier absorbed blocks a still-running
-        extended job may occupy.)
+        guaranteed job may occupy.)
         """
         by_id: dict[int, ReservationResponse] = {r.id: r for r in self.reservations}
         for rid, r in self.cancelled_reservations.items():
@@ -1324,11 +1444,11 @@ class ControllerState:
             for aid in merge.absorbed_ids
         }
 
-        def _busy_past(reservation_id: int, cut: Optional[datetime]) -> bool:
-            """True if any live pod under *reservation_id* projects past *cut*
-            (``cut=None`` ⇒ any live pod at all)."""
+        def _busy_past(reservation_id: int, cut: datetime) -> bool:
+            """True if any live pod under *reservation_id* is guaranteed past *cut*
+            (``end is None`` ⇒ unknown/in-flight, treated as unbounded — fail safe)."""
             for end in pod_ends_by_reservation.get(reservation_id, []):
-                if cut is None or end is None or end > cut:
+                if end is None or end > cut:
                     return True
             return False
 
@@ -1346,11 +1466,13 @@ class ControllerState:
             if res is not None and res.kind != "reclaim":
                 invalid.append(TakeBackConflict(rid, "not-a-reclaim-block"))
                 continue
-            # A live pod admitted directly under the block.  Checked for
-            # unknown ids too: occupancy rebuilt from pod annotations (e.g.
-            # after a controller restart) can reference ids the current
-            # reservation list does not.
-            if _busy_past(rid, None):
+            # A live pod admitted directly under the block, still within its
+            # runtime guarantee.  Checked for unknown ids too: occupancy
+            # rebuilt from pod annotations (e.g. after a controller restart)
+            # can reference ids the current reservation list does not.  A pod
+            # past its guarantee (mapped to some instant <= now, never None)
+            # does not trip this — it is provably preemptible, not a blocker.
+            if _busy_past(rid, now):
                 conflicts.append(TakeBackConflict(rid, "occupied"))
                 continue
             if rid in self.claimed_reservation_ids:
@@ -1360,7 +1482,11 @@ class ControllerState:
                 unknown.append(rid)
                 continue
             subject_id = subject_of_stub.get(rid)
-            if subject_id is not None and _busy_past(subject_id, slot_start(res)):
+            # The subject must be guaranteed past *both* the stub's start and
+            # the current instant: a subject occupant whose own guarantee has
+            # already elapsed must not block a take-back merely because the
+            # stub's window happens to have started in the past too.
+            if subject_id is not None and _busy_past(subject_id, max(slot_start(res), now)):
                 conflicts.append(TakeBackConflict(rid, "extension-in-use"))
                 continue
             taken.append(rid)
@@ -1495,3 +1621,158 @@ class ControllerState:
                 log.info(
                     "Take-back tombstone for reservation #%d cleared by push", rid
                 )
+
+    # ------------------------------------------------------------------
+    # Preemption planning (demand-driven capacity recovery)
+    # ------------------------------------------------------------------
+
+    def upcoming_boundaries(self, now: datetime, lead: timedelta) -> list[datetime]:
+        """Return distinct booking start times within *lead* of *now*, ascending.
+
+        A boundary ``S`` is in scope while ``now - lead < S <= now + lead``: it
+        enters phase A (proactive) as soon as it is within the lead window
+        before it opens, and stays in scope through phase B (at-boundary,
+        ``S <= now``) for one more *lead*-sized window after it opens — long
+        enough for a delayed sweep or a post-restart re-evaluation to still
+        catch it.  Data-driven (distinct ``slot_start`` values of active
+        bookings): hour alignment and DST are the reservation app's concern,
+        not this arithmetic's.
+        """
+        boundaries = {
+            slot_start(r)
+            for r in self.reservations
+            if r.kind == "booking" and now - lead < slot_start(r) <= now + lead
+        }
+        return sorted(boundaries)
+
+    def boundary_demand(
+        self,
+        boundary: datetime,
+        pods: list[PodRuntimeView],
+        now: datetime,
+    ) -> dict[str, int]:
+        """Return GPUs still needed per GPU-class label for bookings starting at *boundary*.
+
+        For each active ``kind == "booking"`` reservation whose window starts
+        exactly at *boundary*, the demand is its remaining budget
+        (``available``) minus the GPUs already supplied by a live reserved-path
+        holder whose back-to-back chain covers it (``reservations_claimed_by``)
+        — a chained holder needs no new capacity for the window it already
+        physically occupies.  Subtracting per-reservation rather than excluding
+        a whole claimed reservation from demand avoids under-counting a
+        partially-chained multi-GPU reservation (a 1-GPU holder chaining into a
+        4-GPU booking still leaves 3 GPUs of genuine demand).  A no-show
+        reservation contributes no demand — its capacity is already on-demand
+        pool territory. Reservations whose GPU-class label cannot be resolved
+        are skipped (logged at debug).
+        """
+        chained_gpus: dict[int, int] = {}
+        for p in pods:
+            if (
+                not p.reserved_path
+                or not p.node_resident
+                or p.terminating
+                or p.reservation_id is None
+            ):
+                continue
+            for rid in self.reservations_claimed_by(p.reservation_id, now):
+                chained_gpus[rid] = chained_gpus.get(rid, 0) + p.gpu_count
+
+        demand: dict[str, int] = {}
+        for r in self.reservations:
+            if r.kind != "booking" or r.user is None:
+                continue
+            if slot_start(r) != boundary:
+                continue
+            if r.id in self.noshow_reservation_ids:
+                continue
+            label = self._effective_label(r)
+            if label is None:
+                log.debug(
+                    "Boundary demand: reservation #%d has no resolvable "
+                    "gpu-class label; skipping",
+                    r.id,
+                )
+                continue
+            need = max(0, self.available(r) - chained_gpus.get(r.id, 0))
+            if need:
+                demand[label] = demand.get(label, 0) + need
+        return demand
+
+    def plan_boundary_preemption(
+        self,
+        boundary: datetime,
+        capacity_by_class: dict[str, int],
+        pods: list[PodRuntimeView],
+        now: datetime,
+        rng: Optional[random.Random] = None,
+    ) -> PreemptionPlan:
+        """Plan (but do not execute) the kills needed to clear *boundary*'s demand.
+
+        Per GPU class: ``kills_needed = max(0, demand - free)``.  Eligible
+        victims are pods of that class admitted by this controller
+        (``reservation_id`` set), physically running or about to
+        (``node_resident``), not already ``terminating``, requesting at least
+        one GPU, and past their runtime guarantee (``guarantee_end`` is
+        ``None`` — unresolvable, treated as already over — or ``<= now``).  A
+        pod within its guarantee is never selected, regardless of shortfall.
+        Selection is uniform-random among eligible victims (priority ranking
+        is future work) and greedy — it stops once enough GPUs are covered,
+        which may overshoot when victims aren't exactly the shortfall size.
+        Classes are planned independently; a victim from one class's plan
+        cannot be re-selected for another (they don't share a GPU class, so
+        this only matters for bookkeeping clarity).  Pure — no I/O, no state
+        mutation; the caller executes the deletions and marks bookkeeping.
+        """
+        rng = rng or random.Random()
+        demand = self.boundary_demand(boundary, pods, now)
+        free = free_capacity_by_class(capacity_by_class, pods)
+
+        def is_past_guarantee(p: PodRuntimeView) -> bool:
+            end = self.guarantee_end(p.reservation_id, reserved_path=p.reserved_path, now=now)
+            return end is None or end <= now
+
+        victims: list[PodRuntimeView] = []
+        unmet: dict[str, int] = {}
+        for gpu_class, need in demand.items():
+            kills_needed = max(0, need - free.get(gpu_class, 0))
+            if kills_needed == 0:
+                continue
+            eligible = [
+                p
+                for p in pods
+                if p.gpu_class == gpu_class
+                and p.reservation_id is not None
+                and p.node_resident
+                and not p.terminating
+                and p.gpu_count > 0
+                and is_past_guarantee(p)
+            ]
+            rng.shuffle(eligible)
+            killed_gpus = 0
+            for p in eligible:
+                if killed_gpus >= kills_needed:
+                    break
+                victims.append(p)
+                killed_gpus += p.gpu_count
+            if killed_gpus < kills_needed:
+                unmet[gpu_class] = kills_needed - killed_gpus
+
+        return PreemptionPlan(
+            boundary=boundary,
+            phase="B" if boundary <= now else "A",
+            demand_by_class=demand,
+            free_by_class=free,
+            victims=victims,
+            unmet_by_class=unmet,
+        )
+
+    def prune_preemption_marks(self, now: datetime, lead: timedelta) -> None:
+        """Drop boundary bookkeeping once phase B's grace window has closed.
+
+        Called at the start of every preemption sweep, mirroring
+        ``reconcile_noshow``'s prune-then-act shape.
+        """
+        stale = [b for b in self.preemption_fired if b <= now - lead]
+        for b in stale:
+            del self.preemption_fired[b]

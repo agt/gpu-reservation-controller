@@ -85,6 +85,7 @@ def _patched_main(monkeypatch, token):
     monkeypatch.setattr(main, "reservation_fetch_loop", _noop)
     monkeypatch.setattr(main, "pod_watch_loop", _noop)
     monkeypatch.setattr(main, "queue_processor_loop", _noop)
+    monkeypatch.setattr(main, "preemption_loop", _noop)
 
     orig = main.app.state.config
     monkeypatch.setattr(

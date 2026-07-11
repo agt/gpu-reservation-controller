@@ -235,7 +235,14 @@ rather than leaving idle GPUs unused.
 
 ## 8. What is NOT modeled (gaps for OR guidance)
 
-- **No priorities, weights, or preemption** between users or groups.
+- **No priorities, weights, or preemption** between users or groups **at
+  booking time** — the reservation app itself is pure FCFS within static
+  ceilings. (The separate Kubernetes controller *does* preempt at the pod
+  level, independent of this app's booking logic: a pod running past its
+  guaranteed window may be deleted to free capacity for an incoming
+  reservation, with random — not priority-based — victim selection among
+  overstayers. See the controller's README/CLAUDE.md for that mechanism; it
+  has no visibility into or effect on booking admission here.)
 - **No fairness mechanism** (no proportional sharing, max-min fairness, lottery,
   or aging) — purely FCFS within static per-group ceilings.
 - **No dynamic pricing or quota adjustment** — SU rates and discount schedules

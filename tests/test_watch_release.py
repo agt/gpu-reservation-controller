@@ -29,6 +29,8 @@ def _config(**overrides) -> Config:
         pod_list_tick_interval=300,
         scheduling_gate_name=None,
         inbound_api_token=None,
+        preemption_lead_minutes=15,
+        preemption_check_interval=60,
     )
     base.update(overrides)
     return Config(**base)

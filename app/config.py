@@ -21,6 +21,8 @@ class Config:
     pod_list_tick_interval: int    # seconds between queue-processor ticks
     scheduling_gate_name: Optional[str]  # SchedulingGate to remove on admission; None = disabled
     inbound_api_token: Optional[str]  # bearer token for the inbound push API; None = endpoint disabled
+    preemption_lead_minutes: int   # lead time before a slot boundary for phase-A preemption
+    preemption_check_interval: int  # seconds between preemption sweeps
     log_level: str = "INFO"        # root log level (LOG_LEVEL)
 
     @classmethod
@@ -67,5 +69,11 @@ class Config:
             ),
             scheduling_gate_name=os.environ.get("POD_SCHEDULING_GATE_NAME") or None,
             inbound_api_token=os.environ.get("INBOUND_API_TOKEN") or None,
+            preemption_lead_minutes=int(
+                os.environ.get("PREEMPTION_LEAD_MINUTES", "15")
+            ),
+            preemption_check_interval=int(
+                os.environ.get("PREEMPTION_CHECK_INTERVAL", "60")
+            ),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
         )

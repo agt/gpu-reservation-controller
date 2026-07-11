@@ -13,6 +13,7 @@ pod_has_toleration(pod, ...)                 — check for a specific toleration
 is_gpu_only_pending(pod)                      — guard 1: GPU-only scheduling failure check
 read_pod(name, namespace)                    — fetch current pod object
 snapshot_tolerated_pods(tol_key)             — one LIST → occupancy + claims + guard 3
+snapshot_node_gpu_capacity(taint_key)        — one LIST → allocatable GPUs per class (preemption planning)
 apply_toleration(...)                        — PATCH a pod to add toleration + booking annotation
 PodWatcher                                   — async-generator based pod event stream
 """
@@ -79,11 +80,6 @@ def get_pod_phase(pod) -> str:
 def is_terminal_phase(pod) -> bool:
     """Return True if *pod* is in a terminal phase (Succeeded/Failed)."""
     return get_pod_phase(pod) in TERMINAL_PHASES
-
-
-def get_pod_active_deadline(pod) -> Optional[int]:
-    """Return the pod's ``spec.activeDeadlineSeconds``, or ``None`` if unset."""
-    return pod.spec.active_deadline_seconds if pod.spec else None
 
 
 def get_pod_creation_timestamp(pod) -> Optional[datetime]:
@@ -307,11 +303,11 @@ class ToleratedPodInfo:
     gpu_count: int
     phase: str
     scheduled_false: bool  # PodScheduled condition present with status == "False"
-    # Deadline-projection inputs (take-back in-use checks): the pod's projected
-    # end is ``start_time + active_deadline_seconds``.  ``None`` when unset or
-    # not yet started — consumers must treat that as unbounded (fail safe).
-    active_deadline_seconds: Optional[int] = None
-    start_time: Optional[datetime] = None
+    # Set when the pod has been marked for deletion (``metadata.deletionTimestamp``).
+    # A terminating pod is excluded from residency accounting (preemption
+    # planning) and is never selected as a preemption victim (it is already on
+    # its way out).
+    deletion_timestamp: Optional[datetime] = None
 
 
 async def snapshot_tolerated_pods(toleration_key: str) -> list[ToleratedPodInfo]:
@@ -347,12 +343,54 @@ async def snapshot_tolerated_pods(toleration_key: str) -> list[ToleratedPodInfo]
                 gpu_count=get_pod_gpu_count(pod),
                 phase=get_pod_phase(pod),
                 scheduled_false=(scheduled is not None and scheduled.status == "False"),
-                active_deadline_seconds=get_pod_active_deadline(pod),
-                start_time=pod.status.start_time if pod.status else None,
+                deletion_timestamp=pod.metadata.deletion_timestamp,
             )
         )
     log.debug("k8s: tolerated snapshot returned %d pod(s)", len(out))
     return out
+
+
+async def snapshot_node_gpu_capacity(
+    taint_key: str, gpu_resource: str = "nvidia.com/gpu"
+) -> dict[str, int]:
+    """Return total allocatable GPUs per GPU-class label, from node taints.
+
+    LISTs all nodes and, for each node carrying a *taint_key* taint, sums
+    ``status.allocatable[gpu_resource]`` into the bucket keyed by the taint's
+    value (the GPU-class label, mirroring the toleration the controller
+    applies to pods).  Nodes that are cordoned (``spec.unschedulable``) or
+    being deleted are excluded — their GPUs are not placeable.  Feeds
+    preemption planning's notion of physical capacity per class; the
+    controller has no other source of "how many GPUs actually exist".
+    """
+    log.debug("k8s: list_node (gpu capacity snapshot)")
+    node_list = await _run(_core_v1.list_node)
+    capacity: dict[str, int] = {}
+    for node in node_list.items:
+        if node.spec and node.spec.unschedulable:
+            continue
+        if node.metadata.deletion_timestamp is not None:
+            continue
+        taints = node.spec.taints if (node.spec and node.spec.taints) else []
+        classes = {t.value for t in taints if t.key == taint_key and t.value}
+        if not classes:
+            continue
+        allocatable = (node.status.allocatable or {}) if node.status else {}
+        raw = allocatable.get(gpu_resource, "0")
+        try:
+            gpus = int(raw)
+        except (ValueError, TypeError):
+            log.warning(
+                "Node %s has non-integer allocatable %s=%r; treating as 0",
+                node.metadata.name,
+                gpu_resource,
+                raw,
+            )
+            gpus = 0
+        for gpu_class in classes:
+            capacity[gpu_class] = capacity.get(gpu_class, 0) + gpus
+    log.debug("k8s: node gpu capacity snapshot: %s", capacity)
+    return capacity
 
 
 async def apply_toleration(
@@ -439,23 +477,41 @@ async def remove_scheduling_gate(
     )
 
 
-async def set_active_deadline(pod_name: str, namespace: str, seconds: int) -> None:
-    """Patch pod's spec.activeDeadlineSeconds to *seconds* and record the limit
-    in the ``horae/pod-runtime-limit-seconds`` annotation."""
+async def annotate_runtime_guarantee(
+    pod_name: str, namespace: str, seconds: int, guaranteed_until: datetime
+) -> None:
+    """Annotate *pod_name* with its runtime guarantee.
+
+    Writes ``horae/pod-runtime-limit-seconds`` (legacy key; now the guaranteed
+    duration in seconds rather than a hard cap — still consumed by in-pod
+    countdown widgets) and ``horae/guaranteed-until`` (the same instant as an
+    absolute UTC ISO-8601 timestamp).  Informational only: unlike the retired
+    ``set_active_deadline``, this never patches ``spec.activeDeadlineSeconds``
+    — demand-driven preemption enforces nothing through a Kubernetes-side
+    deadline, and never reads these annotations back to make a decision; it
+    recomputes the guarantee live from reservation state
+    (``ControllerState.guarantee_end``).
+    """
+    until_str = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
     log.debug(
-        "k8s: patch_namespaced_pod %s/%s (activeDeadlineSeconds=%d)",
-        namespace, pod_name, seconds,
+        "k8s: patch_namespaced_pod %s/%s (runtime guarantee: %ds, until %s)",
+        namespace, pod_name, seconds, until_str,
     )
     patch = {
-        "metadata": {"annotations": {"horae/pod-runtime-limit-seconds": str(seconds)}},
-        "spec": {"activeDeadlineSeconds": seconds},
+        "metadata": {
+            "annotations": {
+                "horae/pod-runtime-limit-seconds": str(seconds),
+                "horae/guaranteed-until": until_str,
+            }
+        },
     }
     await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
     log.info(
-        "Set activeDeadlineSeconds=%d on pod %s/%s",
-        seconds,
+        "Recorded runtime guarantee on pod %s/%s: %ds (until %s)",
         namespace,
         pod_name,
+        seconds,
+        until_str,
     )
 
 
@@ -471,9 +527,10 @@ async def _emit_pod_event(
 ) -> None:
     """Create a ``Normal`` Kubernetes Event linked to *pod*.
 
-    Shared body for the runtime-cap and cancellation emitters (CODE-REVIEW D3c),
-    which differ only in *name_prefix* / *reason* / *action* / *message*.  Uses
-    ``generate_name`` so re-emitting for the same pod never 409s (B10).
+    Shared body for the runtime-guarantee, preemption, and cancellation
+    emitters (CODE-REVIEW D3c), which differ only in *name_prefix* / *reason*
+    / *action* / *message*.  Uses ``generate_name`` so re-emitting for the
+    same pod never 409s (B10).
     """
     now = datetime.now(timezone.utc)
     event = k8s_client.CoreV1Event(
@@ -503,37 +560,41 @@ async def _emit_pod_event(
     await _run(_core_v1.create_namespaced_event, namespace, event)
 
 
-async def emit_runtime_capped_event(
+async def emit_runtime_guaranteed_event(
     pod,
     pod_name: str,
     namespace: str,
-    deadline_seconds: int,
+    seconds: int,
+    guaranteed_until: datetime,
 ) -> None:
-    """Create a Kubernetes Event linked to *pod* with reason='RuntimeCapped'."""
-    minutes, secs = divmod(deadline_seconds, 60)
+    """Create a Kubernetes Event linked to *pod* with reason='RuntimeGuaranteed'."""
+    minutes, secs = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
     human = (
         f"{hours}h{minutes:02d}m{secs:02d}s"
         if hours
         else f"{minutes}m{secs:02d}s"
     )
+    until_str = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
     await _emit_pod_event(
         pod,
         pod_name,
         namespace,
-        name_prefix="gpu-runcap-",
-        reason="RuntimeCapped",
-        action="CapRuntime",
+        name_prefix="gpu-guarantee-",
+        reason="RuntimeGuaranteed",
+        action="GuaranteeRuntime",
         message=(
-            f"activeDeadlineSeconds set to {deadline_seconds} ({human}) "
-            f"to ensure the pod terminates within its GPU reservation window(s)."
+            f"GPU access guaranteed for {human}, until {until_str}. The pod may "
+            f"keep running after that, but can be preempted if reserved capacity "
+            f"is needed."
         ),
     )
     log.info(
-        "Emitted RuntimeCapped event for pod %s/%s (deadline=%ds)",
+        "Emitted RuntimeGuaranteed event for pod %s/%s (guaranteed=%ds, until=%s)",
         namespace,
         pod_name,
-        deadline_seconds,
+        seconds,
+        until_str,
     )
 
 
@@ -552,6 +613,35 @@ async def delete_pod(name: str, namespace: str) -> None:
             log.debug("Pod %s/%s already gone (404)", namespace, name)
             return
         raise
+
+
+async def emit_preempted_event(
+    pod,
+    pod_name: str,
+    namespace: str,
+    message: str,
+) -> None:
+    """Create a Kubernetes Event linked to *pod* with reason='Preempted'.
+
+    Emitted when the preemption sweep or a take-back grant deletes a pod
+    running past its runtime guarantee to recover capacity.  The caller builds
+    *message* (it knows whether the trigger was boundary demand or a
+    take-back grant, and how long the pod overstayed).
+    """
+    await _emit_pod_event(
+        pod,
+        pod_name,
+        namespace,
+        name_prefix="gpu-preempt-",
+        reason="Preempted",
+        action="PreemptPod",
+        message=message,
+    )
+    log.info(
+        "Emitted Preempted event for pod %s/%s",
+        namespace,
+        pod_name,
+    )
 
 
 async def emit_reservation_cancelled_event(

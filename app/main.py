@@ -1,10 +1,12 @@
 """GPU Reservation Kubernetes Controller — entry point.
 
-Starts three background asyncio tasks inside a FastAPI lifespan:
+Starts four background asyncio tasks inside a FastAPI lifespan:
 
 1. reservation_fetch_loop  — periodically refreshes the reservation list
 2. pod_watch_loop          — streams pod events and updates the work queue
 3. queue_processor_loop    — applies tolerations when reservation windows open
+4. preemption_loop         — recovers capacity from overstaying pods near a
+                              reservation boundary (demand-driven preemption)
 
 Additionally, when a pod is detected arriving *inside* an already-open
 reservation window (e.g. a JupyterHub notebook pod), the pod-watch loop
@@ -24,7 +26,7 @@ import random
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 
@@ -33,6 +35,7 @@ from .controller import (
     TOLERATION_KEY,
     ControllerState,
     OnDemandCandidate,
+    PodRuntimeView,
     QueueEntry,
     apply_push_to_active,
     canceller_description,
@@ -45,12 +48,13 @@ from .k8s_client import (
     BOOKING_KIND_RESERVED,
     TERMINAL_PHASES,
     PodWatcher,
+    annotate_runtime_guarantee,
     apply_toleration,
     delete_pod,
+    emit_preempted_event,
     emit_reservation_cancelled_event,
     emit_reservation_reassigned_event,
-    emit_runtime_capped_event,
-    get_pod_active_deadline,
+    emit_runtime_guaranteed_event,
     get_pod_booking_reference,
     get_pod_creation_timestamp,
     get_pod_gpu_count,
@@ -66,7 +70,7 @@ from .k8s_client import (
     pod_has_toleration,
     read_pod,
     remove_scheduling_gate,
-    set_active_deadline,
+    snapshot_node_gpu_capacity,
     snapshot_tolerated_pods,
 )
 from .reservation_client import ReservationClient
@@ -377,29 +381,34 @@ async def _handle_owner_changes(
 # ---------------------------------------------------------------------------
 
 
-async def _enforce_deadline(
-    pod_name: str, namespace: str, fresh_pod, max_seconds: int
+async def _record_guarantee(
+    pod_name: str, namespace: str, fresh_pod, guaranteed_until: datetime, now: datetime
 ) -> None:
-    """Cap the pod's activeDeadlineSeconds to *max_seconds* and emit an Event.
+    """Annotate the pod with its runtime guarantee and emit a RuntimeGuaranteed Event.
 
     Shared by both admission paths (CODE-REVIEW D1a); callers compute
-    *max_seconds* (the reserved path chains back-to-back windows, the on-demand
-    path uses the single block's remaining time).  Only patches when the current
-    deadline is unset or looser than *max_seconds*.
+    *guaranteed_until* (the reserved path chains back-to-back windows, the
+    on-demand path uses the single block's ``effective_end``).  Unlike the
+    retired hard deadline this sets no Kubernetes enforcement — no
+    ``spec.activeDeadlineSeconds`` is patched, so a pod may run past its
+    guarantee freely.  Demand-driven preemption recovers capacity from an
+    overstaying pod only when needed (see ``preemption_loop``), deciding by
+    recomputing the guarantee live from reservation state
+    (``ControllerState.guarantee_end``) — never by reading these annotations
+    back.
 
-    Best-effort: logs a warning on failure but does not raise, so a deadline
-    enforcement failure never rolls back an already-applied toleration.
+    Best-effort: logs a warning on failure but does not raise, so a failure to
+    record the guarantee never rolls back an already-applied toleration.
     """
     try:
-        current = get_pod_active_deadline(fresh_pod)
-        if current is None or current > max_seconds:
-            await set_active_deadline(pod_name, namespace, max_seconds)
-            await emit_runtime_capped_event(
-                fresh_pod, pod_name, namespace, max_seconds
-            )
+        seconds = max(1, int((guaranteed_until - now).total_seconds()))
+        await annotate_runtime_guarantee(pod_name, namespace, seconds, guaranteed_until)
+        await emit_runtime_guaranteed_event(
+            fresh_pod, pod_name, namespace, seconds, guaranteed_until
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning(
-            "Failed to enforce activeDeadlineSeconds on pod %s/%s: %s",
+            "Failed to record runtime guarantee on pod %s/%s: %s",
             namespace,
             pod_name,
             exc,
@@ -468,8 +477,8 @@ async def _try_apply_toleration(
         fresh_pod = await read_pod(entry.pod_name, entry.pod_namespace)
 
         # Drop a pod that completed while queued — mirrors the on-demand path's
-        # terminal-phase drop, so a finished pod is never tolerated / capped
-        # (which would only fail into the deadline warning path) (CODE-REVIEW D1c).
+        # terminal-phase drop, so a finished pod is never tolerated / stamped with
+        # a guarantee (which would only fail into the warning path) (CODE-REVIEW D1c).
         if is_terminal_phase(fresh_pod):
             log.info(
                 "Pod %s/%s is %s; dropping from queue",
@@ -498,16 +507,17 @@ async def _try_apply_toleration(
                 booking_reference,
             )
             now = datetime.now(timezone.utc)
-            max_secs = state.compute_max_deadline_seconds(now, entry.reservation)
-            await _enforce_deadline(
-                entry.pod_name, entry.pod_namespace, fresh_pod, max_secs
+            guaranteed_until = state.compute_guaranteed_until(now, entry.reservation)
+            await _record_guarantee(
+                entry.pod_name, entry.pod_namespace, fresh_pod, guaranteed_until, now
             )
             await _enforce_scheduling_gate_removal(
                 entry.pod_name, entry.pod_namespace, fresh_pod, scheduling_gate_name
             )
             log.info(
                 "Admitted pod %s/%s under reservation #%d "
-                "(gpu-class=%s, gpus=%d, %d/%d free after placement, cap=%ds)",
+                "(gpu-class=%s, gpus=%d, %d/%d free after placement, "
+                "guaranteed until %s)",
                 entry.pod_namespace,
                 entry.pod_name,
                 entry.reservation.id,
@@ -515,7 +525,7 @@ async def _try_apply_toleration(
                 entry.gpu_requested,
                 state.available(entry.reservation),
                 entry.reservation.gpu_count,
-                max_secs,
+                guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
             )
         return True
 
@@ -553,7 +563,7 @@ async def _try_place_ondemand(
        within the single-threaded event loop.
     3. Re-read the pod; if it is gone or terminal, roll back and drop.
     4. Apply toleration.
-    5. Cap runtime to the block's window end and emit a RuntimeCapped event.
+    5. Record the guarantee (block's window end) and emit a RuntimeGuaranteed event.
     """
     now = datetime.now(timezone.utc)
     block = state.find_ondemand_block(
@@ -652,20 +662,23 @@ async def _try_place_ondemand(
             booking_reference,
         )
 
-        # Cap runtime to the on-demand block's window end (no back-to-back
-        # chaining) BEFORE lifting the scheduling gate: on a block whose whole
-        # premise is "free only until slot_end", the pod must not be allowed to
-        # start running with no deadline if the cap patch fails (CODE-REVIEW D1b).
-        remaining = max(int((state.effective_end(block) - datetime.now(timezone.utc)).total_seconds()), 1)
-        await _enforce_deadline(
-            candidate.pod_name, candidate.pod_namespace, fresh_pod, remaining
+        # Record the guarantee (block's window end, no back-to-back chaining)
+        # BEFORE lifting the scheduling gate: the guarantee annotations should
+        # be visible to any in-pod widget from the moment the pod can start
+        # running (CODE-REVIEW D1b; no longer a safety cap — demand-driven
+        # preemption, not a Kubernetes deadline, is what bounds this pod now).
+        now = datetime.now(timezone.utc)
+        guaranteed_until = state.effective_end(block)
+        await _record_guarantee(
+            candidate.pod_name, candidate.pod_namespace, fresh_pod, guaranteed_until, now
         )
         await _enforce_scheduling_gate_removal(
             candidate.pod_name, candidate.pod_namespace, fresh_pod, scheduling_gate_name
         )
         log.info(
             "Placed on-demand pod %s/%s onto block #%d "
-            "(gpu-class=%s, gpus=%d, block has %d/%d free after placement, cap=%ds)",
+            "(gpu-class=%s, gpus=%d, block has %d/%d free after placement, "
+            "guaranteed until %s)",
             candidate.pod_namespace,
             candidate.pod_name,
             block.id,
@@ -673,7 +686,7 @@ async def _try_place_ondemand(
             candidate.gpu_requested,
             state.available(block),
             block.gpu_count,
-            remaining,
+            guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
 
         return True
@@ -1044,6 +1057,163 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Background loop 4: preemption sweep
+# ---------------------------------------------------------------------------
+
+
+def _pod_view(p) -> PodRuntimeView:
+    """Digest a ``k8s_client.ToleratedPodInfo`` into the plain view the pure
+    preemption-planning functions in controller.py operate on."""
+    return PodRuntimeView(
+        uid=p.uid,
+        namespace=p.namespace,
+        name=p.name,
+        gpu_class=p.gpu_class,
+        gpu_count=p.gpu_count,
+        reservation_id=p.reservation_id,
+        reserved_path=is_reserved_path(p.booking_reference),
+        node_resident=(p.phase == "Running" or (p.phase == "Pending" and not p.scheduled_false)),
+        terminating=p.deletion_timestamp is not None,
+    )
+
+
+def _preemption_message(
+    state: ControllerState, view: PodRuntimeView, boundary: datetime, now: datetime
+) -> str:
+    """Build the human-readable ``Preempted`` event message for *view*."""
+    end = state.guarantee_end(view.reservation_id, reserved_path=view.reserved_path, now=now)
+    if end is not None:
+        overstay = max(0, int((now - end).total_seconds()))
+        minutes, secs = divmod(overstay, 60)
+        hours, minutes = divmod(minutes, 60)
+        human = f"{hours}h{minutes:02d}m{secs:02d}s" if hours else f"{minutes}m{secs:02d}s"
+        guarantee_desc = f"overstayed its runtime guarantee by {human}"
+    else:
+        guarantee_desc = "its runtime guarantee could no longer be resolved (reservation no longer active)"
+    return (
+        f"Pod preempted to free capacity for reservation(s) starting "
+        f"{boundary.strftime('%Y-%m-%dT%H:%M:%SZ')}: {guarantee_desc}."
+    )
+
+
+async def _preempt_pod(
+    state: ControllerState, namespace: str, name: str, uid: str, message: str
+) -> None:
+    """Delete an overstaying pod to recover capacity.
+
+    Shared by the preemption sweep and the take-back grant path.  Mirrors
+    ``_handle_cancelled_reservations``'s shape exactly: emit the event before
+    deleting (best-effort — a failed emit does not block the delete), then
+    delete and release occupancy together (best-effort — if the delete fails,
+    occupancy is left as-is since the pod may still be there).
+    """
+    try:
+        pod_obj = await read_pod(name, namespace)
+        await emit_preempted_event(pod_obj, name, namespace, message)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Could not emit Preempted event for pod %s/%s: %s", namespace, name, exc
+        )
+    try:
+        await delete_pod(name, namespace)
+        state.release_pod(uid)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not delete pod %s/%s: %s", namespace, name, exc)
+
+
+async def _run_preemption_sweep(
+    state: ControllerState, config: Config, now: Optional[datetime] = None
+) -> None:
+    """One preemption-sweep evaluation: clear demand at any in-scope boundary.
+
+    For each slot boundary within ``PREEMPTION_LEAD_MINUTES`` of *now* whose
+    phase ("A" = lead-time, "B" = at-boundary) has not already been evaluated,
+    plan the kills needed to cover its demand and execute them.  The two
+    snapshots (pods, node capacity) are taken outside the lock; either
+    failing skips the whole sweep with a WARNING — the controller never kills
+    a pod based on unknown physical state.  Planning and the resulting
+    deletions run under ``reservation_lock`` (mirrors the take-back handler
+    and the cancellation/owner-change eviction paths); boundaries are
+    processed in ascending order with a running ``doomed`` set so one sweep
+    never double-selects a pod's GPUs across two boundaries.
+    """
+    now = now or datetime.now(timezone.utc)
+    lead = timedelta(minutes=config.preemption_lead_minutes)
+    state.prune_preemption_marks(now, lead)
+    boundaries = state.upcoming_boundaries(now, lead)
+    if not boundaries:
+        return
+
+    try:
+        snapshot = await snapshot_tolerated_pods(TOLERATION_KEY)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Preemption sweep: failed to snapshot pods: %s", exc, exc_info=True)
+        return
+    try:
+        capacity = await snapshot_node_gpu_capacity(TOLERATION_KEY)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Preemption sweep: failed to snapshot node GPU capacity: %s", exc, exc_info=True
+        )
+        return
+
+    async with state.reservation_lock:
+        pods = [_pod_view(p) for p in snapshot]
+        doomed: set[str] = set()
+        to_kill: list[tuple[PodRuntimeView, str]] = []
+        for boundary in boundaries:
+            phase = "B" if boundary <= now else "A"
+            fired = state.preemption_fired.setdefault(boundary, set())
+            if phase in fired:
+                continue
+            fired.add(phase)
+            available_pods = [p for p in pods if p.uid not in doomed]
+            plan = state.plan_boundary_preemption(boundary, capacity, available_pods, now)
+            if plan.demand_by_class:
+                log.info(
+                    "Preemption sweep boundary=%s phase=%s: demand=%s free=%s kills=%d",
+                    boundary.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    phase,
+                    plan.demand_by_class,
+                    plan.free_by_class,
+                    len(plan.victims),
+                )
+            for gpu_class, shortfall in plan.unmet_by_class.items():
+                log.warning(
+                    "Preemption sweep boundary=%s phase=%s: %d GPU(s) of gpu-class=%s "
+                    "still short after preempting all eligible overstayers",
+                    boundary.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    phase,
+                    shortfall,
+                    gpu_class,
+                )
+            for victim in plan.victims:
+                doomed.add(victim.uid)
+                to_kill.append((victim, _preemption_message(state, victim, boundary, now)))
+
+        for victim, message in to_kill:
+            log.info(
+                "Preempting pod %s/%s (gpu-class=%s, gpus=%d): %s",
+                victim.namespace,
+                victim.name,
+                victim.gpu_class,
+                victim.gpu_count,
+                message,
+            )
+            await _preempt_pod(state, victim.namespace, victim.name, victim.uid, message)
+
+
+async def preemption_loop(state: ControllerState, config: Config) -> None:
+    """Every ``config.preemption_check_interval`` s, run a preemption sweep."""
+    while True:
+        await asyncio.sleep(config.preemption_check_interval)
+        try:
+            await _run_preemption_sweep(state, config)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Preemption sweep failed: %s", exc, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 
@@ -1092,7 +1262,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             config.reservation_fetch_interval,
         )
 
-    # Launch the three background loops as asyncio tasks.
+    # Launch the four background loops as asyncio tasks.
     tasks = [
         asyncio.create_task(
             reservation_fetch_loop(state, client, config),
@@ -1100,6 +1270,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
         asyncio.create_task(pod_watch_loop(state, config), name="pod-watch"),
         asyncio.create_task(queue_processor_loop(state, config), name="queue-processor"),
+        asyncio.create_task(preemption_loop(state, config), name="preemption"),
     ]
     log.info("GPU reservation controller started")
 
@@ -1269,14 +1440,18 @@ async def take_back_reclaim_blocks(
 
     The app calls this before committing a booking built from capacity the
     controller is holding (e.g. a tentative offer inside the preempt guard).
-    All-or-nothing: if any requested block is in use — a pod admitted on it, or
-    a merged extension a running job's deadline reaches into — the whole request
-    fails with 409 and nothing changes.  On success the blocks leave the
-    controller's scheduling universe immediately (absorbed blocks are detached
-    from their merge subject) and are tombstoned so a stale fetch cannot
-    resurrect them; pushing the id back (``POST /api/reservations/push``) is the
-    restore path if the booking falls through.  503 when idleness cannot be
-    verified (pod snapshot failed) — fail closed, nothing granted.
+    All-or-nothing: if any requested block is in use — a pod still within its
+    runtime guarantee is admitted on it, or a merged extension a guaranteed
+    job reaches into — the whole request fails with 409 and nothing changes.
+    A pod *past* its runtime guarantee never blocks a take-back — a take-back
+    request is itself explicit demand for the capacity, so granting it deletes
+    such overstaying pods immediately rather than waiting for the next
+    preemption sweep.  On success the blocks leave the controller's scheduling
+    universe immediately (absorbed blocks are detached from their merge
+    subject) and are tombstoned so a stale fetch cannot resurrect them;
+    pushing the id back (``POST /api/reservations/push``) is the restore path
+    if the booking falls through.  503 when idleness cannot be verified (pod
+    snapshot failed) — fail closed, nothing granted.
     """
     state: ControllerState = request.app.state.controller_state
     config: Config = request.app.state.config
@@ -1295,23 +1470,30 @@ async def take_back_reclaim_blocks(
                 detail="Cannot verify block idleness (pod snapshot failed); retry later",
             )
 
-        # Projected end per live pod, keyed by the reservation id it occupies.
-        # None = unknown/unbounded (fail safe).  In-memory occupancy is merged
-        # in to cover pods whose admission patch is still in flight (recorded
-        # synchronously before any await) and thus not yet visible to the LIST.
-        # No await may occur between here and take_back_blocks: that keeps the
-        # check-and-mutate atomic against the placement coroutines.
+        # Runtime-guarantee end per live pod, keyed by the reservation id it
+        # occupies — recomputed live (no Kubernetes deadline is set any more)
+        # rather than read back from a frozen activeDeadlineSeconds.  A pod
+        # whose guarantee has already elapsed is mapped to *now* itself, never
+        # to None: None keeps exactly one meaning below (unknown/in-flight,
+        # unbounded, fail safe).  In-memory occupancy is merged in to cover
+        # pods whose admission patch is still in flight (recorded
+        # synchronously before any await) and thus not yet visible to the
+        # LIST.  No await may occur between here and take_back_blocks: that
+        # keeps the check-and-mutate atomic against the placement coroutines.
         pod_ends: dict[int, list[datetime | None]] = {}
         seen_uids: set[str] = set()
         for p in snapshot:
             if p.phase not in ("Running", "Pending") or p.reservation_id is None:
                 continue
             seen_uids.add(p.uid)
-            if p.active_deadline_seconds is not None and p.start_time is not None:
-                projected = p.start_time + timedelta(seconds=p.active_deadline_seconds)
-            else:
-                projected = None
-            pod_ends.setdefault(p.reservation_id, []).append(projected)
+            guarantee = state.guarantee_end(
+                p.reservation_id,
+                reserved_path=is_reserved_path(p.booking_reference),
+                now=now,
+            )
+            pod_ends.setdefault(p.reservation_id, []).append(
+                guarantee if guarantee is not None else now
+            )
         for rid, occupants in state.occupancy.items():
             for uid in occupants:
                 if uid not in seen_uids:
@@ -1324,6 +1506,26 @@ async def take_back_reclaim_blocks(
             unknown_expiry=now
             + timedelta(seconds=2 * config.reservation_fetch_interval),
         )
+
+        # On grant, delete any live pod still recorded under a granted id —
+        # the occupied check above already proved it is past its runtime
+        # guarantee, so this is a provable preemption, not a guess.  Runs
+        # under the same lock as the eviction paths above it (mirrors
+        # _handle_cancelled_reservations / the preemption sweep).
+        if result.granted:
+            granted_ids = set(result.taken_back) | set(result.unknown)
+            for p in snapshot:
+                if (
+                    p.reservation_id in granted_ids
+                    and p.phase in ("Running", "Pending")
+                    and p.deletion_timestamp is None
+                ):
+                    message = (
+                        f"Block #{p.reservation_id} taken back by the reservation "
+                        f"app to be re-booked; the pod had already run past its "
+                        f"runtime guarantee."
+                    )
+                    await _preempt_pod(state, p.namespace, p.name, p.uid, message)
 
     if result.invalid:
         log.info(

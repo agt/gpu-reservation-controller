@@ -76,6 +76,15 @@ config:
   # Leave empty to disable scheduling gate management.
   podSchedulingGateName: ""
 
+  # Minutes before an upcoming reservation slot boundary that the preemption
+  # sweep's phase-A pass runs (proactively frees capacity from overstaying
+  # pods so the incoming reservation has room when its window opens).
+  preemptionLeadMinutes: 15
+
+  # Seconds between preemption sweeps (checks whether any upcoming boundary
+  # needs capacity freed, and whether any just-expired blocks need cleanup).
+  preemptionCheckInterval: 60
+
 # ---------------------------------------------------------------------------
 # ServiceAccount and RBAC
 # ---------------------------------------------------------------------------
