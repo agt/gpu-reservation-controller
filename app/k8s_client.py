@@ -13,6 +13,7 @@ pod_has_toleration(pod, ...)                 — check for a specific toleration
 is_gpu_only_pending(pod)                      — guard 1: GPU-only scheduling failure check
 read_pod(name, namespace)                    — fetch current pod object
 snapshot_tolerated_pods(tol_key)             — one LIST → occupancy + claims + guard 3
+snapshot_node_gpu_capacity(taint_key)        — one LIST → allocatable GPUs per class (preemption planning)
 apply_toleration(...)                        — PATCH a pod to add toleration + booking annotation
 PodWatcher                                   — async-generator based pod event stream
 """
@@ -310,8 +311,16 @@ class ToleratedPodInfo:
     # Deadline-projection inputs (take-back in-use checks): the pod's projected
     # end is ``start_time + active_deadline_seconds``.  ``None`` when unset or
     # not yet started — consumers must treat that as unbounded (fail safe).
+    # TODO(preemption): retired once the take-back projection is re-based on
+    # ``ControllerState.guarantee_end`` (see docs/plan) — kept for now so the
+    # existing take-back handler keeps working until that cutover lands.
     active_deadline_seconds: Optional[int] = None
     start_time: Optional[datetime] = None
+    # Set when the pod has been marked for deletion (``metadata.deletionTimestamp``).
+    # A terminating pod is excluded from residency accounting (preemption
+    # planning) and is never selected as a preemption victim (it is already on
+    # its way out).
+    deletion_timestamp: Optional[datetime] = None
 
 
 async def snapshot_tolerated_pods(toleration_key: str) -> list[ToleratedPodInfo]:
@@ -349,10 +358,54 @@ async def snapshot_tolerated_pods(toleration_key: str) -> list[ToleratedPodInfo]
                 scheduled_false=(scheduled is not None and scheduled.status == "False"),
                 active_deadline_seconds=get_pod_active_deadline(pod),
                 start_time=pod.status.start_time if pod.status else None,
+                deletion_timestamp=pod.metadata.deletion_timestamp,
             )
         )
     log.debug("k8s: tolerated snapshot returned %d pod(s)", len(out))
     return out
+
+
+async def snapshot_node_gpu_capacity(
+    taint_key: str, gpu_resource: str = "nvidia.com/gpu"
+) -> dict[str, int]:
+    """Return total allocatable GPUs per GPU-class label, from node taints.
+
+    LISTs all nodes and, for each node carrying a *taint_key* taint, sums
+    ``status.allocatable[gpu_resource]`` into the bucket keyed by the taint's
+    value (the GPU-class label, mirroring the toleration the controller
+    applies to pods).  Nodes that are cordoned (``spec.unschedulable``) or
+    being deleted are excluded — their GPUs are not placeable.  Feeds
+    preemption planning's notion of physical capacity per class; the
+    controller has no other source of "how many GPUs actually exist".
+    """
+    log.debug("k8s: list_node (gpu capacity snapshot)")
+    node_list = await _run(_core_v1.list_node)
+    capacity: dict[str, int] = {}
+    for node in node_list.items:
+        if node.spec and node.spec.unschedulable:
+            continue
+        if node.metadata.deletion_timestamp is not None:
+            continue
+        taints = node.spec.taints if (node.spec and node.spec.taints) else []
+        classes = {t.value for t in taints if t.key == taint_key and t.value}
+        if not classes:
+            continue
+        allocatable = (node.status.allocatable or {}) if node.status else {}
+        raw = allocatable.get(gpu_resource, "0")
+        try:
+            gpus = int(raw)
+        except (ValueError, TypeError):
+            log.warning(
+                "Node %s has non-integer allocatable %s=%r; treating as 0",
+                node.metadata.name,
+                gpu_resource,
+                raw,
+            )
+            gpus = 0
+        for gpu_class in classes:
+            capacity[gpu_class] = capacity.get(gpu_class, 0) + gpus
+    log.debug("k8s: node gpu capacity snapshot: %s", capacity)
+    return capacity
 
 
 async def apply_toleration(

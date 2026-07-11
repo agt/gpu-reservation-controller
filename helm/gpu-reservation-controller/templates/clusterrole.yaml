@@ -6,13 +6,20 @@ metadata:
     {{- include "gpu-reservation-controller.labels" . | nindent 4 }}
 rules:
   # The controller lists and watches pods across all namespaces to detect
-  # reservation candidates, patches pods to apply tolerations and set
-  # activeDeadlineSeconds, and deletes pods when a reservation is cancelled.
+  # reservation candidates, patches pods to apply tolerations and record
+  # runtime-guarantee annotations, and deletes pods when a reservation is
+  # cancelled or when capacity must be recovered from an overstaying pod.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch", "patch", "delete"]
-  # emit_runtime_capped_event and emit_reservation_cancelled_event create
-  # Normal events on admitted pods.
+  # emit_runtime_guaranteed_event, emit_preempted_event, and
+  # emit_reservation_cancelled_event create Normal events on admitted pods.
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create"]
+  # snapshot_node_gpu_capacity sums allocatable nvidia.com/gpu per
+  # gpu-class-reservation taint value to compute physical capacity for
+  # preemption planning.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]

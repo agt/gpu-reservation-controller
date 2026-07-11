@@ -34,6 +34,8 @@ _CONFIG_ENV = [
     "NOSHOWN_GRACE_MINUTES",
     "POD_LIST_TICK_INTERVAL",
     "POD_SCHEDULING_GATE_NAME",
+    "PREEMPTION_LEAD_MINUTES",
+    "PREEMPTION_CHECK_INTERVAL",
     "LOG_LEVEL",
 ]
 
@@ -79,6 +81,8 @@ class TestConfigFromEnv:
         assert c.pod_list_tick_interval == 300
         assert c.ondemand_placement_enabled is True
         assert c.scheduling_gate_name is None
+        assert c.preemption_lead_minutes == 15
+        assert c.preemption_check_interval == 60
 
     def test_noshow_new_name_preferred_over_legacy(self, monkeypatch):
         from app.config import Config
