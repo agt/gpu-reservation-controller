@@ -52,6 +52,7 @@ from .k8s_client import (
     annotate_runtime_guarantee,
     apply_toleration,
     delete_pod,
+    emit_ondemand_upgraded_event,
     emit_overstay_relinked_event,
     emit_preempted_event,
     emit_reservation_cancelled_event,
@@ -996,9 +997,9 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
         # boundary is near for the preemption sweep to act on.  Held under the
         # reservation lock (unlike the rest of this tick) so a concurrent
         # fetch/push cannot swap the reservation set across the patch awaits.
-        if config.overstay_adoption_enabled and snapshot is not None:
+        if config.pod_adoption_enabled and snapshot is not None:
             async with state.reservation_lock:
-                await _adopt_overstay_pods(
+                await _adopt_pods(
                     state, config, [_pod_view(p) for p in snapshot], now
                 )
 
@@ -1134,27 +1135,29 @@ async def _preempt_pod(
         log.warning("Could not delete pod %s/%s: %s", namespace, name, exc)
 
 
-async def _adopt_overstay_pods(
+async def _adopt_pods(
     state: ControllerState,
     config: Config,
     pods: list[PodRuntimeView],
     now: datetime,
 ) -> None:
-    """Re-link overstay pods to a reservation their user has since booked.
+    """Re-link pods to a reservation their user has since booked.
 
     Caller must hold ``state.reservation_lock`` and pass the ``pods`` list it
     derived from a fresh ``snapshot_tolerated_pods``.  For each adoption planned
-    by ``plan_overstay_adoptions``, re-annotate the pod's booking-reference to
-    the new reservation (the toleration is already present, so this patch just
-    rewrites the annotation) and, **only on patch success**, move its occupancy
-    and update the in-memory view so subsequent planning in the same tick sees
-    the new binding.  Each pod is independently best-effort: a failure logs a
-    warning and never deletes the pod.  *pods* is mutated in place — an adopted
-    entry is replaced with a view carrying the new reservation id.
+    by ``plan_pod_adoptions`` — a rescue for a pod already past its runtime
+    guarantee, or a proactive upgrade of a within-guarantee on-demand pod — re-
+    annotate the pod's booking-reference to the new reservation (the toleration
+    is already present, so this patch just rewrites the annotation) and, **only
+    on patch success**, move its occupancy and update the in-memory view so
+    subsequent planning in the same tick sees the new binding.  Each pod is
+    independently best-effort: a failure logs a warning and never deletes the
+    pod.  *pods* is mutated in place — an adopted entry is replaced with a view
+    carrying the new reservation id.
     """
-    if not config.overstay_adoption_enabled:
+    if not config.pod_adoption_enabled:
         return
-    for view, res_new in state.plan_overstay_adoptions(pods, now):
+    for view, res_new, was_overstay in state.plan_pod_adoptions(pods, now):
         booking_reference = make_booking_reference(BOOKING_KIND_RESERVED, res_new.id)
         try:
             fresh_pod = await read_pod(view.name, view.namespace)
@@ -1186,7 +1189,8 @@ async def _adopt_overstay_pods(
 
         guaranteed_until = state.compute_guaranteed_until(now, res_new)
         log.info(
-            "Re-linked overstay pod %s/%s to reservation #%d (guaranteed until %s)",
+            "%s pod %s/%s to reservation #%d (guaranteed until %s)",
+            "Re-linked overstay" if was_overstay else "Upgraded on-demand",
             view.namespace,
             view.name,
             res_new.id,
@@ -1195,13 +1199,18 @@ async def _adopt_overstay_pods(
         await _record_guarantee(
             view.name, view.namespace, fresh_pod, guaranteed_until, now
         )
+        emit_event = (
+            emit_overstay_relinked_event if was_overstay else emit_ondemand_upgraded_event
+        )
+        event_reason = "OverstayRelinked" if was_overstay else "OnDemandUpgraded"
         try:
-            await emit_overstay_relinked_event(
+            await emit_event(
                 fresh_pod, view.name, view.namespace, res_new.id, guaranteed_until
             )
         except Exception as exc:  # noqa: BLE001
             log.warning(
-                "Could not emit OverstayRelinked event for pod %s/%s: %s",
+                "Could not emit %s event for pod %s/%s: %s",
+                event_reason,
                 view.namespace,
                 view.name,
                 exc,
@@ -1250,7 +1259,7 @@ async def _run_preemption_sweep(
         # any kills: an adopted pod's occupancy re-homes to its new reservation
         # (zeroing that boundary's demand) and its refreshed view is no longer
         # past-guarantee, so it can never be selected as a victim.
-        await _adopt_overstay_pods(state, config, pods, now)
+        await _adopt_pods(state, config, pods, now)
         doomed: set[str] = set()
         to_kill: list[tuple[PodRuntimeView, str]] = []
         for boundary in boundaries:

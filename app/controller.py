@@ -1699,38 +1699,57 @@ class ControllerState:
         """Return True if *view*'s runtime guarantee is over (or unresolvable).
 
         Shared by ``plan_boundary_preemption`` (victim eligibility) and
-        ``plan_overstay_adoptions`` (adoption eligibility) so both agree on what
-        "overstay" means: ``guarantee_end`` is ``None`` (not ours / no longer
-        active) or ``<= now``.
+        ``plan_pod_adoptions`` (rescue eligibility for reserved-path pods, and
+        to distinguish rescue from proactive upgrade for on-demand pods) so all
+        agree on what "overstay" means: ``guarantee_end`` is ``None`` (not ours
+        / no longer active) or ``<= now``.
         """
         end = self.guarantee_end(
             view.reservation_id, reserved_path=view.reserved_path, now=now
         )
         return end is None or end <= now
 
-    def plan_overstay_adoptions(
+    def plan_pod_adoptions(
         self,
         pods: list[PodRuntimeView],
         now: datetime,
-    ) -> list[tuple[PodRuntimeView, ReservationResponse]]:
-        """Plan (but do not execute) re-links of overstay pods to open bookings.
+    ) -> list[tuple[PodRuntimeView, ReservationResponse, bool]]:
+        """Plan (but do not execute) re-links of pods to a user's open booking.
 
-        For each pod running **past its runtime guarantee** (``_past_guarantee``)
-        that this controller admitted (``reservation_id`` set), physically
-        present (``node_resident``, not ``terminating``, ``gpu_count > 0``), find
-        a currently-open booking the same user holds with spare budget
-        (``find_open_booking_for``) and, if it is a *different* reservation,
-        assign the pod to it.  This rescues a pod whose user re-booked capacity
-        the existing back-to-back chaining cannot reach (a non-abutting follow-on
-        window, a different ``gpu_count``, or an on-demand pod) before the
-        preemption sweep would reclaim it.
+        Covers two distinct triggers, gated differently by admission path:
+
+        - **Reserved-path** pods (``res-<id>``) are only rescued once **past
+          their runtime guarantee** (``_past_guarantee``) — there is no reason
+          to touch a pod already correctly tied to its own live booking. This
+          rescues a pod whose user re-booked capacity the existing
+          back-to-back chaining cannot reach (a non-abutting follow-on window
+          or a different ``gpu_count``) before the preemption sweep would
+          reclaim it.
+        - **On-demand-path** pods (``ondemand-<id>`` / ``noshow-<id>``) are
+          eligible any time — not just once past guarantee. The moment the
+          same user has a currently-open booking with spare budget, the
+          on-demand job is proactively upgraded to that reservation rather
+          than waiting for it to overstay its own on-demand block. This is
+          unconditional: no "shrink guard" — the upgrade happens even if the
+          new booking's own guarantee would end sooner than the on-demand
+          block's current (possibly merge-extended) guarantee.
+
+        Both triggers require the pod to be controller-admitted
+        (``reservation_id`` set), physically present (``node_resident``, not
+        ``terminating``, ``gpu_count > 0``), and a currently-open booking the
+        same user holds with spare budget (``find_open_booking_for``) that
+        differs from the pod's current reservation. The returned tuple's third
+        element is ``True`` when the pod was already past its runtime
+        guarantee at plan time (a rescue) and ``False`` when it was a
+        within-guarantee on-demand pod (a proactive upgrade) — callers use
+        this to pick an accurate event/message.
 
         Budget is respected across the pass: a running per-reservation tally is
-        subtracted from ``available`` so several overstay pods cannot over-book
-        one reservation.  Pure — no I/O, no state mutation; the caller performs
+        subtracted from ``available`` so several adopted pods cannot over-book
+        one reservation. Pure — no I/O, no state mutation; the caller performs
         the annotation patch and occupancy re-home.
         """
-        assignments: list[tuple[PodRuntimeView, ReservationResponse]] = []
+        assignments: list[tuple[PodRuntimeView, ReservationResponse, bool]] = []
         extra_used: dict[int, int] = {}
         for p in pods:
             if (
@@ -1740,14 +1759,15 @@ class ControllerState:
                 or p.gpu_count <= 0
             ):
                 continue
-            if not self._past_guarantee(p, now):
+            overstay = self._past_guarantee(p, now)
+            if p.reserved_path and not overstay:
                 continue
             res = self.find_open_booking_for(
                 p.namespace, p.gpu_class, now, p.gpu_count, extra_used=extra_used
             )
             if res is None or res.id == p.reservation_id:
                 continue
-            assignments.append((p, res))
+            assignments.append((p, res, overstay))
             extra_used[res.id] = extra_used.get(res.id, 0) + p.gpu_count
         return assignments
 
