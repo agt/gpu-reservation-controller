@@ -955,6 +955,47 @@ async def pod_watch_loop(
                 )
 
 
+async def _cancel_pending_noshows(
+    state: ControllerState, client: ReservationClient, snapshot: list
+) -> None:
+    """Durably cancel each declared no-show still awaiting one (POST
+    ``/api/reservations/{id}/cancel``, ``reason="no-show"``), so the app can
+    re-book the window immediately and a restart never needs to re-arm it.
+
+    Re-verified against *snapshot* (this tick's fresh pod snapshot) first — an
+    id with a pod now admitted under it (a last-second arrival racing the
+    declaration) is skipped rather than cancelled out from under it.  On
+    success the id is dropped from ``state.reservations`` and
+    ``state.pending_noshow_cancels``; on failure it is left pending and
+    retried next tick.
+    """
+    if not state.pending_noshow_cancels:
+        return
+    occupied_ids = {
+        p.reservation_id
+        for p in snapshot
+        if p.phase in ("Running", "Pending") and p.reservation_id is not None
+    }
+    async with state.reservation_lock:
+        for rid in sorted(state.pending_noshow_cancels):
+            if rid in occupied_ids:
+                log.info(
+                    "No-show cancel for reservation #%d skipped this tick: "
+                    "a pod is now admitted under it",
+                    rid,
+                )
+                continue
+            if await client.cancel_reservation(rid, "no-show"):
+                state.reservations = [r for r in state.reservations if r.id != rid]
+                state.pending_noshow_cancels.discard(rid)
+                log.info("Reservation #%d cancelled (no-show)", rid)
+            else:
+                log.warning(
+                    "Failed to cancel no-show reservation #%d; will retry next tick",
+                    rid,
+                )
+
+
 # ---------------------------------------------------------------------------
 # Background loop 3: queue processor
 # ---------------------------------------------------------------------------
@@ -1013,6 +1054,12 @@ async def queue_processor_loop(
             state.refresh_claimed_reservations(holder_ids, now)
 
         state.check_noshow_deadlines(now)
+
+        # No-show → cancel: durably free the window app-side.  Skipped
+        # entirely when the snapshot failed this tick; pending ids simply
+        # retry next tick.
+        if snapshot is not None:
+            await _cancel_pending_noshows(state, client, snapshot)
 
         # Adopt overstay pods whose user has re-booked capacity: re-link them to
         # the new reservation so they stop surfacing as overstay even when no

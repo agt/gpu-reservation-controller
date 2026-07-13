@@ -254,8 +254,16 @@ class ControllerState:
         self.noshow_deadlines: dict[int, datetime] = {}
 
         # Reservations permanently declared no-show for this controller lifetime.
-        # These are treated as on-demand capacity for placement purposes.
+        # Excluded from reserved-path matching and chaining from the moment of
+        # declaration (see find_best_reservation / _chain_for).
         self.noshow_reservation_ids: set[int] = set()
+
+        # Declared no-shows still awaiting a durable controller-issued cancel
+        # (POST /api/reservations/{id}/cancel, reason="no-show").  Populated by
+        # check_noshow_deadlines; drained by queue_processor_loop once the
+        # cancel succeeds.  Retried every tick until it does, since a durable
+        # app-side cancel is what actually frees the window for re-booking.
+        self.pending_noshow_cancels: set[int] = set()
 
         # Reservation ids currently "claimed" by a live reserved-path holder pod
         # — each holder's booking reservation plus the back-to-back chain its
@@ -338,7 +346,11 @@ class ControllerState:
     def reconcile_noshow(self) -> None:
         """Prune no-show state for reservations no longer in the active list.
 
-        Called after each reservation refresh alongside reconcile_queue.
+        Called after each reservation refresh alongside reconcile_queue.  An id
+        leaves the active list once its controller-issued cancel has actually
+        landed (or the app removed it some other way), so ``pending_noshow_cancels``
+        is pruned the same way as ``noshow_reservation_ids`` — no further retry
+        is needed for an id the next fetch no longer reports as active.
         """
         active_ids = {r.id for r in self.reservations}
         stale = [rid for rid in self.noshow_deadlines if rid not in active_ids]
@@ -349,12 +361,20 @@ class ControllerState:
         for rid in stale_noshow:
             self.noshow_reservation_ids.discard(rid)
             log.info("No-show reservation #%d removed: left active list", rid)
+        stale_pending = [rid for rid in self.pending_noshow_cancels if rid not in active_ids]
+        for rid in stale_pending:
+            self.pending_noshow_cancels.discard(rid)
+            log.debug("Pending no-show cancel #%d pruned: left active list", rid)
 
     def check_noshow_deadlines(self, now: datetime) -> None:
         """Declare no-shows for any reservation whose deadline has passed.
 
         Called at the start of each queue_processor_loop tick.  Moves expired
-        entries from noshow_deadlines into noshow_reservation_ids.  A reservation
+        entries from noshow_deadlines into noshow_reservation_ids and queues
+        them in pending_noshow_cancels for a durable controller-issued cancel
+        (``queue_processor_loop`` sends ``POST /api/reservations/{id}/cancel``,
+        reason="no-show", later in the same tick) — that cancel is what
+        actually frees the window app-side for re-booking.  A reservation
         currently claimed by a live chained holder is never declared a no-show —
         ``refresh_claimed_reservations`` clears its deadline, and this guard is a
         belt-and-suspenders check against tick ordering.
@@ -368,8 +388,8 @@ class ControllerState:
             del self.noshow_deadlines[rid]
             res = next((r for r in self.reservations if r.id == rid), None)
             # Don't declare a no-show for a window that has already ended: it can
-            # never be selected as an on-demand block, so "capacity opened" would
-            # be a misleading log line (CODE-REVIEW D9).  Just drop the deadline.
+            # never be re-booked anyway, so "capacity opened" would be a
+            # misleading log line (CODE-REVIEW D9).  Just drop the deadline.
             if res is not None and slot_end(res) <= now:
                 log.debug(
                     "No-show deadline for reservation #%d passed but window already "
@@ -378,12 +398,12 @@ class ControllerState:
                 )
                 continue
             self.noshow_reservation_ids.add(rid)
+            self.pending_noshow_cancels.add(rid)
             user = res.user.username if (res and res.user) else "unknown"
             gpu_class = self.gpu_class_labels.get(res.gpu_class_id, "unknown") if res else "unknown"
             log.info(
                 "Reservation #%d declared no-show (user=%s, gpu-class=%s): "
-                "no matching pod appeared before deadline; "
-                "capacity opened for on-demand placement",
+                "no matching pod appeared before deadline; queued for cancellation",
                 rid,
                 user,
                 gpu_class,

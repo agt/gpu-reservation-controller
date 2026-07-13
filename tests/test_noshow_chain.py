@@ -120,6 +120,7 @@ class TestCheckNoshowDeadlinesRespectsClaimed:
         state.claimed_reservation_ids = {1}
         state.check_noshow_deadlines(NOW)
         assert 1 not in state.noshow_reservation_ids
+        assert 1 not in state.pending_noshow_cancels  # never queued for a cancel
         assert 1 in state.noshow_deadlines  # left intact for when it unclaims
 
     def test_unclaimed_expired_still_declared(self):
