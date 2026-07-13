@@ -1191,8 +1191,7 @@ async def _preempt_pod(
 ) -> None:
     """Delete an overstaying pod to recover capacity.
 
-    Shared by the preemption sweep and the take-back grant path.  Mirrors
-    ``_handle_cancelled_reservations``'s shape exactly: emit the event before
+    Mirrors ``_handle_cancelled_reservations``'s shape exactly: emit the event before
     deleting (best-effort — a failed emit does not block the delete), then
     delete and release occupancy together (best-effort — if the delete fails,
     occupancy is left as-is since the pod may still be there).
@@ -1298,8 +1297,8 @@ async def _run_preemption_sweep(
     snapshots (pods, node capacity) are taken outside the lock; either
     failing skips the whole sweep with a WARNING — the controller never kills
     a pod based on unknown physical state.  Planning and the resulting
-    deletions run under ``reservation_lock`` (mirrors the take-back handler
-    and the cancellation/owner-change eviction paths); boundaries are
+    deletions run under ``reservation_lock`` (mirrors the
+    cancellation/owner-change eviction paths); boundaries are
     processed in ascending order with a running ``doomed`` set so one sweep
     never double-selects a pod's GPUs across two boundaries.
     """
@@ -1498,7 +1497,7 @@ def _require_push_auth(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> None:
-    """Authenticate an inbound API call (push / take-back) via a static bearer token.
+    """Authenticate an inbound API call (push) via a static bearer token.
 
     - 503 if ``INBOUND_API_TOKEN`` is unset — the inbound API is opt-in and
       disabled by default, so existing deployments are unaffected.

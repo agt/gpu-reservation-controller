@@ -24,7 +24,7 @@ from tests.conftest import (
     USERNAME,
 )
 from tests.conftest import make_state as _state
-from tests.conftest import reclaim_reservation as _ondemand_reservation
+from tests.conftest import reclaim_reservation as _reclaim_reservation
 from tests.conftest import user_reservation as _user_reservation
 
 
@@ -80,8 +80,8 @@ class TestInitializeNoshowTracking:
         state.update_noshow_tracking(now, TIMEOUT, GRACE, reason="init")
         assert 1 not in state.noshow_deadlines
 
-    def test_ondemand_reservation_not_tracked(self):
-        r = _ondemand_reservation(1, reservation_date=FUTURE_DATE)
+    def test_reclaim_reservation_not_tracked(self):
+        r = _reclaim_reservation(1, reservation_date=FUTURE_DATE)
         state = _state(r)
         now = datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc)
         state.update_noshow_tracking(now, TIMEOUT, GRACE, reason="init")

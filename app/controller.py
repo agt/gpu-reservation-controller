@@ -736,9 +736,8 @@ class ControllerState:
         visited: set[int] = set()
         while True:
             # If several reservations abut the same instant (shouldn't happen in
-            # this data model, but the two window-extension mechanisms must answer
-            # it identically), take the longest — the same max(key=slot_end) rule
-            # reclaim-merge discovery uses (CODE-REVIEW D4b).
+            # this data model), take the longest, mirroring the same tiebreak
+            # find_open_booking_for uses.
             abutting = [
                 r
                 for r in candidates

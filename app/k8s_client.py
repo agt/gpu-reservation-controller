@@ -617,10 +617,9 @@ async def emit_preempted_event(
 ) -> None:
     """Create a Kubernetes Event linked to *pod* with reason='Preempted'.
 
-    Emitted when the preemption sweep or a take-back grant deletes a pod
-    running past its runtime guarantee to recover capacity.  The caller builds
-    *message* (it knows whether the trigger was boundary demand or a
-    take-back grant, and how long the pod overstayed).
+    Emitted when the preemption sweep deletes a pod running past its runtime
+    guarantee to recover capacity.  The caller builds *message* (it knows how
+    long the pod overstayed).
     """
     await _emit_pod_event(
         pod,

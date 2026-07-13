@@ -15,7 +15,7 @@ from app.schemas import GpuClassBrief, ReservationResponse, UserBrief
 
 from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, USERNAME
 from tests.conftest import make_state as _state
-from tests.conftest import reclaim_reservation as _ondemand_reservation
+from tests.conftest import reclaim_reservation as _reclaim_reservation
 from tests.conftest import user_reservation as _user_reservation
 
 NOW = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)  # 1 h into res #1's 08:00–10:00 UTC window
@@ -168,8 +168,8 @@ class TestMarkPodSeenChainAware:
         assert 1 not in state.noshow_deadlines
         assert 2 not in state.noshow_deadlines
 
-    def test_ondemand_booking_clears_nothing(self):
-        state = _state(_ondemand_reservation(1))
+    def test_reclaim_booking_clears_nothing(self):
+        state = _state(_reclaim_reservation(1))
         state.noshow_deadlines[1] = datetime(2099, 1, 1, tzinfo=timezone.utc)
         state.mark_pod_seen_for_noshow(USERNAME, GPU_CLASS_LABEL, booking_reservation_id=1)
         assert 1 in state.noshow_deadlines  # squatter vouches for nothing

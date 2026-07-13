@@ -3,8 +3,8 @@
 Drives the sweep directly via ``asyncio.run`` with ``snapshot_tolerated_pods``,
 ``snapshot_node_gpu_capacity``, ``read_pod``, ``delete_pod``, and
 ``emit_preempted_event`` monkeypatched at the ``app.main`` module level — the
-same convention ``test_admission.py`` and ``test_takeback_api.py`` use for
-Kubernetes-boundary coroutines.  No real Kubernetes or HTTP calls are made.
+same convention ``test_admission.py`` uses for Kubernetes-boundary
+coroutines.  No real Kubernetes or HTTP calls are made.
 """
 
 from __future__ import annotations
@@ -253,7 +253,7 @@ class TestRestartIdempotence:
 
         pod = _pod(
             "v1",
-            booking_reference="ondemand-2",
+            booking_reference="res-2",
             reservation_id=2,
             gpu_count=1,
             deletion_timestamp=S - timedelta(minutes=1),
