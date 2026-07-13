@@ -67,7 +67,8 @@ config:
   ondemandLeaseBufferMinutes: 10
 
   # Minutes after a reservation window opens before the holder is declared a
-  # no-show and the block is opened to on-demand pods.
+  # no-show and the controller durably cancels it app-side, freeing the
+  # window for re-booking.
   noshownTimeoutMinutes: 15
 
   # Grace period (minutes) after controller startup before no-shows are
@@ -103,11 +104,9 @@ config:
   # needs capacity freed, and whether any just-expired blocks need cleanup).
   preemptionCheckInterval: 60
 
-  # Re-link a pod to a reservation the same user has since booked: rescues an
-  # overstay pod (one running past its runtime guarantee) so it is no longer
-  # eligible for preemption, and proactively upgrades a within-guarantee
-  # on-demand pod to a guaranteed reservation as soon as one is open, rather
-  # than waiting for it to overstay.  Set to false to disable both.
+  # Re-link an overstay pod (one running past its runtime guarantee) to a
+  # reservation the same user has since booked, so it is no longer eligible
+  # for preemption.  Set to false to disable.
   podAdoptionEnabled: true
 
 # ---------------------------------------------------------------------------
