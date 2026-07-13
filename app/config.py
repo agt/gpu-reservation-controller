@@ -24,6 +24,7 @@ class Config:
     preemption_lead_minutes: int   # lead time before a slot boundary for phase-A preemption
     preemption_check_interval: int  # seconds between preemption sweeps
     pod_adoption_enabled: bool = True  # re-link overstay/on-demand pods to a user's new booking
+    required_group_label: Optional[str] = None  # pod label naming the usage group to match; None = disabled
     log_level: str = "INFO"        # root log level (LOG_LEVEL)
 
     @classmethod
@@ -69,6 +70,7 @@ class Config:
                 os.environ.get("POD_LIST_TICK_INTERVAL", "300")
             ),
             scheduling_gate_name=os.environ.get("POD_SCHEDULING_GATE_NAME") or None,
+            required_group_label=os.environ.get("REQUIRED_GROUP_LABEL") or None,
             inbound_api_token=os.environ.get("INBOUND_API_TOKEN") or None,
             preemption_lead_minutes=int(
                 os.environ.get("PREEMPTION_LEAD_MINUTES", "15")

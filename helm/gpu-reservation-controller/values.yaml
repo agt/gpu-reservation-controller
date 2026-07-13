@@ -76,6 +76,13 @@ config:
   # Leave empty to disable scheduling gate management.
   podSchedulingGateName: ""
 
+  # Optional pod label naming the usage group a pod belongs to (e.g.
+  # "dsmlp/course").  When set, the controller additionally requires the pod's
+  # value for this label to equal the reservation's group name before admitting
+  # it, adopting it, or chain-extending its guarantee — an extra match axis
+  # alongside gpu-class.  Leave empty to disable (no group constraint).
+  requiredGroupLabel: ""
+
   # Minutes before an upcoming reservation slot boundary that the preemption
   # sweep's phase-A pass runs (proactively frees capacity from overstaying
   # pods so the incoming reservation has room when its window opens).

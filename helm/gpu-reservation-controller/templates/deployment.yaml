@@ -69,6 +69,10 @@ spec:
             - name: POD_SCHEDULING_GATE_NAME
               value: {{ .Values.config.podSchedulingGateName | quote }}
             {{- end }}
+            {{- if .Values.config.requiredGroupLabel }}
+            - name: REQUIRED_GROUP_LABEL
+              value: {{ .Values.config.requiredGroupLabel | quote }}
+            {{- end }}
             - name: PREEMPTION_LEAD_MINUTES
               value: {{ .Values.config.preemptionLeadMinutes | quote }}
             - name: PREEMPTION_CHECK_INTERVAL

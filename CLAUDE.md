@@ -78,6 +78,28 @@ is reused as long as the class stays in the list, so changing a class's
 active reservations for a cycle or the controller restarts.  If a GPU class
 has no `label_value`, its reservations are skipped with a warning.
 
+**Optional usage-group constraint** (`REQUIRED_GROUP_LABEL`, default off).  When
+set to a pod-label name (e.g. `dsmlp/course`), a **third** equality is required:
+
+```
+pod.labels[REQUIRED_GROUP_LABEL]  ==  reservation.group.name
+```
+
+It behaves like `gpu-class` — an additional match axis threaded alongside
+`gpu_class_label` (`ControllerState._group_ok`, gated on
+`ControllerState.required_group_label`, set once from config at startup).  The
+gate applies to the **reserved path only**: `find_best_reservation`,
+`find_open_booking_for` (adoption), `mark_pod_seen_for_noshow`, and reserved
+back-to-back chaining (`_chain_for` additionally requires equal `group_id`, so a
+guarantee never chains across a different group's window).  A pod with no such
+label (feature on) matches **no** grouped reservation and is never admitted on
+the reserved path — it falls through to the group-agnostic on-demand path.
+Matching is against the group **name** (the reservation carries only
+`GroupBrief{id, name}`; there is no per-group `label_value`).  **Reclaim /
+on-demand placement is group-agnostic**: reclaim blocks carry no group
+(`group_id = null`), so `find_ondemand_block` and reclaim-block merging are left
+unconstrained — un-attributed spare capacity stays usable by any group.
+
 ### Toleration applied
 
 ```
@@ -499,6 +521,7 @@ above applies.
 | `NOSHOW_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared (legacy alias `NOSHOWN_GRACE_MINUTES` still honored) |
 | `POD_LIST_TICK_INTERVAL` | `300` | Seconds between queue-processor ticks (pod LIST frequency) |
 | `POD_SCHEDULING_GATE_NAME` | *(absent)* | Name of the SchedulingGate to remove after admitting a pod; unset = disabled |
+| `REQUIRED_GROUP_LABEL` | *(absent)* | Pod label naming the usage group (e.g. `dsmlp/course`); when set, the pod's value must equal the reservation's `group.name` — an extra match axis alongside `gpu-class` (see **Matching pods to reservations**). Unset = disabled |
 | `PREEMPTION_LEAD_MINUTES` | `15` | Minutes before a reservation slot boundary that phase-A preemption runs |
 | `PREEMPTION_CHECK_INTERVAL` | `60` | Seconds between preemption sweeps |
 | `POD_ADOPTION_ENABLED` | `true` | Re-link an overstay pod, or proactively upgrade a within-guarantee on-demand pod, to a reservation its user has since booked (see **Adopting pods into a re-booked reservation**); `false` disables |

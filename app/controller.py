@@ -131,6 +131,7 @@ class QueueEntry:
     gpu_requested: int     # nvidia.com/gpu units requested by this pod
     reservation: ReservationResponse
     next_attempt_at: datetime  # earliest time to try applying the toleration
+    group_label: Optional[str] = None  # value of REQUIRED_GROUP_LABEL pod label; None when disabled
 
 
 @dataclass
@@ -170,6 +171,7 @@ class PodRuntimeView:
     reserved_path: bool            # booking-reference had the "res-" prefix
     node_resident: bool            # Running, or (Pending and not scheduled_false)
     terminating: bool              # metadata.deletionTimestamp is set
+    group_label: Optional[str] = None  # value of REQUIRED_GROUP_LABEL pod label; None when disabled
 
 
 @dataclass
@@ -253,6 +255,12 @@ class ControllerState:
         # Mapping from gpu_class_id → Kubernetes label value (e.g. "h100").
         # Populated by the reservation-fetch loop using GET /api/gpu-classes/{id}.
         self.gpu_class_labels: dict[int, str] = {}
+
+        # Name of the pod label naming the usage group to match (REQUIRED_GROUP_LABEL),
+        # or None when the feature is disabled.  Set once from config at startup.
+        # When set, the reserved-path matchers additionally require a pod's group
+        # label value to equal the reservation's group.name (see _group_ok).
+        self.required_group_label: Optional[str] = None
 
         # Active work queue keyed by pod UID (reserved path).
         self.task_queue: dict[str, QueueEntry] = {}
@@ -469,6 +477,7 @@ class ControllerState:
         namespace: str,
         gpu_class_label: str,
         booking_reservation_id: Optional[int] = None,
+        group_label: Optional[str] = None,
     ) -> None:
         """Clear the no-show deadline(s) vouched for by an already-admitted pod.
 
@@ -512,6 +521,7 @@ class ControllerState:
             and r.user is not None
             and r.user.username == namespace
             and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
+            and self._group_ok(r, group_label)
             and r.id in self.noshow_deadlines
         ]
         if not candidates:
@@ -558,13 +568,18 @@ class ControllerState:
     # ------------------------------------------------------------------
 
     def find_best_reservation(
-        self, namespace: str, gpu_class_label: str
+        self,
+        namespace: str,
+        gpu_class_label: str,
+        group_label: Optional[str] = None,
     ) -> Optional[ReservationResponse]:
         """Find the nearest upcoming (or active) reservation for *namespace* / *gpu_class_label*.
 
         Matching rules:
         - reservation.user.username == namespace
         - gpu_class_labels[reservation.gpu_class_id] == gpu_class_label
+        - usage group satisfies REQUIRED_GROUP_LABEL (see _group_ok); *group_label*
+          is the pod's group label value, ignored when the feature is disabled
         - reservation window has not yet expired
 
         When multiple matches exist, return the one whose window starts soonest.
@@ -577,6 +592,7 @@ class ControllerState:
             and r.user is not None
             and r.user.username == namespace
             and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
+            and self._group_ok(r, group_label)
             and slot_end(r) > now  # still has time left
             and r.id not in self.noshow_reservation_ids
         ]
@@ -591,6 +607,7 @@ class ControllerState:
         now: datetime,
         gpu_requested: int,
         extra_used: Optional[dict[int, int]] = None,
+        group_label: Optional[str] = None,
     ) -> Optional[ReservationResponse]:
         """Find a *currently-open* booking *namespace* holds that can adopt a pod.
 
@@ -613,6 +630,7 @@ class ControllerState:
             and r.user is not None
             and r.user.username == namespace
             and self._effective_label(r) == gpu_class_label
+            and self._group_ok(r, group_label)
             and slot_start(r) <= now < slot_end(r)
             and r.id not in self.noshow_reservation_ids
             and self.available(r) - extra_used.get(r.id, 0) >= gpu_requested
@@ -632,14 +650,19 @@ class ControllerState:
         pod_namespace: str,
         gpu_class_label: str,
         gpu_requested: int,
+        group_label: Optional[str] = None,
     ) -> None:
         """Match pod to a reservation and add to the work queue if eligible.
 
         If the pod is already queued for the same reservation, this is a no-op
         (idempotent).  If the reservation changes (e.g. old one cancelled), the
-        entry is replaced.
+        entry is replaced.  *group_label* is the pod's REQUIRED_GROUP_LABEL value
+        (ignored when the feature is disabled); it is carried on the QueueEntry so
+        reconcile_queue can re-match with the same group constraint.
         """
-        reservation = self.find_best_reservation(pod_namespace, gpu_class_label)
+        reservation = self.find_best_reservation(
+            pod_namespace, gpu_class_label, group_label
+        )
         if reservation is None:
             return  # no matching reservation; nothing to do
 
@@ -658,6 +681,7 @@ class ControllerState:
             gpu_requested=gpu_requested,
             reservation=reservation,
             next_attempt_at=datetime.now(timezone.utc),
+            group_label=group_label,
         )
         self.task_queue[pod_uid] = entry
         log.info(
@@ -693,7 +717,10 @@ class ControllerState:
         A reservation extends the chain when it shares the same namespace, GPU
         class, and gpu_count, has not yet expired, is not a no-show, and starts
         exactly when the previous window ends (``slot_start(next) ==
-        slot_end(previous)``).  *reservation* itself is **not** included.
+        slot_end(previous)``).  When REQUIRED_GROUP_LABEL is enabled it must also
+        share the same usage group (``group_id``), so a guarantee never chains
+        across a different group's window.  *reservation* itself is **not**
+        included.
 
         Shared by ``compute_guaranteed_until`` (runtime-guarantee arithmetic) and
         ``reservations_claimed_by`` (no-show protection) so both agree on what a
@@ -715,6 +742,10 @@ class ControllerState:
                 and r.user.username == namespace
                 and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
                 and r.gpu_count == gpu_count
+                and (
+                    self.required_group_label is None
+                    or r.group_id == reservation.group_id
+                )
                 and slot_end(r) > now
                 and r.id not in self.noshow_reservation_ids
             ],
@@ -853,7 +884,7 @@ class ControllerState:
         for uid in stale_uids:
             entry = self.task_queue.pop(uid)
             new_res = self.find_best_reservation(
-                entry.pod_namespace, entry.gpu_class_label
+                entry.pod_namespace, entry.gpu_class_label, entry.group_label
             )
             if new_res:
                 self.task_queue[uid] = QueueEntry(
@@ -864,6 +895,7 @@ class ControllerState:
                     gpu_requested=entry.gpu_requested,
                     reservation=new_res,
                     next_attempt_at=datetime.now(timezone.utc),
+                    group_label=entry.group_label,
                 )
                 log.info(
                     "Pod %s/%s re-queued: reservation #%d cancelled, "
@@ -971,6 +1003,21 @@ class ControllerState:
         if cached is not None:
             return cached
         return r.gpu_class.label_value if r.gpu_class else None
+
+    def _group_ok(
+        self, r: ReservationResponse, group_label: Optional[str]
+    ) -> bool:
+        """Whether *r*'s usage group satisfies the REQUIRED_GROUP_LABEL gate.
+
+        When the feature is disabled (``required_group_label is None``) this is
+        always True — no constraint.  When enabled, *group_label* is the value
+        of the pod's group label; it must equal ``r.group.name``.  A pod with no
+        such label (``group_label is None`` while enabled) matches no grouped
+        reservation, so it is never admitted on the reserved path (it falls
+        through to the group-agnostic on-demand path)."""
+        if self.required_group_label is None:
+            return True
+        return r.group is not None and r.group.name == group_label
 
     def effective_end(self, r: ReservationResponse) -> datetime:
         """Return *r*'s window end, extended if it is a reclaim-merge subject.
@@ -1763,7 +1810,12 @@ class ControllerState:
             if p.reserved_path and not overstay:
                 continue
             res = self.find_open_booking_for(
-                p.namespace, p.gpu_class, now, p.gpu_count, extra_used=extra_used
+                p.namespace,
+                p.gpu_class,
+                now,
+                p.gpu_count,
+                extra_used=extra_used,
+                group_label=p.group_label,
             )
             if res is None or res.id == p.reservation_id:
                 continue
