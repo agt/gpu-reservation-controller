@@ -106,32 +106,3 @@ class ReservationPushResponse(BaseModel):
     cancelled: int      # in-window cancellations evicted / reclaimed
     adopted: int = 0    # in-window owner changes whose prior-owner pod was evicted
     total_active: int   # size of the active reservation set after the push
-
-
-# ---------------------------------------------------------------------------
-# Inbound take-back API (POST /api/reservations/take-back)
-# ---------------------------------------------------------------------------
-
-
-class ReclaimTakeBackRequest(BaseModel):
-    """Body of a reclaim-block take-back request from the reservation app.
-
-    Asks the controller to relinquish the named ``kind="reclaim"`` blocks so the
-    app can re-book that capacity (e.g. a tentative front-end offer inside the
-    preempt guard).  All-or-nothing: if any requested block is in use, the whole
-    request is rejected and nothing changes.  The envelope object leaves room
-    for future fields (e.g. a replacement reservation pushed atomically with the
-    take-back) without an API break.
-    """
-
-    reclaim_ids: list[int]
-
-
-class ReclaimTakeBackResponse(BaseModel):
-    """Summary returned after a successful (all-or-nothing) take-back."""
-
-    taken_back: list[int]          # ids removed from the active set by this call
-    already_taken_back: list[int]  # ids relinquished by an earlier call (idempotent retry)
-    unknown: list[int]             # ids the controller had never seen; granted + tombstoned
-    detached: list[int]            # absorbed stub ids released back to standalone blocks
-    total_active: int              # size of the active reservation set afterwards
