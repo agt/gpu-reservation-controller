@@ -52,8 +52,19 @@ config:
   # Port for the GET /health liveness endpoint.
   healthPort: 8000
 
-  # Enable on-demand pod placement (set to false to disable).
+  # Enable JIT on-demand reservation requests for pending pods with no open
+  # reservation window (set to false to disable).
   ondemandPlacementEnabled: true
+
+  # Reserved-match horizon (minutes) for the JIT trigger: a pod is queued for
+  # its own reservation when one opens now or within this many minutes and has
+  # budget; otherwise, if the pod is JIT-eligible, the controller requests an
+  # on-demand lease instead of waiting.
+  ondemandHorizonMinutes: 30
+
+  # Minutes added to a pod's horae/minimum-runtime-seconds annotation when
+  # sizing the duration of a requested JIT lease.
+  ondemandLeaseBufferMinutes: 10
 
   # Minutes after a reservation window opens before the holder is declared a
   # no-show and the block is opened to on-demand pods.

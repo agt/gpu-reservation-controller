@@ -90,3 +90,28 @@ class ReservationPushResponse(BaseModel):
     cancelled: int      # in-window cancellations evicted / reclaimed
     adopted: int = 0    # in-window owner changes whose prior-owner pod was evicted
     total_active: int   # size of the active reservation set after the push
+
+
+# ---------------------------------------------------------------------------
+# JIT on-demand reservation request (POST /api/reservations)
+# ---------------------------------------------------------------------------
+
+
+class OnDemandReservationRequest(BaseModel):
+    """Body of a JIT on-demand booking request, sent on behalf of a pending pod.
+
+    The app anchors ``start_utc`` at its own "now" (avoids controller/app clock
+    skew) and sets ``end_utc = start_utc + duration_seconds``.
+    ``on_demand=True`` relaxes policy limits (SU/caps/min-duration) only —
+    never physical calendar capacity.  ``idempotency_key`` is the admitting
+    pod's UID: a retry with the same key returns the original reservation
+    rather than creating a duplicate.
+    """
+
+    username: str
+    group_name: Optional[str] = None
+    gpu_class_id: int
+    gpu_count: int
+    duration_seconds: int
+    on_demand: bool = True
+    idempotency_key: str

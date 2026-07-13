@@ -59,6 +59,10 @@ spec:
               value: {{ .Values.config.healthPort | quote }}
             - name: ONDEMAND_PLACEMENT_ENABLED
               value: {{ .Values.config.ondemandPlacementEnabled | quote }}
+            - name: ONDEMAND_HORIZON_MINUTES
+              value: {{ .Values.config.ondemandHorizonMinutes | quote }}
+            - name: ONDEMAND_LEASE_BUFFER_MINUTES
+              value: {{ .Values.config.ondemandLeaseBufferMinutes | quote }}
             - name: NOSHOWN_TIMEOUT_MINUTES
               value: {{ .Values.config.noshownTimeoutMinutes | quote }}
             - name: NOSHOWN_GRACE_MINUTES
