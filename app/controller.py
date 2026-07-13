@@ -136,11 +136,11 @@ class QueueEntry:
 
 @dataclass
 class OnDemandCandidate:
-    """A pod that is eligible for on-demand placement and is searching for a block.
+    """A pod eligible for a just-in-time (JIT) on-demand reservation lease.
 
     Distinct from QueueEntry: a QueueEntry is bound to a specific reservation;
-    an OnDemandCandidate is still searching for any on-demand block that can
-    accommodate it.
+    an OnDemandCandidate has none yet and requests one from the reservation
+    app (``main._try_request_lease``).
     """
 
     pod_uid: str
@@ -150,7 +150,8 @@ class OnDemandCandidate:
     gpu_requested: int     # nvidia.com/gpu units requested by this pod
     min_runtime_seconds: int  # horae/minimum-runtime-seconds annotation value
     pod_created_at: datetime  # metadata.creationTimestamp; used for FIFO ordering
-    next_attempt_at: datetime  # earliest time to try placement
+    next_attempt_at: datetime  # earliest time to try requesting a lease
+    group_label: Optional[str] = None  # value of REQUIRED_GROUP_LABEL pod label; None when disabled
 
 
 @dataclass(frozen=True)
@@ -205,8 +206,16 @@ class ControllerState:
         self.reservations: list[ReservationResponse] = []
 
         # Mapping from gpu_class_id → Kubernetes label value (e.g. "h100").
-        # Populated by the reservation-fetch loop using GET /api/gpu-classes/{id}.
+        # Refreshed each reconcile from GET /api/gpu-classes (full list), with a
+        # per-id GET /api/gpu-classes/{id} fallback for a class referenced by a
+        # reservation but missing from the bulk list.
         self.gpu_class_labels: dict[int, str] = {}
+
+        # Reverse of gpu_class_labels (label → id).  A pod carries only its
+        # gpu-class label, but requesting a JIT lease needs the numeric
+        # gpu_class_id, so this map is what main._try_request_lease resolves
+        # against.  Refreshed alongside gpu_class_labels.
+        self.gpu_class_ids: dict[str, int] = {}
 
         # Name of the pod label naming the usage group to match (REQUIRED_GROUP_LABEL),
         # or None when the feature is disabled.  Set once from config at startup.
@@ -503,6 +512,48 @@ class ControllerState:
             and self._group_ok(r, group_label)
             and slot_end(r) > now  # still has time left
             and r.id not in self.noshow_reservation_ids
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=slot_start)
+
+    def find_admittable_reservation(
+        self,
+        namespace: str,
+        gpu_class_label: str,
+        gpu_requested: int,
+        now: datetime,
+        horizon: timedelta,
+        group_label: Optional[str] = None,
+    ) -> Optional[ReservationResponse]:
+        """Find the nearest reservation admittable soon, with room, for a pod.
+
+        The JIT-routing-aware sibling of ``find_best_reservation``: that method
+        answers "does any future reservation match at all" (used to preserve
+        the existing wait-for-window behaviour for a pod that is not
+        JIT-eligible); this one answers "is one admittable soon enough, with
+        budget" — the trigger for routing a pod to the reserved queue instead
+        of requesting a JIT on-demand lease. Matching rules are the same as
+        ``find_best_reservation`` plus two additional requirements:
+        - the window opens now or within *horizon* (``slot_start(r) <= now +
+          horizon``)
+        - it has spare budget for *gpu_requested* (``available(r) >=
+          gpu_requested``)
+
+        When multiple match, the one whose window starts soonest wins.
+        """
+        candidates = [
+            r
+            for r in self.reservations
+            if r.kind == "booking"
+            and r.user is not None
+            and r.user.username == namespace
+            and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
+            and self._group_ok(r, group_label)
+            and slot_end(r) > now
+            and r.id not in self.noshow_reservation_ids
+            and slot_start(r) <= now + horizon
+            and self.available(r) >= gpu_requested
         ]
         if not candidates:
             return None
@@ -819,8 +870,9 @@ class ControllerState:
         gpu_requested: int,
         min_runtime_seconds: int,
         pod_created_at: datetime,
+        group_label: Optional[str] = None,
     ) -> None:
-        """Register a pod as an on-demand placement candidate (idempotent).
+        """Register a pod as a JIT on-demand lease candidate (idempotent).
 
         If the pod is already registered with the same parameters this is a
         no-op.  A pod already tracked in ``occupancy`` (already placed) is also
@@ -843,6 +895,7 @@ class ControllerState:
             min_runtime_seconds=min_runtime_seconds,
             pod_created_at=pod_created_at,
             next_attempt_at=datetime.now(timezone.utc),
+            group_label=group_label,
         )
         self.ondemand_candidates[pod_uid] = candidate
         log.info(
