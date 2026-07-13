@@ -3,7 +3,6 @@
 Implements only the endpoints the controller needs:
   - GET /api/reservations  — paginated list of all (active + cancelled) reservations
   - GET /api/gpu-classes/{id}  — per-class detail including label_value
-  - GET /api/settings  — app settings (reclaim window/guard) for reclaim merging
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ import httpx
 from pydantic import ValidationError
 
 from .config import Config
-from .schemas import AppSettings, GpuClassDetail, ReservationResponse
+from .schemas import GpuClassDetail, ReservationResponse
 
 log = logging.getLogger(__name__)
 
@@ -46,9 +45,9 @@ class ReservationClient:
 
         Raises:
             httpx.HTTPStatusError / httpx.RequestError: on API or network failure.
-                Unlike ``fetch_gpu_class`` / ``fetch_settings`` (which degrade to
-                ``None``), a failed reservation fetch propagates so the refresh
-                cycle aborts rather than acting on an empty reservation list.
+                Unlike ``fetch_gpu_class`` (which degrades to ``None``), a failed
+                reservation fetch propagates so the refresh cycle aborts rather
+                than acting on an empty reservation list.
         """
         # UTC everywhere: date.today() would use the process TZ and drop
         # currently-open reservations east of UTC (see CODE-REVIEW-2026-07 B2).
@@ -113,20 +112,3 @@ class ReservationClient:
             log.warning("Could not parse GPU class %d response: %s", gpu_class_id, exc)
             return None
 
-    async def fetch_settings(self) -> Optional[AppSettings]:
-        """Return the app settings (reclaim window/guard), or None on error."""
-        try:
-            resp = await self._client.get("/api/settings")
-            resp.raise_for_status()
-            return AppSettings.model_validate(resp.json())
-        except httpx.HTTPStatusError as exc:
-            log.warning("Could not fetch app settings: HTTP %s", exc.response.status_code)
-            return None
-        except httpx.RequestError as exc:
-            log.warning("Could not fetch app settings: %s", exc)
-            return None
-        except (ValidationError, ValueError) as exc:
-            # See fetch_gpu_class: a malformed /api/settings payload must skip the
-            # guard update, not abort the refresh cycle (B9).
-            log.warning("Could not parse app settings response: %s", exc)
-            return None

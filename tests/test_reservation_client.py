@@ -87,17 +87,6 @@ def test_fetch_reservations_date_start_is_utc_and_widened():
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_settings_returns_none_on_malformed_payload():
-    """A payload that fails schema validation must return None, not propagate a
-    ValidationError that aborts the whole refresh cycle (CODE-REVIEW B9)."""
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"unexpected": "shape"})
-
-    client = _client_with_handler(_config(), handler)
-    assert asyncio.run(client.fetch_settings()) is None
-    asyncio.run(client.aclose())
-
-
 def test_fetch_gpu_class_returns_none_on_invalid_json():
     """Non-JSON body (ValueError/JSONDecodeError) must also return None (B9)."""
     def handler(request: httpx.Request) -> httpx.Response:

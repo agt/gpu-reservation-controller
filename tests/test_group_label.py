@@ -3,11 +3,10 @@
 When ``ControllerState.required_group_label`` is set (populated from the
 ``REQUIRED_GROUP_LABEL`` env var), the reserved-path matchers add a third
 equality gate: a pod's group-label value must equal the reservation's
-``group.name``.  When unset the gate is a no-op.  The on-demand path
-(``find_ondemand_block`` onto reclaim blocks) stays group-agnostic.
+``group.name``.  When unset the gate is a no-op.
 
-Covers: find_best_reservation, find_open_booking_for, _chain_for,
-plan_pod_adoptions, and the group-agnostic on-demand path.
+Covers: find_best_reservation, find_open_booking_for, _chain_for, and
+plan_pod_adoptions.
 """
 
 from __future__ import annotations
@@ -101,9 +100,10 @@ class TestFindOpenBookingFor:
 # ---------------------------------------------------------------------------
 
 
-def _ondemand_view(uid, reservation_id, *, group_label):
-    """A within-guarantee on-demand pod (reserved_path=False) — adoption-eligible
-    any time once a matching open booking exists."""
+def _overstay_view(uid, reservation_id, *, group_label):
+    """A pod whose reservation id no longer resolves — unconditionally past its
+    runtime guarantee, so it is adoption-eligible once a matching open booking
+    exists."""
     return PodRuntimeView(
         uid=uid,
         namespace="alice",
@@ -111,7 +111,6 @@ def _ondemand_view(uid, reservation_id, *, group_label):
         gpu_class=GPU_CLASS_LABEL,
         gpu_count=1,
         reservation_id=reservation_id,
-        reserved_path=False,
         node_resident=True,
         terminating=False,
         group_label=group_label,
@@ -119,16 +118,16 @@ def _ondemand_view(uid, reservation_id, *, group_label):
 
 
 class TestPlanPodAdoptions:
-    def test_upgrade_respects_group(self):
-        # Open booking in G1; an on-demand pod tagged G1 is upgraded, G2 is not.
+    def test_rescue_respects_group(self):
+        # Open booking in G1; an overstay pod tagged G1 is rescued, G2 is not.
         state = make_state(_open_booking(1, group=G1), required_group_label=GROUP_LABEL_KEY)
         now = datetime.now(timezone.utc)
 
-        matching = _ondemand_view("p-g1", reservation_id=999, group_label=G1)
+        matching = _overstay_view("p-g1", reservation_id=999, group_label=G1)
         assigns = state.plan_pod_adoptions([matching], now)
-        assert [(p.uid, r.id) for p, r, _ in assigns] == [("p-g1", 1)]
+        assert [(p.uid, r.id) for p, r in assigns] == [("p-g1", 1)]
 
-        mismatched = _ondemand_view("p-g2", reservation_id=999, group_label=G2)
+        mismatched = _overstay_view("p-g2", reservation_id=999, group_label=G2)
         assert state.plan_pod_adoptions([mismatched], now) == []
 
 
@@ -212,25 +211,3 @@ class TestEnqueueAndReconcile:
         state.reservations = [_open_booking(3, group=G2)]
         state.reconcile_queue()
         assert "u1" not in state.task_queue
-
-
-# ---------------------------------------------------------------------------
-# On-demand path is group-agnostic (reclaim blocks have no group)
-# ---------------------------------------------------------------------------
-
-
-class TestOnDemandGroupAgnostic:
-    def test_reclaim_block_placed_regardless_of_group(self):
-        now = datetime.now(timezone.utc)
-        reclaim = reservation(
-            5,
-            start_utc=now - timedelta(hours=1),
-            end_utc=now + timedelta(hours=1),
-            kind="reclaim",
-            gpu_class_label=GPU_CLASS_LABEL,
-            gpu_count=2,
-        )
-        # Feature on: reclaim blocks (group=None) still place — no group predicate.
-        state = make_state(reclaim, required_group_label=GROUP_LABEL_KEY)
-        block = state.find_ondemand_block(GPU_CLASS_LABEL, now, 1, 60)
-        assert block is not None and block.id == 5

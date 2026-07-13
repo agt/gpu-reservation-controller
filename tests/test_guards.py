@@ -191,7 +191,7 @@ def test_gpu_only_with_preemption_note_returns_true():
 
 
 # ---------------------------------------------------------------------------
-# Guard 3 — stuck_holder_gpu_classes gates _try_place_ondemand synchronously
+# Guard 3 — stuck_holder_gpu_classes state field
 # ---------------------------------------------------------------------------
 
 
@@ -213,115 +213,5 @@ def test_stuck_holder_gpu_classes_can_be_set():
     assert state.stuck_holder_gpu_classes == set()
 
 
-def _make_main_module_and_state(monkeypatch):
-    """Import app.main with required env vars and return ``(main_module, state)``.
-
-    app.main is imported inside the function (after the env vars are set) because
-    importing it executes ``create_app()`` at module load, which calls
-    ``Config.from_env()`` and would fail without the required vars.
-    """
-    from datetime import date, datetime, timedelta, timezone
-
-    monkeypatch.setenv("RESERVATION_API_URL", "http://localhost:9999")
-    monkeypatch.setenv("RESERVATION_API_KEY", "test-key-guards")
-    import app.main as main_module
-    from app.controller import ControllerState
-    from app.schemas import GpuClassBrief, ReservationResponse
-
-    today = date.today()
-    midnight = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
-    state = ControllerState()
-    block = ReservationResponse(
-        id=99,
-        user_id=None, user=None, group_id=None, group=None,
-        gpu_class_id=1,
-        gpu_class=GpuClassBrief(id=1, name="H100"),
-        date=today,
-        start_utc=midnight,
-        end_utc=midnight + timedelta(days=1),
-        gpu_count=4, status="active", kind="reclaim",
-        created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
-    )
-    state.reservations = [block]
-    state.gpu_class_labels = {1: "h100"}
-    return main_module, state
-
-
-def test_guard3_blocks_matching_gpu_class(monkeypatch):
-    """When the stuck set contains the candidate's class, placement is held."""
-    import asyncio
-    from datetime import datetime, timezone
-    from app.controller import OnDemandCandidate
-
-    main_module, state = _make_main_module_and_state(monkeypatch)
-    state.stuck_holder_gpu_classes = {"h100"}
-
-    candidate = OnDemandCandidate(
-        pod_uid="uid-1", pod_name="pod-1", pod_namespace="ns-1",
-        gpu_class_label="h100", gpu_requested=1, min_runtime_seconds=60,
-        pod_created_at=datetime.now(timezone.utc), next_attempt_at=datetime.now(timezone.utc),
-    )
-
-    called = []
-
-    async def fake_read_pod(name, namespace):
-        called.append((name, namespace))
-        raise AssertionError("read_pod should not be called when guard 3 is active")
-
-    monkeypatch.setattr(main_module, "read_pod", fake_read_pod)
-    result = asyncio.run(main_module._try_place_ondemand(state, "uid-1", candidate))
-
-    assert result is False, "guard 3 should keep candidate when its class is stuck"
-    assert called == [], "read_pod must not be called"
-    assert state.occupancy == {}
-
-
-def test_guard3_does_not_block_other_gpu_class(monkeypatch):
-    """When the stuck set contains h100, an a100 candidate is not blocked."""
-    import asyncio
-    from datetime import date, datetime, timedelta, timezone
-    from app.controller import OnDemandCandidate
-    from app.schemas import GpuClassBrief, ReservationResponse
-
-    main_module, state = _make_main_module_and_state(monkeypatch)
-
-    # Add an a100 on-demand block so find_ondemand_block can succeed.
-    today = date.today()
-    midnight = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
-    a100_block = ReservationResponse(
-        id=100,
-        user_id=None, user=None, group_id=None, group=None,
-        gpu_class_id=2,
-        gpu_class=GpuClassBrief(id=2, name="A100"),
-        date=today,
-        start_utc=midnight,
-        end_utc=midnight + timedelta(days=1),
-        gpu_count=4, status="active", kind="reclaim",
-        created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
-    )
-    state.reservations.append(a100_block)
-    state.gpu_class_labels[2] = "a100"
-
-    # Only h100 is stuck; a100 should be unaffected.
-    state.stuck_holder_gpu_classes = {"h100"}
-
-    candidate = OnDemandCandidate(
-        pod_uid="uid-2", pod_name="pod-2", pod_namespace="ns-2",
-        gpu_class_label="a100", gpu_requested=1, min_runtime_seconds=60,
-        pod_created_at=datetime.now(timezone.utc), next_attempt_at=datetime.now(timezone.utc),
-    )
-
-    # Guard 3 should NOT fire; the function will proceed to read_pod.
-    # We let read_pod raise so we can verify guard 3 was bypassed.
-    guard3_bypassed = []
-
-    async def fake_read_pod(name, namespace):
-        guard3_bypassed.append(True)
-        raise RuntimeError("stop here — we only need to confirm guard 3 was skipped")
-
-    monkeypatch.setattr(main_module, "read_pod", fake_read_pod)
-    # The RuntimeError from fake_read_pod is caught by _try_place_ondemand's
-    # outer except, which rolls back and returns False.
-    asyncio.run(main_module._try_place_ondemand(state, "uid-2", candidate))
-
-    assert guard3_bypassed, "read_pod should have been called (guard 3 did not block a100)"
+# Guard 3's synchronous gating of the JIT lease request path
+# (``main._try_request_lease``) is covered in test_jit_lease.py.

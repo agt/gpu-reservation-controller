@@ -2,9 +2,9 @@
 
 Covers: update_noshow_tracking (init + new), reconcile_noshow,
 check_noshow_deadlines, mark_pod_seen_for_noshow, enqueue_pod deadline clearing,
-find_best_reservation skipping no-shows, find_ondemand_block including no-shows,
-and reconcile_occupancy including no-shows.  Guarantee-arithmetic no-show
-skipping (compute_guaranteed_until) is covered in test_guarantees.py.
+find_best_reservation skipping no-shows, and reconcile_occupancy including
+no-shows.  Guarantee-arithmetic no-show skipping (compute_guaranteed_until) is
+covered in test_guarantees.py.
 
 No Kubernetes or HTTP calls are made.
 """
@@ -345,71 +345,6 @@ class TestFindBestReservationSkipsNoshow:
         result = state.find_best_reservation(USERNAME, GPU_CLASS_LABEL)
         assert result is not None
         assert result.id == 2
-
-
-# ---------------------------------------------------------------------------
-# TestFindOndemandBlockIncludesNoshow
-# ---------------------------------------------------------------------------
-
-
-class TestFindOndemandBlockIncludesNoshow:
-    def test_noshow_block_matched_when_window_open(self):
-        r = _user_reservation(1)
-        now = _window_open_now()
-        state = _state(r)
-        state.noshow_reservation_ids.add(1)
-        result = state.find_ondemand_block(GPU_CLASS_LABEL, now, 1, 1)
-        assert result is not None
-        assert result.id == 1
-
-    def test_noshow_block_not_matched_when_window_closed(self):
-        r = _user_reservation(1)
-        now = _window_start_dt() + timedelta(hours=3)  # past slot_end
-        state = _state(r)
-        state.noshow_reservation_ids.add(1)
-        assert state.find_ondemand_block(GPU_CLASS_LABEL, now, 1, 1) is None
-
-    def test_noshow_respects_capacity(self):
-        r = _user_reservation(1, gpu_count=2)
-        now = _window_open_now()
-        state = _state(r)
-        state.noshow_reservation_ids.add(1)
-        state.record_placement(1, "uid-a", 2)  # fills all capacity
-        assert state.find_ondemand_block(GPU_CLASS_LABEL, now, 1, 1) is None
-
-    def test_noshow_respects_min_runtime(self):
-        r = _user_reservation(1, duration_minutes=30)
-        # Only 1 second left in the window
-        end = _window_start_dt() + timedelta(minutes=30)
-        now = end - timedelta(seconds=1)
-        state = _state(r)
-        state.noshow_reservation_ids.add(1)
-        assert state.find_ondemand_block(GPU_CLASS_LABEL, now, 1, 60) is None
-
-    def test_prefers_latest_slot_end(self):
-        # noshow:   09:00–12:00 (start=09:00, dur=180) — ends later
-        # ondemand: 08:00–10:00 (start=08:00, dur=120) — ends sooner
-        # Both are open at 09:30 UTC
-        r_noshow = _user_reservation(
-            1, slot_index=0, start_time="09:00:00", duration_minutes=180
-        )
-        r_ondemand = _ondemand_reservation(
-            2, slot_index=0, start_time="08:00:00", duration_minutes=120
-        )
-        now = _window_start_dt("09:00:00") + timedelta(minutes=30)  # 09:30 UTC
-        state = _state(r_noshow, r_ondemand)
-        state.noshow_reservation_ids.add(1)
-        result = state.find_ondemand_block(GPU_CLASS_LABEL, now, 1, 1)
-        assert result is not None
-        assert result.id == 1  # later slot_end (12:00) preferred over 10:00
-
-    def test_regular_ondemand_still_matched(self):
-        r = _ondemand_reservation(1)
-        now = _window_open_now()
-        state = _state(r)
-        result = state.find_ondemand_block(GPU_CLASS_LABEL, now, 1, 1)
-        assert result is not None
-        assert result.id == 1
 
 
 # ---------------------------------------------------------------------------

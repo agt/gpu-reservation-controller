@@ -178,7 +178,6 @@ def test_push_cancellation_evicts_admitted_pod(monkeypatch):
 
         assert deleted == [("pod-1", USERNAME)]         # pod evicted
         assert state.occupancy.get(1, {}) == {}         # budget freed
-        assert 1 in state.cancelled_reservations        # capacity offered on-demand
         assert [r.id for r in state.reservations] == [] # dropped from active set
 
 

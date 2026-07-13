@@ -13,8 +13,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from app.controller import ReclaimMerge
-
 from tests.conftest import (
     FIXED_DATE,
     GPU_CLASS_ID,
@@ -24,7 +22,6 @@ from tests.conftest import (
     USERNAME,
 )
 from tests.conftest import make_state as _state
-from tests.conftest import reclaim_reservation as _reclaim
 from tests.conftest import user_reservation as _user_reservation
 
 NOW = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)  # 1h into an 08:00-10:00 window
@@ -115,25 +112,25 @@ class TestComputeGuaranteedUntil:
 
 
 # ---------------------------------------------------------------------------
-# guarantee_end (live, restart-safe, dispatches on reserved_path)
+# guarantee_end (live, restart-safe)
 # ---------------------------------------------------------------------------
 
 
-class TestGuaranteeEndReservedPath:
+class TestGuaranteeEnd:
     def test_resolves_to_chain_end(self):
         res1 = _user_reservation(1, slot_index=0, start_time="08:00:00", duration_minutes=120)
         res2 = _user_reservation(2, slot_index=1, start_time="08:00:00", duration_minutes=120)
         state = _state(res1, res2)
-        end = state.guarantee_end(1, reserved_path=True, now=NOW)
+        end = state.guarantee_end(1, now=NOW)
         assert end == datetime(2024, 1, 15, 12, 0, tzinfo=timezone.utc)
 
     def test_absent_reservation_id_returns_none(self):
         state = _state()
-        assert state.guarantee_end(999, reserved_path=True, now=NOW) is None
+        assert state.guarantee_end(999, now=NOW) is None
 
     def test_none_reservation_id_returns_none(self):
         state = _state()
-        assert state.guarantee_end(None, reserved_path=True, now=NOW) is None
+        assert state.guarantee_end(None, now=NOW) is None
 
     def test_extends_when_abutting_booking_lands(self):
         # The defining property of live guarantees: booking a follow-on slot
@@ -142,45 +139,11 @@ class TestGuaranteeEndReservedPath:
         # raising an existing deadline).
         res1 = _user_reservation(1, slot_index=0, start_time="08:00:00", duration_minutes=120)
         state = _state(res1)
-        assert state.guarantee_end(1, reserved_path=True, now=NOW) == datetime(
+        assert state.guarantee_end(1, now=NOW) == datetime(
             2024, 1, 15, 10, 0, tzinfo=timezone.utc
         )
         res2 = _user_reservation(2, slot_index=1, start_time="08:00:00", duration_minutes=120)
         state.reservations.append(res2)
-        assert state.guarantee_end(1, reserved_path=True, now=NOW) == datetime(
+        assert state.guarantee_end(1, now=NOW) == datetime(
             2024, 1, 15, 12, 0, tzinfo=timezone.utc
         )
-
-
-class TestGuaranteeEndOnDemandPath:
-    def test_resolves_to_effective_end_of_active_block(self):
-        block = _reclaim(42, slot_index=0, start_time="08:00:00", duration_minutes=120)
-        state = _state(block)
-        end = state.guarantee_end(42, reserved_path=False, now=NOW)
-        assert end == datetime(2024, 1, 15, 10, 0, tzinfo=timezone.utc)
-
-    def test_resolves_through_reclaim_merge_extension(self):
-        subject = _reclaim(1, slot_index=0, start_time="08:00:00", duration_minutes=120)
-        state = _state(subject)
-        extended = datetime(2024, 1, 15, 14, 0, tzinfo=timezone.utc)
-        state.reclaim_merges[1] = ReclaimMerge(
-            subject_id=1, absorbed_ids=[2], extended_end=extended
-        )
-        assert state.guarantee_end(1, reserved_path=False, now=NOW) == extended
-
-    def test_resolves_from_cancelled_reservations_when_not_active(self):
-        cancelled = _user_reservation(7, start_time="08:00:00", duration_minutes=120)
-        state = _state()
-        state.record_cancelled_reservation(cancelled)
-        end = state.guarantee_end(7, reserved_path=False, now=NOW)
-        assert end == datetime(2024, 1, 15, 10, 0, tzinfo=timezone.utc)
-
-    def test_absent_block_returns_none(self):
-        state = _state()
-        assert state.guarantee_end(999, reserved_path=False, now=NOW) is None
-
-
-class TestGuaranteeEndForeignPod:
-    def test_no_booking_reference_never_returns_a_guarantee(self):
-        state = _state()
-        assert state.guarantee_end(None, reserved_path=False, now=NOW) is None

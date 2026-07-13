@@ -44,15 +44,11 @@ from .controller import (
     slot_start,
 )
 from .k8s_client import (
-    BOOKING_KIND_NOSHOW,
-    BOOKING_KIND_ONDEMAND,
-    BOOKING_KIND_RESERVED,
     TERMINAL_PHASES,
     PodWatcher,
     annotate_runtime_guarantee,
     apply_toleration,
     delete_pod,
-    emit_ondemand_upgraded_event,
     emit_overstay_relinked_event,
     emit_preempted_event,
     emit_reservation_cancelled_event,
@@ -66,7 +62,6 @@ from .k8s_client import (
     get_unschedulable_message,
     init_k8s,
     is_gpu_only_pending,
-    is_reserved_path,
     is_terminal_phase,
     make_booking_reference,
     parse_booking_reference,
@@ -129,8 +124,6 @@ async def _reconcile_after_reservation_change(
     cancelled_in_window: list[ReservationResponse],
     owner_changes: list[tuple[ReservationResponse, str]],
     now: datetime,
-    *,
-    update_fetch_stamp: bool,
 ) -> None:
     """Apply a new active reservation set and run the reconciliation tail.
 
@@ -138,16 +131,13 @@ async def _reconcile_after_reservation_change(
     inbound push endpoint (which supplies a partial delta merged into the current
     set).  Resolves gpu_class_id → label_value for every referenced GPU class
     (rebuilt from scratch, reusing cached values), assigns the new reservation
-    list and label map, reconciles the task queue, evicts pods for any in-window
-    cancellations or owner changes (adoption), and re-applies reclaim-block merges.
+    list and label map, reconciles the task queue, and evicts pods for any
+    in-window cancellations or owner changes (adoption).
 
     The caller must already hold ``state.reservation_lock`` and must have computed
     *cancelled_in_window* and *owner_changes* against the OLD reservation set (both
     detectors compare the incoming entries with ``state.reservations`` before it is
-    replaced here).  *update_fetch_stamp* is ``True`` only for a full fetch;
-    a partial push passes ``False`` so it does not advance
-    ``last_reservation_fetch_at`` (the reclaim-merge commitment guard anchors on
-    that stamp — advancing it on partial data could race an unseen booking).
+    replaced here).
     """
     # Resolve label_value for each unique GPU class in active reservations.
     class_ids = {r.gpu_class_id for r in active_reservations}
@@ -171,11 +161,6 @@ async def _reconcile_after_reservation_change(
 
     state.reservations = active_reservations
     state.gpu_class_labels = new_labels
-    if update_fetch_stamp:
-        # Stamp the freshness of this data; the reclaim-merge commitment test
-        # anchors its guard horizon here, not on the between-fetch tick clock.
-        # A partial push must not advance this stamp (see docstring).
-        state.last_reservation_fetch_at = now
 
     # Drop / re-match queue entries whose reservation was cancelled.
     state.reconcile_queue()
@@ -191,31 +176,18 @@ async def _reconcile_after_reservation_change(
     if owner_changes:
         await _handle_owner_changes(state, owner_changes)
 
-    # Re-apply persistent reclaim-block merges to the freshly loaded reservation
-    # objects (and discover new ones) so a reload never re-exposes an absorbed
-    # block.  Only meaningful when on-demand placement is enabled.
-    if config.ondemand_placement_enabled:
-        state.reconcile_reclaim_merges(datetime.now(timezone.utc))
-
 
 async def _refresh_reservations(
     state: ControllerState, client: ReservationClient, config: Config
 ) -> None:
     """Fetch the current reservation list and update shared state.
 
-    Pulls the full ``status=all`` reservation set, refreshes the reclaim-preempt
-    guard from app settings, then hands the active subset to
-    ``_reconcile_after_reservation_change`` (under ``reservation_lock``) to apply
-    it and run the reconciliation tail.
+    Pulls the full ``status=all`` reservation set, then hands the active subset
+    to ``_reconcile_after_reservation_change`` (under ``reservation_lock``) to
+    apply it and run the reconciliation tail.
     """
     all_reservations = await client.fetch_reservations()
     active_reservations = [r for r in all_reservations if r.status == "active"]
-
-    # Refresh the reclaim-preempt guard from app settings; keep the previous
-    # value on a failed fetch so merging is not disrupted by a transient error.
-    settings = await client.fetch_settings()
-    if settings is not None:
-        state.reclaim_preempt_guard_minutes = settings.reclaim_preempt_guard_minutes
 
     now = datetime.now(timezone.utc)
     async with state.reservation_lock:
@@ -231,7 +203,6 @@ async def _refresh_reservations(
             cancelled_in_window,
             owner_changes,
             now,
-            update_fetch_stamp=True,
         )
 
 
@@ -250,8 +221,6 @@ async def _handle_cancelled_reservations(
     info from the ``status=all`` fetch):
     1. Snapshot live tolerated pods and filter those admitted under this reservation.
     2. Emit a ReservationCancelled event on each pod, then delete it.
-    3. Record the reservation in ``state.cancelled_reservations`` so its freed
-       GPU capacity is immediately available for on-demand placement.
     """
     # One pod snapshot serves the whole batch.
     pod_snapshot = []
@@ -296,9 +265,6 @@ async def _handle_cancelled_reservations(
                     exc,
                 )
 
-        # Record immediately so on-demand candidates can use the freed capacity.
-        state.record_cancelled_reservation(cancelled_res)
-
 
 async def _handle_owner_changes(
     state: ControllerState,
@@ -317,8 +283,7 @@ async def _handle_owner_changes(
     3. Release its capacity so the new owner's pod can be admitted under the same
        still-active reservation on a subsequent tick / watch event.
 
-    Unlike cancellation, the reservation stays active — it is not recorded in
-    ``cancelled_reservations``; it simply changes hands.
+    Unlike cancellation, the reservation stays active; it simply changes hands.
     """
     # One pod snapshot serves the whole batch.
     pod_snapshot = []
@@ -380,10 +345,9 @@ async def _record_guarantee(
 ) -> None:
     """Annotate the pod with its runtime guarantee and emit a RuntimeGuaranteed Event.
 
-    Shared by both admission paths (CODE-REVIEW D1a); callers compute
-    *guaranteed_until* (the reserved path chains back-to-back windows, the
-    on-demand path uses the single block's ``effective_end``).  Unlike the
-    retired hard deadline this sets no Kubernetes enforcement — no
+    Callers compute *guaranteed_until* by chaining back-to-back windows
+    (``compute_guaranteed_until``).  Unlike the retired hard deadline this sets
+    no Kubernetes enforcement — no
     ``spec.activeDeadlineSeconds`` is patched, so a pod may run past its
     guarantee freely.  Demand-driven preemption recovers capacity from an
     overstaying pod only when needed (see ``preemption_loop``), deciding by
@@ -446,7 +410,7 @@ async def _try_apply_toleration(
     **Does not** evaluate timing (window open/closed, retry cooldown); callers
     are responsible for those guards before invoking this function.
     """
-    booking_reference = make_booking_reference(BOOKING_KIND_RESERVED, entry.reservation.id)
+    booking_reference = make_booking_reference(entry.reservation.id)
 
     available = state.available(entry.reservation, exclude_uid=uid)
     if entry.gpu_requested > available:
@@ -537,168 +501,6 @@ async def _try_apply_toleration(
 
 
 # ---------------------------------------------------------------------------
-# On-demand placement coroutine
-# ---------------------------------------------------------------------------
-
-
-async def _try_place_ondemand(
-    state: ControllerState, uid: str, candidate: OnDemandCandidate,
-    scheduling_gate_name: str | None = None,
-) -> bool:
-    """Attempt to place an on-demand candidate onto a suitable block.
-
-    Returns ``True``  — candidate should be removed (placed, or pod gone/terminal).
-    Returns ``False`` — candidate should remain; ``candidate.next_attempt_at``
-                        has been pushed forward.
-
-    Placement steps:
-    1. Find a suitable block (class + window + capacity + min-runtime).
-    2. Reserve capacity optimistically (before any await) to prevent races
-       within the single-threaded event loop.
-    3. Re-read the pod; if it is gone or terminal, roll back and drop.
-    4. Apply toleration.
-    5. Record the guarantee (block's window end) and emit a RuntimeGuaranteed event.
-    """
-    now = datetime.now(timezone.utc)
-    block = state.find_ondemand_block(
-        candidate.gpu_class_label,
-        now,
-        candidate.gpu_requested,
-        candidate.min_runtime_seconds,
-    )
-    if block is None:
-        log.debug(
-            "On-demand candidate %s/%s: no suitable block available; retry later",
-            candidate.pod_namespace,
-            candidate.pod_name,
-        )
-        candidate.next_attempt_at = _jittered_retry_at(datetime.now(timezone.utc))
-        return False
-
-    # Guard 3: safety interlock — hold on-demand placement for any GPU class
-    # that has a stuck reservation-holder pod.  Other classes are unaffected.
-    if candidate.gpu_class_label in state.stuck_holder_gpu_classes:
-        log.debug(
-            "On-demand candidate %s/%s: safety interlock active for gpu-class=%s; "
-            "retry shortly",
-            candidate.pod_namespace,
-            candidate.pod_name,
-            candidate.gpu_class_label,
-        )
-        candidate.next_attempt_at = _short_retry_at(datetime.now(timezone.utc))
-        return False
-
-    if block.id in state.noshow_reservation_ids:
-        booking_reference = make_booking_reference(BOOKING_KIND_NOSHOW, block.id)
-    else:
-        booking_reference = make_booking_reference(BOOKING_KIND_ONDEMAND, block.id)
-    # --- optimistic reservation (before any await) ---
-    state.record_placement(block.id, uid, candidate.gpu_requested)
-
-    try:
-        fresh_pod = await read_pod(candidate.pod_name, candidate.pod_namespace)
-
-        # Drop gone or terminal pods.  Placement additionally treats "Unknown"
-        # (node unreachable) as gone — there is nothing to schedule onto — unlike
-        # occupancy release, which only frees confirmed-terminal slots (D1c).
-        phase = get_pod_phase(fresh_pod)
-        if phase in TERMINAL_PHASES or phase == "Unknown":
-            log.info(
-                "On-demand candidate %s/%s is %s; dropping",
-                candidate.pod_namespace,
-                candidate.pod_name,
-                phase,
-            )
-            state.release_pod(uid)
-            return True
-
-        # Guard 1: GPU-only-pending check.
-        gpu_only = is_gpu_only_pending(fresh_pod)
-        if gpu_only is False:
-            # Pod has non-GPU resource constraints; our toleration cannot help.
-            log.info(
-                "On-demand candidate %s/%s: not GPU-only-pending (%r); dropping",
-                candidate.pod_namespace,
-                candidate.pod_name,
-                get_unschedulable_message(fresh_pod),
-            )
-            state.release_pod(uid)
-            return True
-        if gpu_only is None:
-            # Scheduling conditions not yet populated; keep candidate, retry shortly.
-            log.debug(
-                "On-demand candidate %s/%s: scheduling conditions not yet set; retry shortly",
-                candidate.pod_namespace,
-                candidate.pod_name,
-            )
-            state.release_pod(uid)
-            candidate.next_attempt_at = _short_retry_at(datetime.now(timezone.utc))
-            return False
-
-        if pod_has_toleration(fresh_pod, TOLERATION_KEY, candidate.gpu_class_label, "NoSchedule"):
-            # Toleration was applied externally between the event and now.
-            log.info(
-                "On-demand pod %s/%s already has toleration; "
-                "recording as placed on block #%d",
-                candidate.pod_namespace,
-                candidate.pod_name,
-                block.id,
-            )
-            # Keep the occupancy record — it was placed somehow.
-            return True
-
-        await apply_toleration(
-            candidate.pod_name,
-            candidate.pod_namespace,
-            fresh_pod,
-            TOLERATION_KEY,
-            candidate.gpu_class_label,
-            booking_reference,
-        )
-
-        # Record the guarantee (block's window end, no back-to-back chaining)
-        # BEFORE lifting the scheduling gate: the guarantee annotations should
-        # be visible to any in-pod widget from the moment the pod can start
-        # running (CODE-REVIEW D1b; no longer a safety cap — demand-driven
-        # preemption, not a Kubernetes deadline, is what bounds this pod now).
-        now = datetime.now(timezone.utc)
-        guaranteed_until = state.effective_end(block)
-        await _record_guarantee(
-            candidate.pod_name, candidate.pod_namespace, fresh_pod, guaranteed_until, now
-        )
-        await _enforce_scheduling_gate_removal(
-            candidate.pod_name, candidate.pod_namespace, fresh_pod, scheduling_gate_name
-        )
-        log.info(
-            "Placed on-demand pod %s/%s onto block #%d "
-            "(gpu-class=%s, gpus=%d, block has %d/%d free after placement, "
-            "guaranteed until %s)",
-            candidate.pod_namespace,
-            candidate.pod_name,
-            block.id,
-            candidate.gpu_class_label,
-            candidate.gpu_requested,
-            state.available(block),
-            block.gpu_count,
-            guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        )
-
-        return True
-
-    except Exception as exc:  # noqa: BLE001
-        # Roll back the optimistic occupancy record so capacity is not leaked.
-        state.release_pod(uid)
-        log.warning(
-            "Error placing on-demand pod %s/%s: %s; will retry",
-            candidate.pod_namespace,
-            candidate.pod_name,
-            exc,
-        )
-        candidate.next_attempt_at = _jittered_retry_at(datetime.now(timezone.utc))
-        return False
-
-
-# ---------------------------------------------------------------------------
 # Background loop 1: reservation refresh
 # ---------------------------------------------------------------------------
 
@@ -748,11 +550,10 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
     - DELETED → dequeue
     - ADDED inside open window → fast-path immediate toleration attempt
 
-    On-demand path (places onto kind="reclaim" blocks, when ``config.ondemand_placement_enabled``):
+    On-demand path (when ``config.ondemand_placement_enabled``):
     - ADDED, Pending, has ``horae/minimum-runtime-seconds`` annotation,
       no matching user reservation → add as on-demand candidate
-    - DELETED or terminal (Succeeded/Failed) → release any held on-demand slot
-      and attempt immediate placement of a waiting candidate of the same class
+    - DELETED or terminal (Succeeded/Failed) → release any held slot
     - MODIFIED with toleration present → dequeue from candidates (already placed)
     """
     watcher = PodWatcher(label_selector="gpu-class")
@@ -801,12 +602,10 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
                 )
             state.remove_ondemand_candidate(uid)
             # Occupancy is the unified budget map for every admission path, so a
-            # deleted pod must always be released — not only when on-demand
-            # placement is enabled (otherwise reserved-path budget leaks until the
-            # next reconcile).  Only the on-demand recycle is gated on the flag.
-            block_id = state.release_pod(uid)
-            if config.ondemand_placement_enabled and block_id is not None:
-                await _place_ondemand_candidates(state, config, gpu_class=gpu_class_label, max_placements=1)
+            # deleted pod must always be released, regardless of on-demand
+            # placement being enabled (otherwise reserved-path budget leaks until
+            # the next reconcile).
+            state.release_pod(uid)
 
         elif event_type in ("ADDED", "MODIFIED"):
             phase = get_pod_phase(pod)
@@ -819,9 +618,7 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
             # otherwise re-add it to occupancy on every MODIFIED event.
             if phase in TERMINAL_PHASES:
                 state.remove_ondemand_candidate(uid)
-                block_id = state.release_pod(uid)
-                if config.ondemand_placement_enabled and block_id is not None:
-                    await _place_ondemand_candidates(state, config, gpu_class=gpu_class_label, max_placements=1)
+                state.release_pod(uid)
                 continue
 
             if has_tol:
@@ -898,44 +695,6 @@ async def pod_watch_loop(state: ControllerState, config: Config) -> None:
 
 
 # ---------------------------------------------------------------------------
-# On-demand recycling helper
-# ---------------------------------------------------------------------------
-
-
-async def _place_ondemand_candidates(
-    state: ControllerState,
-    config: Config,
-    *,
-    gpu_class: str | None = None,
-    max_placements: int | None = None,
-) -> int:
-    """Attempt on-demand placement for eligible candidates in FIFO order.
-
-    Single scan shared by the queue processor (all classes, no cap) and the
-    post-vacate recycle path (one class, ``max_placements=1``) — replacing the
-    two copies that sorted by ``pod_created_at``, filtered on ``next_attempt_at``,
-    called ``_try_place_ondemand``, and popped on success (CODE-REVIEW D5).
-
-    *gpu_class* restricts to one GPU class; *max_placements* stops after that many
-    successful placements.  Returns the number placed.
-    """
-    now = datetime.now(timezone.utc)
-    placed = 0
-    ordered = sorted(state.ondemand_candidates.items(), key=lambda kv: kv[1].pod_created_at)
-    for uid, candidate in ordered:
-        if now < candidate.next_attempt_at:
-            continue
-        if gpu_class is not None and candidate.gpu_class_label != gpu_class:
-            continue
-        if await _try_place_ondemand(state, uid, candidate, config.scheduling_gate_name):
-            state.remove_ondemand_candidate(uid)
-            placed += 1
-            if max_placements is not None and placed >= max_placements:
-                break
-    return placed
-
-
-# ---------------------------------------------------------------------------
 # Background loop 3: queue processor
 # ---------------------------------------------------------------------------
 
@@ -983,24 +742,14 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
                     if p.reservation_id is not None
                 ]
             )
-            # Claim every window a live reserved-path holder occupies (chain-aware)
-            # before declaring no-shows.
+            # Claim every window a live holder occupies (chain-aware) before
+            # declaring no-shows.
             holder_ids = [
-                p.reservation_id
-                for p in live
-                if p.reservation_id is not None
-                and is_reserved_path(p.booking_reference)
+                p.reservation_id for p in live if p.reservation_id is not None
             ]
             state.refresh_claimed_reservations(holder_ids, now)
 
         state.check_noshow_deadlines(now)
-        state.cleanup_cancelled_reservations(now)
-
-        # Re-apply / extend reclaim-block merges now that the claimed, no-show
-        # and cancelled sets are current — picks up future blocks that have
-        # entered the preempt guard since the last reservation reload.
-        if config.ondemand_placement_enabled:
-            state.reconcile_reclaim_merges(now)
 
         # Adopt overstay pods whose user has re-booked capacity: re-link them to
         # the new reservation so they stop surfacing as overstay even when no
@@ -1069,9 +818,7 @@ async def queue_processor_loop(state: ControllerState, config: Config) -> None:
         for uid in to_remove:
             state.dequeue_pod(uid)
 
-        # --- on-demand path ---
-        if config.ondemand_placement_enabled:
-            await _place_ondemand_candidates(state, config)
+        # --- on-demand path: JIT lease requests wired up in a later commit ---
 
         log.debug(
             "Queue processor tick: %d reserved queue entr(ies), %d on-demand candidate(s)",
@@ -1095,7 +842,6 @@ def _pod_view(p) -> PodRuntimeView:
         gpu_class=p.gpu_class,
         gpu_count=p.gpu_count,
         reservation_id=p.reservation_id,
-        reserved_path=is_reserved_path(p.booking_reference),
         node_resident=(p.phase == "Running" or (p.phase == "Pending" and not p.scheduled_false)),
         terminating=p.deletion_timestamp is not None,
         group_label=p.group_label,
@@ -1106,7 +852,7 @@ def _preemption_message(
     state: ControllerState, view: PodRuntimeView, boundary: datetime, now: datetime
 ) -> str:
     """Build the human-readable ``Preempted`` event message for *view*."""
-    end = state.guarantee_end(view.reservation_id, reserved_path=view.reserved_path, now=now)
+    end = state.guarantee_end(view.reservation_id, now=now)
     if end is not None:
         overstay = max(0, int((now - end).total_seconds()))
         minutes, secs = divmod(overstay, 60)
@@ -1152,24 +898,24 @@ async def _adopt_pods(
     pods: list[PodRuntimeView],
     now: datetime,
 ) -> None:
-    """Re-link pods to a reservation their user has since booked.
+    """Re-link overstay pods to a reservation their user has since booked.
 
     Caller must hold ``state.reservation_lock`` and pass the ``pods`` list it
-    derived from a fresh ``snapshot_tolerated_pods``.  For each adoption planned
-    by ``plan_pod_adoptions`` — a rescue for a pod already past its runtime
-    guarantee, or a proactive upgrade of a within-guarantee on-demand pod — re-
-    annotate the pod's booking-reference to the new reservation (the toleration
-    is already present, so this patch just rewrites the annotation) and, **only
-    on patch success**, move its occupancy and update the in-memory view so
-    subsequent planning in the same tick sees the new binding.  Each pod is
-    independently best-effort: a failure logs a warning and never deletes the
-    pod.  *pods* is mutated in place — an adopted entry is replaced with a view
-    carrying the new reservation id.
+    derived from a fresh ``snapshot_tolerated_pods``.  For each rescue planned
+    by ``plan_pod_adoptions`` (a pod already past its runtime guarantee whose
+    user has since booked a non-abutting or differently-sized follow-on
+    window), re-annotate the pod's booking-reference to the new reservation
+    (the toleration is already present, so this patch just rewrites the
+    annotation) and, **only on patch success**, move its occupancy and update
+    the in-memory view so subsequent planning in the same tick sees the new
+    binding.  Each pod is independently best-effort: a failure logs a warning
+    and never deletes the pod.  *pods* is mutated in place — an adopted entry
+    is replaced with a view carrying the new reservation id.
     """
     if not config.pod_adoption_enabled:
         return
-    for view, res_new, was_overstay in state.plan_pod_adoptions(pods, now):
-        booking_reference = make_booking_reference(BOOKING_KIND_RESERVED, res_new.id)
+    for view, res_new in state.plan_pod_adoptions(pods, now):
+        booking_reference = make_booking_reference(res_new.id)
         try:
             fresh_pod = await read_pod(view.name, view.namespace)
             if is_terminal_phase(fresh_pod):
@@ -1196,12 +942,11 @@ async def _adopt_pods(
         # adopted pod contributes zero demand and is no longer past-guarantee.
         state.relink_occupancy(view.uid, res_new.id, view.gpu_count)
         idx = pods.index(view)
-        pods[idx] = replace(view, reservation_id=res_new.id, reserved_path=True)
+        pods[idx] = replace(view, reservation_id=res_new.id)
 
         guaranteed_until = state.compute_guaranteed_until(now, res_new)
         log.info(
-            "%s pod %s/%s to reservation #%d (guaranteed until %s)",
-            "Re-linked overstay" if was_overstay else "Upgraded on-demand",
+            "Re-linked overstay pod %s/%s to reservation #%d (guaranteed until %s)",
             view.namespace,
             view.name,
             res_new.id,
@@ -1210,18 +955,13 @@ async def _adopt_pods(
         await _record_guarantee(
             view.name, view.namespace, fresh_pod, guaranteed_until, now
         )
-        emit_event = (
-            emit_overstay_relinked_event if was_overstay else emit_ondemand_upgraded_event
-        )
-        event_reason = "OverstayRelinked" if was_overstay else "OnDemandUpgraded"
         try:
-            await emit_event(
+            await emit_overstay_relinked_event(
                 fresh_pod, view.name, view.namespace, res_new.id, guaranteed_until
             )
         except Exception as exc:  # noqa: BLE001
             log.warning(
-                "Could not emit %s event for pod %s/%s: %s",
-                event_reason,
+                "Could not emit OverstayRelinked event for pod %s/%s: %s",
                 view.namespace,
                 view.name,
                 exc,
@@ -1505,7 +1245,6 @@ async def push_reservations(
             cancelled_in_window,
             owner_changes,
             now,
-            update_fetch_stamp=False,
         )
 
         # Re-arm / prune no-show tracking for the new set, mirroring what the

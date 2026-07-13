@@ -33,7 +33,6 @@ def _view(
     gpu_class: str = GPU_CLASS_LABEL,
     gpu_count: int = 1,
     reservation_id: int | None = None,
-    reserved_path: bool = True,
     node_resident: bool = True,
     terminating: bool = False,
     namespace: str = USERNAME,
@@ -46,7 +45,6 @@ def _view(
         gpu_class=gpu_class,
         gpu_count=gpu_count,
         reservation_id=reservation_id,
-        reserved_path=reserved_path,
         node_resident=node_resident,
         terminating=terminating,
     )
@@ -188,7 +186,7 @@ class TestBoundaryDemand:
             gpu_class_label=GPU_CLASS_LABEL,
         )
         state = _state(prior, boundary_res)
-        holder = _view("h1", reservation_id=1, reserved_path=True, gpu_count=1)
+        holder = _view("h1", reservation_id=1, gpu_count=1)
         demand = state.boundary_demand(BOUNDARY, [holder], NOW)
         assert demand == {GPU_CLASS_LABEL: 3}
 
@@ -208,7 +206,7 @@ class TestBoundaryDemand:
             gpu_class_label=GPU_CLASS_LABEL,
         )
         state = _state(prior, boundary_res)
-        holder = _view("h1", reservation_id=1, reserved_path=True, gpu_count=2)
+        holder = _view("h1", reservation_id=1, gpu_count=2)
         demand = state.boundary_demand(BOUNDARY, [holder], NOW)
         assert demand == {}
 
@@ -294,9 +292,9 @@ class TestPlanBoundaryPreemption:
         state = self._demand_state(gpu_count=2)
         # reservation_id set to ids absent from state.reservations so
         # guarantee_end resolves to None (unresolvable → treated as past
-        # guarantee → eligible); reserved_path=False (on-demand path).
+        # guarantee → eligible).
         victims = [
-            _view(f"v{i}", reservation_id=100 + i, reserved_path=False, gpu_count=1)
+            _view(f"v{i}", reservation_id=100 + i, gpu_count=1)
             for i in range(3)
         ]
         # capacity_by_class is TOTAL node capacity, not pre-computed free —
@@ -322,7 +320,7 @@ class TestPlanBoundaryPreemption:
             gpu_class_label=GPU_CLASS_LABEL,
         )
         state.reservations.append(holder_res)
-        within_guarantee = _view("in-guarantee", reservation_id=2, reserved_path=True, gpu_count=1)
+        within_guarantee = _view("in-guarantee", reservation_id=2, gpu_count=1)
         # capacity == the pod's own usage → free=0 → kills_needed=demand=2.
         plan = state.plan_boundary_preemption(
             BOUNDARY, {GPU_CLASS_LABEL: 1}, [within_guarantee], NOW, rng=random.Random(0)
@@ -341,7 +339,7 @@ class TestPlanBoundaryPreemption:
             gpu_class_label=GPU_CLASS_LABEL,
         )
         state.reservations.append(expired_res)
-        overstayer = _view("overstayer", reservation_id=2, reserved_path=True, gpu_count=1)
+        overstayer = _view("overstayer", reservation_id=2, gpu_count=1)
         plan = state.plan_boundary_preemption(
             BOUNDARY, {GPU_CLASS_LABEL: 1}, [overstayer], NOW, rng=random.Random(0)
         )
@@ -351,7 +349,7 @@ class TestPlanBoundaryPreemption:
         # reservation_id not in state.reservations at all → guarantee_end
         # returns None → treated as past guarantee → eligible.
         state = self._demand_state(gpu_count=1)
-        overstayer = _view("gone", reservation_id=999, reserved_path=True, gpu_count=1)
+        overstayer = _view("gone", reservation_id=999, gpu_count=1)
         plan = state.plan_boundary_preemption(
             BOUNDARY, {GPU_CLASS_LABEL: 1}, [overstayer], NOW, rng=random.Random(0)
         )
@@ -362,7 +360,7 @@ class TestPlanBoundaryPreemption:
         # A foreign pod (not admitted by this controller) still occupies
         # physical capacity — capacity=5 matches its usage so free=0 — but is
         # never eligible as a victim (reservation_id is None).
-        foreign = _view("foreign", reservation_id=None, reserved_path=False, gpu_count=5)
+        foreign = _view("foreign", reservation_id=None, gpu_count=5)
         plan = state.plan_boundary_preemption(
             BOUNDARY, {GPU_CLASS_LABEL: 5}, [foreign], NOW, rng=random.Random(0)
         )
@@ -372,7 +370,7 @@ class TestPlanBoundaryPreemption:
     def test_terminating_pod_excluded_from_victims(self):
         state = self._demand_state(gpu_count=1)
         term = _view(
-            "term", reservation_id=None, reserved_path=False, gpu_count=5, terminating=True
+            "term", reservation_id=None, gpu_count=5, terminating=True
         )
         plan = state.plan_boundary_preemption(
             BOUNDARY, {GPU_CLASS_LABEL: 0}, [term], NOW, rng=random.Random(0)
@@ -381,7 +379,7 @@ class TestPlanBoundaryPreemption:
 
     def test_zero_gpu_pod_excluded_from_victims(self):
         state = self._demand_state(gpu_count=1)
-        zero = _view("zero", reservation_id=None, reserved_path=False, gpu_count=0)
+        zero = _view("zero", reservation_id=None, gpu_count=0)
         plan = state.plan_boundary_preemption(
             BOUNDARY, {GPU_CLASS_LABEL: 0}, [zero], NOW, rng=random.Random(0)
         )
@@ -390,7 +388,7 @@ class TestPlanBoundaryPreemption:
     def test_no_shortfall_selects_nothing(self):
         state = self._demand_state(gpu_count=2)
         # capacity=7, usage=5 → free=2 == demand → kills_needed=0.
-        overstayer = _view("v1", reservation_id=None, reserved_path=False, gpu_count=5)
+        overstayer = _view("v1", reservation_id=None, gpu_count=5)
         plan = state.plan_boundary_preemption(
             BOUNDARY, {GPU_CLASS_LABEL: 7}, [overstayer], NOW, rng=random.Random(0)
         )
@@ -401,7 +399,7 @@ class TestPlanBoundaryPreemption:
         state = self._demand_state(gpu_count=1)
         # reservation_id set but absent from state → unresolvable guarantee →
         # treated as past → eligible.  capacity == usage (4) → free=0.
-        big_victim = _view("big", reservation_id=55, reserved_path=False, gpu_count=4)
+        big_victim = _view("big", reservation_id=55, gpu_count=4)
         plan = state.plan_boundary_preemption(
             BOUNDARY, {GPU_CLASS_LABEL: 4}, [big_victim], NOW, rng=random.Random(0)
         )
@@ -437,8 +435,8 @@ class TestPlanBoundaryPreemption:
         )
         state = _state(res1, res2)
         state.gpu_class_labels[OTHER_CLASS_ID] = OTHER_CLASS_LABEL
-        v1 = _view("v1", gpu_class=GPU_CLASS_LABEL, reservation_id=101, reserved_path=False, gpu_count=1)
-        v2 = _view("v2", gpu_class=OTHER_CLASS_LABEL, reservation_id=102, reserved_path=False, gpu_count=1)
+        v1 = _view("v1", gpu_class=GPU_CLASS_LABEL, reservation_id=101, gpu_count=1)
+        v2 = _view("v2", gpu_class=OTHER_CLASS_LABEL, reservation_id=102, gpu_count=1)
         plan = state.plan_boundary_preemption(
             BOUNDARY,
             {GPU_CLASS_LABEL: 1, OTHER_CLASS_LABEL: 1},
@@ -452,7 +450,7 @@ class TestPlanBoundaryPreemption:
     def test_seeded_rng_is_deterministic(self):
         state = self._demand_state(gpu_count=1)
         victims = [
-            _view(f"v{i}", reservation_id=100 + i, reserved_path=False, gpu_count=1)
+            _view(f"v{i}", reservation_id=100 + i, gpu_count=1)
             for i in range(5)
         ]
         plan1 = state.plan_boundary_preemption(
