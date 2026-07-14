@@ -1419,6 +1419,7 @@ async def _run_renewal_sweep(
         return
     now = now or datetime.now(timezone.utc)
     lead = timedelta(minutes=config.lease_renewal_lead_minutes)
+    this_hour = now.replace(minute=0, second=0, microsecond=0)
 
     try:
         snapshot = await snapshot_tolerated_pods(
@@ -1432,13 +1433,18 @@ async def _run_renewal_sweep(
     candidates: list[tuple[ReservationResponse, object]] = []
     async with state.reservation_lock:
         by_id = {r.id: r for r in state.reservations}
-        # Prune denied-marks for ids no longer active on-demand leases, so a
-        # reused id (or a lease that has since left the set) is not suppressed.
+        # Prune per-lease bookkeeping for ids no longer active on-demand leases,
+        # so a reused id (or a lease that has since left the set) is not
+        # suppressed by a stale denied-mark or clock-hour entry.
         active_lease_ids = {
             r.id for r in state.reservations
             if r.kind == "on_demand" and r.status == "active"
         }
         state.renewal_denied_ids &= active_lease_ids
+        state.renewal_last_hour = {
+            rid: h for rid, h in state.renewal_last_hour.items()
+            if rid in active_lease_ids
+        }
 
         seen: set[int] = set()
         for p in snapshot:
@@ -1455,6 +1461,8 @@ async def _run_renewal_sweep(
                 continue  # already expired, or not near enough to renew yet
             if rid in state.renewal_denied_ids:
                 continue  # already warned; let the job checkpoint
+            if state.renewal_last_hour.get(rid) == this_hour:
+                continue  # already renewed this clock hour — a repeat is a no-op
             seen.add(rid)
             candidates.append((res, p))
 
@@ -1466,6 +1474,9 @@ async def _run_renewal_sweep(
             renewed = result.reservation
             async with state.reservation_lock:
                 state.reservations = apply_push_to_active(state.reservations, [renewed])
+            # Arm the once-per-clock-hour guard whether or not the end advanced:
+            # a repeat renew this hour would just no-op app-side, so don't re-ask.
+            state.renewal_last_hour[res.id] = this_hour
             new_end = slot_end(renewed)
             if new_end <= old_end:
                 # Idempotent no-op (lease already covered the target) — nothing

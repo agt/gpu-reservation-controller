@@ -284,6 +284,17 @@ class ControllerState:
         # unaffected).
         self.renewal_denied_ids: set[int] = set()
 
+        # On-demand leases already renewed in the current clock hour: lease id →
+        # the floored UTC clock-hour of the last successful renewal.  The app's
+        # renew is idempotent within a clock hour (target = ceil_to_hour(now)+1h)
+        # and every grant pushes the end at least to the next hour boundary, so a
+        # lease never legitimately needs renewing twice in one clock hour.  This
+        # caps re-renewal at once per lease per clock hour, so a large
+        # LEASE_RENEWAL_LEAD_MINUTES (>= the app's ~1 h minimum extension) can't
+        # make a just-renewed lease re-trigger on every sweep.  Pruned each
+        # renewal sweep against the current active on-demand-lease set.
+        self.renewal_last_hour: dict[int, datetime] = {}
+
         # Preemption sweep bookkeeping: for each upcoming slot boundary,
         # which phase(s) ("A" = lead-time, "B" = at-boundary) have already
         # been evaluated.  Prevents a flapping snapshot from re-planning (and
