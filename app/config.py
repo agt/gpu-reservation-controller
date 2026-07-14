@@ -27,6 +27,9 @@ class Config:
     required_group_label: Optional[str] = None  # pod label naming the usage group to match; None = disabled
     ondemand_horizon_minutes: int = 30    # JIT trigger: reserved-match horizon before requesting a lease
     ondemand_lease_buffer_minutes: int = 10  # added to a pod's minimum-runtime when sizing a JIT lease
+    lease_renewal_enabled: bool = True     # renew on-demand leases nearing expiry (chaining)
+    lease_renewal_lead_minutes: int = 15   # renew a lease whose guarantee ends within this window of now
+    lease_renewal_check_interval: int = 60  # seconds between renewal sweeps
     log_level: str = "INFO"        # root log level (LOG_LEVEL)
 
     @classmethod
@@ -89,6 +92,16 @@ class Config:
             ),
             ondemand_lease_buffer_minutes=int(
                 os.environ.get("ONDEMAND_LEASE_BUFFER_MINUTES", "10")
+            ),
+            lease_renewal_enabled=os.environ.get(
+                "LEASE_RENEWAL_ENABLED", "true"
+            ).lower()
+            not in ("false", "0", "no"),
+            lease_renewal_lead_minutes=int(
+                os.environ.get("LEASE_RENEWAL_LEAD_MINUTES", "15")
+            ),
+            lease_renewal_check_interval=int(
+                os.environ.get("LEASE_RENEWAL_CHECK_INTERVAL", "60")
             ),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
         )

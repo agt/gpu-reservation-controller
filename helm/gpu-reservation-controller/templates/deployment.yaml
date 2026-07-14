@@ -83,6 +83,12 @@ spec:
               value: {{ .Values.config.preemptionCheckInterval | quote }}
             - name: POD_ADOPTION_ENABLED
               value: {{ .Values.config.podAdoptionEnabled | quote }}
+            - name: LEASE_RENEWAL_ENABLED
+              value: {{ .Values.config.leaseRenewalEnabled | quote }}
+            - name: LEASE_RENEWAL_LEAD_MINUTES
+              value: {{ .Values.config.leaseRenewalLeadMinutes | quote }}
+            - name: LEASE_RENEWAL_CHECK_INTERVAL
+              value: {{ .Values.config.leaseRenewalCheckInterval | quote }}
             {{- if .Values.inboundApiTokenSecret.name }}
             # Enables the inbound reservation-push API (POST /api/reservations/push).
             # Omit the secret to leave the endpoint disabled (returns 503).

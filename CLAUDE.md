@@ -31,7 +31,7 @@ to displace overstayers via the same boundary preemption as any other booking
 | Choice | Rationale |
 |--------|-----------|
 | **FastAPI** | Provides the `GET /health` liveness endpoint, the `POST /api/reservations/push` inbound API, and clean lifespan management for background tasks; no routers or static files needed |
-| **asyncio** | Single event loop drives all four background loops concurrently without threads for the application logic |
+| **asyncio** | Single event loop drives all five background loops concurrently without threads for the application logic |
 | **httpx** | Async HTTP client for the reservation management API; supports connection pooling and clean timeout handling |
 | **kubernetes** (official Python client) | LIST + WATCH pod streams; strategic-merge-patch for toleration injection; supports both in-cluster and kubeconfig auth |
 | **Pydantic v2** | Validates and deserialises reservation API responses into typed models |
@@ -46,7 +46,7 @@ to displace overstayers via the same boundary preemption as any other booking
 ```
 app/
 ├── __init__.py
-├── main.py               Entry point — FastAPI app, lifespan, four background tasks
+├── main.py               Entry point — FastAPI app, lifespan, five background tasks
 ├── config.py             Config dataclass populated from environment variables
 ├── schemas.py            Pydantic models mirroring RESERVATION-API.md §6
 ├── reservation_client.py httpx async client — fetches reservations + GPU classes; creates/cancels JIT on-demand reservations
@@ -62,6 +62,7 @@ app/
 | `pod_watch_loop` | continuous (LIST + WATCH) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods; **fast-path**: applies toleration immediately when a new pod arrives inside an open window |
 | `queue_processor_loop` | every `POD_LIST_TICK_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
 | `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee, only when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**) |
+| `renewal_loop` | every `LEASE_RENEWAL_CHECK_INTERVAL` s (default 60) | Renews (chains) on-demand leases as they near the end of their guaranteed block, so a running job keeps its GPUs when capacity exists — or is warned to checkpoint when it doesn't (see **Renewing on-demand leases**) |
 
 ---
 
@@ -369,6 +370,53 @@ sites share `_try_request_lease`.
 existing pod-patch path); `ONDEMAND_HORIZON_MINUTES` and
 `ONDEMAND_LEASE_BUFFER_MINUTES` tune the routing horizon and lease sizing.
 
+### Renewing on-demand leases
+
+An on-demand lease is a fixed-length reservation; without intervention its pod
+would simply run out its window and become a preemption/expiry victim.  The
+`renewal_loop` (`_run_renewal_sweep` in `main.py`) is the controller's owner of
+the "~15-min-ahead trigger" the app expects: it **renews (chains)** a lease in
+place as it nears the end of its guaranteed block, so a still-running job keeps
+its GPUs when capacity exists, or gets advance warning to checkpoint when it
+doesn't.  Gated by `LEASE_RENEWAL_ENABLED` (default on).
+
+Every `LEASE_RENEWAL_CHECK_INTERVAL` s (default 60) the sweep:
+
+1. Snapshots tolerated pods (`snapshot_tolerated_pods`); a snapshot failure
+   skips the whole sweep (never act on unknown state, mirroring the preemption
+   sweep).
+2. Under `reservation_lock`, prunes `ControllerState.renewal_denied_ids` to the
+   current active on-demand-lease set, then selects candidates: each **live**
+   (`Running`/`Pending`, not terminating) pod whose `reservation_id` resolves to
+   an **active `kind == "on_demand"` lease** ending within
+   `LEASE_RENEWAL_LEAD_MINUTES` (default 15) of now — i.e.
+   `now < slot_end(res) <= now + lead` — and not already marked denied.  An
+   on-demand lease's guarantee **is** its own `end_utc` (chaining only spans
+   `kind == "booking"` windows), so `slot_end` is the near-expiry signal.
+3. For each candidate, calls `client.renew_reservation(id)`
+   (`POST /api/reservations/{id}/renew`) **outside** the lock (like
+   `_try_request_lease`) and dispatches on the typed `RenewalOutcome`:
+   - **RENEWED** (200) — merges the extended row via `apply_push_to_active`
+     (the guarantee grows with the new `end_utc`); when the end actually
+     advanced (not an idempotent no-op) it re-records the guarantee on the pod
+     and emits a `LeaseRenewed` event.  The lease keeps its id, so pod matching,
+     booking-reference, and occupancy are unchanged.
+   - **DENIED** (409) — capacity/budget unavailable: marks the id in
+     `renewal_denied_ids` and emits a `RenewalDenied` event **once** (the
+     documented "let the job checkpoint" cue); it is not re-attempted before its
+     window ends.
+   - **NOT_RENEWABLE** (400/404) — the lease ended/cancelled/isn't on-demand:
+     dropped (any stale denied-mark discarded).
+   - **ERROR** (network / other non-2xx) — transient: left un-marked so the next
+     sweep retries.
+
+Because the app computes the renewal window from **its own** `now`
+(`ceil_to_hour(now) + 1h`), a renewal is idempotent within a clock hour and a
+granted extension pushes `end_utc` 1–2 h out — so the 15-min lead naturally
+prevents re-renewal until the lease again nears expiry.  **RBAC**: unchanged
+(the renew call is outbound HTTP; re-annotation reuses the existing pod-patch
+path).
+
 ### Inbound push API
 
 `POST /api/reservations/push` lets the reservation app push **one or more
@@ -477,6 +525,9 @@ the claimed set and the grace re-arm path above applies.
 | `PREEMPTION_LEAD_MINUTES` | `15` | Minutes before a reservation slot boundary that phase-A preemption runs |
 | `PREEMPTION_CHECK_INTERVAL` | `60` | Seconds between preemption sweeps |
 | `POD_ADOPTION_ENABLED` | `true` | Re-link an overstay pod to a reservation its user has since booked (see **Adopting overstay pods into a re-booked reservation**); `false` disables |
+| `LEASE_RENEWAL_ENABLED` | `true` | Renew (chain) on-demand leases as they near expiry (see **Renewing on-demand leases**); set to `false`/`0`/`no` to disable |
+| `LEASE_RENEWAL_LEAD_MINUTES` | `15` | Renew a lease whose guaranteed block ends within this many minutes of now |
+| `LEASE_RENEWAL_CHECK_INTERVAL` | `60` | Seconds between lease-renewal sweeps |
 | `LOG_LEVEL` | `INFO` | Root Python logging level (parsed by `config.py`) |
 
 ---

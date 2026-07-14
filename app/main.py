@@ -1,12 +1,14 @@
 """GPU Reservation Kubernetes Controller — entry point.
 
-Starts four background asyncio tasks inside a FastAPI lifespan:
+Starts five background asyncio tasks inside a FastAPI lifespan:
 
 1. reservation_fetch_loop  — periodically refreshes the reservation list
 2. pod_watch_loop          — streams pod events and updates the work queue
 3. queue_processor_loop    — applies tolerations when reservation windows open
 4. preemption_loop         — recovers capacity from overstaying pods near a
                               reservation boundary (demand-driven preemption)
+5. renewal_loop            — renews on-demand leases (chaining) as they near the
+                              end of their guaranteed block
 
 Additionally, when a pod is detected arriving *inside* an already-open
 reservation window (e.g. a JupyterHub notebook pod), the pod-watch loop
@@ -49,8 +51,10 @@ from .k8s_client import (
     annotate_runtime_guarantee,
     apply_toleration,
     delete_pod,
+    emit_lease_renewed_event,
     emit_overstay_relinked_event,
     emit_preempted_event,
+    emit_renewal_denied_event,
     emit_reservation_cancelled_event,
     emit_reservation_reassigned_event,
     emit_runtime_guaranteed_event,
@@ -71,7 +75,7 @@ from .k8s_client import (
     snapshot_node_gpu_capacity,
     snapshot_tolerated_pods,
 )
-from .reservation_client import ReservationClient
+from .reservation_client import RenewalOutcome, ReservationClient
 from .schemas import (
     OnDemandReservationRequest,
     ReservationPushRequest,
@@ -1386,6 +1390,169 @@ async def preemption_loop(state: ControllerState, config: Config) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Background loop 5: on-demand lease renewal (chaining)
+# ---------------------------------------------------------------------------
+
+
+async def _run_renewal_sweep(
+    state: ControllerState,
+    client: ReservationClient,
+    config: Config,
+    now: Optional[datetime] = None,
+) -> None:
+    """Renew on-demand leases whose guaranteed block is about to end.
+
+    The controller owns the ~lead-minute-ahead trigger: for every live pod
+    admitted under an on-demand lease (``kind == "on_demand"``) whose window
+    ends within ``LEASE_RENEWAL_LEAD_MINUTES`` of *now*, request an in-place
+    extension (``POST /api/reservations/{id}/renew``).  A grant chains the lease
+    forward (1–2 h of hour-aligned runway) and the guarantee grows with it; a
+    denial (409) is the user's cue to checkpoint before the lease ends.
+
+    The pod snapshot is taken outside the lock; a snapshot failure skips the
+    whole sweep (never act on unknown state, mirroring the preemption sweep).
+    Candidate selection reads reservation state under ``reservation_lock``, but
+    each ``renew`` HTTP call runs outside it (like ``_try_request_lease``); the
+    result is merged back under the lock.
+    """
+    if not config.lease_renewal_enabled:
+        return
+    now = now or datetime.now(timezone.utc)
+    lead = timedelta(minutes=config.lease_renewal_lead_minutes)
+
+    try:
+        snapshot = await snapshot_tolerated_pods(
+            TOLERATION_KEY, config.required_group_label
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Renewal sweep: failed to snapshot pods: %s", exc, exc_info=True)
+        return
+
+    # (reservation, pod_info) for each on-demand lease near expiry with a live pod.
+    candidates: list[tuple[ReservationResponse, object]] = []
+    async with state.reservation_lock:
+        by_id = {r.id: r for r in state.reservations}
+        # Prune denied-marks for ids no longer active on-demand leases, so a
+        # reused id (or a lease that has since left the set) is not suppressed.
+        active_lease_ids = {
+            r.id for r in state.reservations
+            if r.kind == "on_demand" and r.status == "active"
+        }
+        state.renewal_denied_ids &= active_lease_ids
+
+        seen: set[int] = set()
+        for p in snapshot:
+            rid = p.reservation_id
+            if rid is None or rid in seen:
+                continue
+            if p.phase not in ("Running", "Pending") or p.deletion_timestamp is not None:
+                continue
+            res = by_id.get(rid)
+            if res is None or res.kind != "on_demand" or res.status != "active":
+                continue
+            end = slot_end(res)
+            if not (now < end <= now + lead):
+                continue  # already expired, or not near enough to renew yet
+            if rid in state.renewal_denied_ids:
+                continue  # already warned; let the job checkpoint
+            seen.add(rid)
+            candidates.append((res, p))
+
+    for res, pod_info in candidates:
+        old_end = slot_end(res)
+        result = await client.renew_reservation(res.id)
+
+        if result.outcome is RenewalOutcome.RENEWED and result.reservation is not None:
+            renewed = result.reservation
+            async with state.reservation_lock:
+                state.reservations = apply_push_to_active(state.reservations, [renewed])
+            new_end = slot_end(renewed)
+            if new_end <= old_end:
+                # Idempotent no-op (lease already covered the target) — nothing
+                # user-visible changed, so skip the re-annotation and event.
+                log.debug(
+                    "On-demand lease #%d renewal was a no-op (end unchanged at %s)",
+                    res.id,
+                    new_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
+                continue
+            log.info(
+                "On-demand lease #%d renewed for pod %s/%s: end %s -> %s",
+                res.id,
+                pod_info.namespace,
+                pod_info.name,
+                old_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                new_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
+            # Re-record the (now later) guarantee on the pod and announce it.
+            # Best-effort: the annotation is informational and nothing reads it
+            # back for a decision, so a failure here never rolls back the renewal.
+            try:
+                fresh_pod = await read_pod(pod_info.name, pod_info.namespace)
+                guaranteed_until = state.compute_guaranteed_until(now, renewed)
+                await _record_guarantee(
+                    pod_info.name, pod_info.namespace, fresh_pod, guaranteed_until, now
+                )
+                await emit_lease_renewed_event(
+                    fresh_pod, pod_info.name, pod_info.namespace, res.id, guaranteed_until
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Could not re-record guarantee / emit LeaseRenewed for pod %s/%s: %s",
+                    pod_info.namespace,
+                    pod_info.name,
+                    exc,
+                )
+
+        elif result.outcome is RenewalOutcome.DENIED:
+            # Warn once, then stop (the documented contract): mark the lease so
+            # later sweeps skip it, and tell the user to checkpoint.
+            state.renewal_denied_ids.add(res.id)
+            log.warning(
+                "On-demand lease #%d could not be renewed for pod %s/%s "
+                "(no capacity/budget); lease ends %s — job should checkpoint",
+                res.id,
+                pod_info.namespace,
+                pod_info.name,
+                old_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
+            try:
+                fresh_pod = await read_pod(pod_info.name, pod_info.namespace)
+                await emit_renewal_denied_event(
+                    fresh_pod, pod_info.name, pod_info.namespace, res.id, old_end
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Could not emit RenewalDenied event for pod %s/%s: %s",
+                    pod_info.namespace,
+                    pod_info.name,
+                    exc,
+                )
+
+        elif result.outcome is RenewalOutcome.NOT_RENEWABLE:
+            # Lease ended / cancelled / not on-demand — nothing to do; drop any
+            # stale denied-mark so a future lease reusing the id is unaffected.
+            state.renewal_denied_ids.discard(res.id)
+            log.debug(
+                "On-demand lease #%d not renewable; skipping", res.id
+            )
+        # RenewalOutcome.ERROR: transient — leave it un-marked so the next sweep
+        # retries; the client already logged the failure.
+
+
+async def renewal_loop(
+    state: ControllerState, client: ReservationClient, config: Config
+) -> None:
+    """Every ``config.lease_renewal_check_interval`` s, run a lease-renewal sweep."""
+    while True:
+        await asyncio.sleep(config.lease_renewal_check_interval)
+        try:
+            await _run_renewal_sweep(state, client, config)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Renewal sweep failed: %s", exc, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 
@@ -1437,7 +1604,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             config.reservation_fetch_interval,
         )
 
-    # Launch the four background loops as asyncio tasks.
+    # Launch the five background loops as asyncio tasks.
     tasks = [
         asyncio.create_task(
             reservation_fetch_loop(state, client, config),
@@ -1448,6 +1615,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             queue_processor_loop(state, client, config), name="queue-processor"
         ),
         asyncio.create_task(preemption_loop(state, config), name="preemption"),
+        asyncio.create_task(
+            renewal_loop(state, client, config), name="lease-renewal"
+        ),
     ]
     log.info("GPU reservation controller started")
 

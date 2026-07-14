@@ -274,6 +274,16 @@ class ControllerState:
         # Recomputed from the live pod snapshot each queue-processor tick.
         self.claimed_reservation_ids: set[int] = set()
 
+        # On-demand leases already warned as un-renewable this window (the
+        # renewal sweep got a 409 "no capacity/budget").  Per the app contract a
+        # 409 is the cue to let the job checkpoint, so a denied lease is not
+        # re-attempted before its window ends; the id is emitted a RenewalDenied
+        # event exactly once.  Pruned each renewal sweep against the current
+        # active on-demand-lease set (an id that left the active list, or was
+        # successfully renewed, is dropped so a future lease reusing the id is
+        # unaffected).
+        self.renewal_denied_ids: set[int] = set()
+
         # Preemption sweep bookkeeping: for each upcoming slot boundary,
         # which phase(s) ("A" = lead-time, "B" = at-boundary) have already
         # been evaluated.  Prevents a flapping snapshot from re-planning (and
