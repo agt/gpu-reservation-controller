@@ -3,15 +3,8 @@
 This document covers every endpoint needed to build two external daemons:
 
 - **Kubernetes controller** — reads active reservations and manages pod
-  scheduling by injecting GPU-reservation tolerations and recording each
-  admitted pod's runtime guarantee (informational annotations only — no
-  `activeDeadlineSeconds` is set).  Capacity is recovered from overstaying
-  pods on demand, only when an incoming reservation needs it (see the
-  controller's README for the demand-driven preemption model).  A pod with no
-  reservation open now or opening soon gets one just-in-time: the controller
-  requests a short on-demand booking on the pod's behalf
-  (`POST /api/reservations`) rather than being placed onto ad-hoc spare
-  capacity, so on-demand jobs are ordinary reservations start to finish.
+  scheduling by injecting GPU-reservation tolerations and enforcing runtime
+  caps (`activeDeadlineSeconds`) on admitted pods.
 - **Roster sync daemon** — provisions user accounts and manages usage-group
   membership from an institutional directory.
 
@@ -206,6 +199,11 @@ python manage_service_keys.py revoke --id 3
 
 The controller polls for active reservations, computes the time window for
 each slot, and creates or deletes Kubernetes resource objects accordingly.
+When pending **on-demand** pods need capacity, the controller also *requests*
+a reservation from the app (an on-demand lease — see
+§"Creating on-demand reservations") using a `read_write` service key; the app
+judges feasibility with the same capacity/borrowing/budget analysis it applies
+to a user's web booking.
 
 ### `GET /api/reservations`
 
@@ -224,6 +222,7 @@ all reservations across all users and groups.
 | `user_id` | integer | — | Filter by user ID |
 | `username` | string | — | Filter by username (exact match) |
 | `group_id` | integer | — | Filter by usage group ID |
+| `include_teammates` | boolean | `false` | Non-privileged callers only: switch to the personal *"me + my team"* scope — own reservations **plus** teammates' reservations in team-enabled groups (Team Mode). Replaces the default own+managed scope. Ignored for admins/auditors/service keys (they already see all). |
 | `created_after` | datetime | — | Include reservations created at or after this time |
 | `created_before` | datetime | — | Include reservations created at or before this time |
 | `limit` | integer | 200 | Max records (1–1000) |
@@ -254,7 +253,9 @@ X-API-Key: gpures_...
     "start_utc": "2026-09-01T15:00:00Z",
     "end_utc": "2026-09-01T23:00:00Z",
     "gpu_count": 4,
-    "su_cost": 32,
+    "su_cost_user": 32,
+    "su_cost_group": 32,
+    "su_cost_original": 32,
     "kind": "booking",
     "status": "active",
     "notes": null,
@@ -264,26 +265,142 @@ X-API-Key: gpures_...
     "updated_at": "2026-08-20T10:15:00Z",
     "cancelled_at": null,
     "cancelled_by_id": null,
-    "cancelled_by": null
+    "cancel_reason": null
   }
 ]
 ```
 
 `start_dt` / `end_dt` are the booking's site-local wall-clock interval (naive, no
-timezone). A reservation is an arbitrary whole-hour range that **may cross midnight**
-(`end_dt` on the next calendar day). Non-privileged members are limited to 48 hours;
-admins and group managers have no server-side cap. `date` mirrors `start_dt`'s date
-and is provided for convenience filtering. `su_cost` is the total Service Units the
-booking consumes, computed at creation from the GPU class base rate
-(`su_rate_per_hour`) and the active discount schedules.
+timezone). A user-scheduled reservation (`kind: "booking"`) is a whole-hour range
+that **may cross midnight** (`end_dt` on the next calendar day); non-privileged
+members are limited to 48 hours, while admins and group managers have no
+server-side cap. An on-demand lease (`kind: "on_demand"`) starts and ends on
+**arbitrary second-granularity timestamps** — clients must not assume the hourly
+grid. `date` mirrors `start_dt`'s date
+and is provided for convenience filtering. `su_cost_user` is the Service Units
+charged to the individual user for this booking; `su_cost_group` is the SU charged
+against the group's shared pool budget.  Both are computed from the GPU class base
+rate (`su_rate_per_hour`) and the active discount schedules and stored at creation
+time.  They differ only when a group manager (but not an admin) waives a
+cancellation penalty: in that case `su_cost_user` is zeroed while `su_cost_group`
+retains the penalty amount.  `su_cost_original` records the SU charged at creation
+time and is never altered by later adjustments (cancellation-penalty rewrites or
+waives), so it always reflects the booking's original full cost.
 
 ### Reservation kinds
 
-Every reservation has a `kind` field, currently always `"booking"` — a normal
-reservation, whether booked directly by a user or requested just-in-time by
-the Kubernetes controller on a pending pod's behalf (`on_demand=True`, see
-below).  There is no separate ad-hoc capacity-hold type; the controller does
-not need to special-case `kind` at all.
+Every reservation has a `kind` field:
+
+| `kind` | Created by | Time grid | Attribution |
+|--------|-----------|-----------|-------------|
+| `"booking"` | A user through the web UI (or an admin/manager on a user's behalf) | Whole hours | `user_id` + `group_id` always set |
+| `"on_demand"` | The Kubernetes controller via §"Creating on-demand reservations" | Arbitrary timestamps, anchored at creation time | `user_id` + `group_id` always set |
+
+Both kinds are returned by `GET /api/reservations` under every `status` filter —
+there is no kind-based filtering. (Historical note: a third kind, `"reclaim"`,
+existed before the lease model; those rows carried no user/group and are deleted
+by migration, but `user_id`/`group_id` remain nullable in the schema for
+pre-migration data.)
+
+### Creating on-demand reservations
+
+```
+POST /api/reservations
+X-API-Key: gpures_...            (read_write scope required)
+```
+
+When the controller detects pending on-demand pods, it requests a lease. The
+body is distinguished from a user booking by `on_demand: true`:
+
+```json
+{
+  "on_demand": true,
+  "username": "jsmith",
+  "group_name": "CS151B-FA26",
+  "gpu_class_id": 1,
+  "gpu_count": 2,
+  "duration_seconds": 4200,
+  "idempotency_key": "8f14e45f-ceea-4e07-8c2f-pod-uid",
+  "notes": "on-demand lease for pod train-7c9"
+}
+```
+
+Semantics:
+
+- **The app anchors `start_dt` at its own "now"** (avoiding controller/app clock
+  skew) and sets `end_dt = start + duration_seconds`. The controller typically
+  sends `duration_seconds = min_runtime_seconds + buffer`. Bounds: 60 s ≤
+  `duration_seconds` ≤ 604 800 (7 days).
+- `username` / `group_name` are natural keys. The user must be an **active
+  member** of the named active group, and the GPU class must be attached to that
+  group (or `attach_all_groups`). Users supply the group via a pod annotation
+  and are responsible for matching the usage-group name exactly.
+- **Feasibility is the same analysis as a web booking**: the three capacity
+  tiers (physical / cohort / group, including borrowing when the group's
+  resolved relaxation flag is on, clamped by the class's `relax_min_available`
+  buffer), the per-member/team SU budget and group SU pool (skipped when the
+  user is an admin or a manager of the group — as if they booked themselves),
+  `max_gpus_per_reservation`, and the group's validity dates (±90-day grace for
+  those privileged users).
+- **Timing policy does not apply**: no 15-minute lead requirement, no whole-hour
+  alignment, no 48-hour cap, no `min/max_days_ahead` window.
+- The lease is charged Service Units exactly like a booking (`su_cost_user` /
+  `su_cost_group` stored at creation).
+- No confirmation email is sent and nothing is pushed to the controller — the
+  caller receives the reservation synchronously.
+
+**Responses**
+
+| Code | Condition |
+|------|-----------|
+| 201 | Lease created — full [ReservationResponse](#reservationresponse), `kind: "on_demand"` |
+| 200 | `idempotency_key` matched an existing reservation — that original reservation is returned unchanged (idempotent retry) |
+| 403 | Missing/`read_only` key, or a human JWT sent `on_demand: true` |
+| 404 | Unknown `username` / `group_name` / `gpu_class_id` (or inactive) |
+| 409 | Denied — insufficient capacity **or** a policy gate (membership, class access, SU budget, GPU cap, validity dates). Human-readable JSON `detail` explains which |
+| 422 | Malformed body (e.g. `duration_seconds` out of bounds) |
+
+Send a fresh `idempotency_key` per lease attempt (e.g. derived from the pod
+UID); replaying the same key returns the original reservation even after it was
+cancelled. A `409` means "not feasible right now" — the controller may retry
+later as demand/capacity changes.
+
+### `POST /api/reservations/{id}/cancel`
+
+Cancel a reservation on the controller's behalf, recording a machine-readable
+reason. Requires a `read_write` service key (or an admin JWT).
+
+```json
+{ "reason": "no-show" }
+```
+
+| `reason` | Meaning |
+|----------|---------|
+| `"no-show"` | The reservation holder never ran pods (applies to leases and to already-started bookings) |
+| `"controller-revoked"` | The controller released the lease (job finished early, controller shutdown, …) |
+
+Scope:
+
+- a `kind: "on_demand"` lease may be cancelled at any time;
+- a `kind: "booking"` row may be cancelled only once it has **started**
+  (`start_dt <= now`) — the controller's no-show path for a user who reserved
+  capacity but never used it. A not-yet-started booking returns 403 (users and
+  admins cancel those via `DELETE /api/reservations/{id}`).
+
+The retained SU charge is the standard, unwaived late-cancellation charge —
+identical to the member cancelling at that instant (time already consumed in
+full, plus the fraction-of-cost penalty on the unused remainder inside the next
+24 h; short remainders are forgiven by the exemption). The reason is stored in
+`cancel_reason` and appears in all reservation responses.
+
+**Responses**
+
+| Code | Condition |
+|------|-----------|
+| 200 | Cancelled — the updated [ReservationResponse](#reservationresponse). **Idempotent**: cancelling an already-cancelled reservation returns 200 with its current state and changes nothing |
+| 403 | Read-only key / non-admin JWT, or a not-yet-started `booking` |
+| 404 | Reservation not found |
+| 422 | Unknown `reason` |
 
 ### Reading the reservation time window
 
@@ -297,12 +414,11 @@ Every `ReservationResponse` includes pre-computed UTC timestamps:
 Use these directly — no timezone knowledge required:
 
 ```python
-# Python example — compute a pod's runtime guarantee for the k8s controller
-# (informational only; no activeDeadlineSeconds is set on the pod)
+# Python example — compute activeDeadlineSeconds for the k8s controller
 from datetime import datetime, timezone
 
 end = datetime.strptime(reservation["end_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-guaranteed_seconds = max(1, int((end - datetime.now(timezone.utc)).total_seconds()))
+active_deadline_seconds = max(0, int((end - datetime.now(timezone.utc)).total_seconds()))
 ```
 
 **How they are computed.** The server converts the stored local-time `start_dt` /
@@ -343,10 +459,10 @@ either service-key scope.
   "name": "H100",
   "description": "NVIDIA H100 80 GB SXM5",
   "total_gpus": 8,
-  "management_buffer": 1,
   "label_value": "h100",
   "su_rate_per_hour": 4,
   "max_gpus_per_reservation": 2,
+  "relax_min_available": null,
   "attach_all_groups": false,
   "is_active": true,
   "created_at": "2026-01-15T09:00:00Z"
@@ -355,10 +471,11 @@ either service-key scope.
 
 `su_rate_per_hour` is the base Service Units charged per GPU per hour (before
 discount-schedule multipliers). `max_gpus_per_reservation` caps a single booking's
-GPU count (`null` = no cap).
+GPU count (`null` = no cap). `relax_min_available` is an admission-control
+buffer for borrowing (limit relaxation; `null` = no buffer); it does not affect the
+controller and can be ignored by API clients.
 `attach_all_groups` makes the class bookable by every group without an explicit
-attachment. `management_buffer` is the number of GPUs within `total_gpus`
-reserved for admin/manager use and invisible to regular members.
+attachment.
 
 `label_value` is `null` when the class has no Kubernetes mapping; the
 controller skips reservations for such classes.
@@ -373,54 +490,16 @@ controller skips reservations for such classes.
 All gpu-class **write** endpoints (`POST`/`PUT`/`DELETE` and the
 `/overrides` sub-resource) require an admin JWT.
 
-### `POST /api/reservations`
+### `GET /api/settings`
 
-Create an on-demand booking on behalf of a user — the just-in-time (JIT)
-counterpart to a normal front-end booking. The Kubernetes controller calls
-this for a pending pod that has no reservation open now or opening soon,
-sized to just outlast the pod's declared minimum runtime.
-
-**Body**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `username` | string | Owner of the new booking (the pod's namespace) |
-| `group_name` | string \| null | Usage group name (from the pod's usage-group label, when the controller has `REQUIRED_GROUP_LABEL` configured); `null` when the deployment has no group constraint |
-| `gpu_class_id` | integer | Target GPU class |
-| `gpu_count` | integer | GPUs requested |
-| `duration_seconds` | integer | Booking length; the controller sends the pod's declared minimum runtime plus a fixed buffer |
-| `on_demand` | boolean | Always `true` for this endpoint; relaxes **policy** limits (SU balance, per-user/group caps, minimum-duration floor) — it never relaxes physical calendar capacity. A request that cannot fit the actual schedule is denied like any other booking. |
-| `idempotency_key` | string | The admitting pod's Kubernetes UID. A repeated request with the same key returns the **original** reservation rather than creating a duplicate — safe for the controller to retry after a network error without double-booking. |
-
-The server anchors `start_utc` at its own current time (avoiding controller/app
-clock skew) and computes `end_utc = start_utc + duration_seconds`.
-
-**Response** `201` — the created [ReservationResponse](#reservationresponse)
-(`kind: "booking"`, `status: "active"`).
-
-**Errors**
-
-| Code | Condition |
-|------|-----------|
-| 409 | No physical capacity for the requested window, or a policy limit `on_demand` does not relax (e.g. GPU class inactive) blocks it. Body carries a JSON `detail` describing the reason. |
-
-### `POST /api/reservations/{id}/cancel`
-
-Cancel a reservation, recording why. Used by the controller for two distinct
-outcomes:
-
-| `reason` | Meaning |
-|----------|---------|
-| `"no-show"` | The reservation's holder never appeared before the no-show deadline; recorded for no-show-penalty accounting per the institution's policy. |
-| `"controller-revoked"` | A JIT on-demand booking was granted but the pod could not actually be admitted (a transient Kubernetes error, or the pod finished/vanished first); the controller compensates by cancelling the lease it just requested. |
-
-**Path parameter:** `id` — integer (`reservation.id`)
-
-**Body:** `{"reason": "no-show" | "controller-revoked"}`
-
-**Response** `200` — idempotent: cancelling an already-cancelled reservation
-also returns `200` (no error on a retried or racing cancel). `404` if the id
-does not exist.
+Public (no authentication required). The response carries UI-oriented fields
+(site title, announcement content, the borrowing default `relax_limits`, …) and
+`controller_push_enabled` (whether the app is configured to push reservation
+changes to the controller in real time). Nothing in it is required by the
+controller: every reservation it needs arrives via `GET /api/reservations` and
+the on-demand endpoints above. (The pre-lease-model `reclaim_window_minutes` /
+`reclaim_preempt_guard_minutes` fields are gone along with the reclaim
+subsystem.)
 
 ---
 
@@ -451,9 +530,10 @@ Create a new user account.
 | `username` | string | yes | 3–64 chars, unique | Login name |
 | `email` | string | yes | unique | Email address |
 | `password` | string | only for local accounts | min 8 chars | Initial password (Argon2id-hashed). Required when `auth_provider` is `"local"`; **must be omitted** for any other provider. |
-| `is_admin` | boolean | no | default `false` | Administrator flag. **Service keys may not set this** — a key sending `is_admin: true` receives 403. |
-| `auth_provider` | string | no | default `"local"` | `"local"` or an OAuth provider name (`"jupyterhub"`, `"google"`, `"oidc"`). Set the matching provider name when pre-provisioning accounts that will log in via OAuth. |
-| `external_id` | string | no | unique | External identity for the provider (JupyterHub username, Google email, or OIDC subject). Set it for non-local accounts so the OAuth callback matches the pre-created row. |
+| `role` | string | no | `"admin"` \| `"auditor"` \| `"user"`; default `"user"` | App-wide privilege tier: `admin` = full read/write, `auditor` = read-only access to all admin surfaces, `user` = ordinary account. **Service keys may set only `"user"`** — a key requesting `admin` or `auditor` receives 403. |
+| `is_admin` | boolean | no | default `false` | **Deprecated alias** for `role` (maps `true`→`admin`, `false`→`user`). Honoured only when `role` is omitted; prefer `role`. Same service-key restriction applies. |
+| `auth_provider` | string | no | default `"local"` | `"local"`, an OAuth provider name (`"jupyterhub"`, `"google"`, `"oidc"`), or `"saml"`. Set the matching provider name when pre-provisioning accounts that will log in via SSO. |
+| `external_id` | string | no | unique | External identity for the provider (JupyterHub username, Google email, OIDC subject, or domain-stripped SAML NameID). Set it for non-local accounts so the SSO callback matches the pre-created row. |
 
 **Response** `201` — [UserResponse](#userresponse)
 
@@ -464,7 +544,7 @@ Create a new user account.
 | 400 | `username` already exists |
 | 400 | `email` already registered |
 | 400 | `external_id` already registered |
-| 403 | Service key attempted to create an admin user |
+| 403 | Service key attempted to create a privileged user (`role` other than `"user"`) |
 
 **Sync pattern:** query `GET /api/users` first and index by `username` or
 `email` to avoid duplicate-creation errors.
@@ -484,12 +564,13 @@ fields are left unchanged.
 |-------|------|-------------|
 | `email` | string | New email address (must be unique) |
 | `password` | string (min 8 chars) | New password. **Human callers only** — a service key sending this field receives 403. |
-| `is_admin` | boolean | Grant or revoke admin flag. **Admin JWT only** — a service key sending this field receives 403. |
+| `role` | string | Set the privilege tier (`"admin"` \| `"auditor"` \| `"user"`). **Admin JWT only** — a service key sending this field receives 403. |
+| `is_admin` | boolean | **Deprecated alias** for `role` (maps `true`→`admin`, `false`→`user`); applied only when `role` is omitted. **Admin JWT only.** |
 | `is_active` | boolean | Reactivate (`true`) or deactivate (`false`) a user |
 
 For a service-key caller (the roster-sync case) the usable fields are
 therefore `email` and `is_active` — a leaked key must not be able to take
-over an account by resetting its password or promoting it to admin.
+over an account by resetting its password or changing its role.
 
 **Response** `200` — [UserResponse](#userresponse)
 
@@ -499,7 +580,7 @@ over an account by resetting its password or promoting it to admin.
 |------|-----------|
 | 400 | New email already in use by another account |
 | 400 | Change would demote/deactivate the last active administrator |
-| 403 | Service key attempted to set `password` or `is_admin` |
+| 403 | Service key attempted to set `password`, `role`, or `is_admin` |
 | 404 | User not found |
 
 **Deactivation note:** prefer `DELETE /api/users/{user_id}` for departing
@@ -570,6 +651,13 @@ which returns [GroupMemberBrief](#groupmemberbrief) objects that include `role`.
 Add a user to a group, or update their role if they are already a member
 (idempotent upsert).
 
+**Authorization** (applies to `POST`, `PATCH`, and `DELETE` on `.../members`):
+an admin JWT or a `read_write` service key (the controller path) may curate any
+group. In the human UI, a **group manager** may also curate a group whose
+`provisioning_source` is `"manager"` (full parity — add/remove members and
+appoint/demote co-managers); other callers get `403`. These endpoints only
+attach existing accounts — they never create users.
+
 **Path parameter:** `group_id` — integer
 
 **Request body**
@@ -585,6 +673,7 @@ Add a user to a group, or update their role if they are already a member
 
 | Code | Condition |
 |------|-----------|
+| 403 | Caller may not curate this group's membership |
 | 404 | Group not found |
 | 404 | User not found |
 
@@ -617,7 +706,8 @@ currently a member (use `POST` to add-or-update instead).
 
 | Code | Condition |
 |------|-----------|
-| 404 | User is not a member of the group |
+| 403 | Caller may not curate this group's membership |
+| 404 | Group not found, or user is not a member of the group |
 
 ---
 
@@ -634,7 +724,8 @@ membership are not affected.
 
 | Code | Condition |
 |------|-----------|
-| 404 | Membership record not found (user was not in the group) |
+| 403 | Caller may not curate this group's membership |
+| 404 | Group not found, or membership record not found (user was not in the group) |
 
 ---
 
@@ -676,6 +767,7 @@ both new additions and role corrections without a separate `PATCH` call.
   "id":            7,
   "username":      "jsmith",
   "email":         "jsmith@example.edu",
+  "role":          "user",
   "is_admin":      false,
   "is_active":     true,
   "auth_provider": "local",
@@ -689,10 +781,11 @@ both new additions and role corrections without a separate `PATCH` call.
 | `id` | integer | Stable primary key; use this in membership calls |
 | `username` | string | 3–64 chars, unique, immutable after creation |
 | `email` | string | Unique |
-| `is_admin` | boolean | |
+| `role` | string | App-wide privilege tier: `"admin"`, `"auditor"` (read-only admin), or `"user"` |
+| `is_admin` | boolean | Derived from `role` (`true` iff `role == "admin"`); retained for backward compatibility |
 | `is_active` | boolean | `false` = soft-deleted |
-| `auth_provider` | string | `"local"` or an OAuth provider name (`"jupyterhub"`, `"google"`, `"oidc"`) |
-| `external_id` | string \| null | External identity (JupyterHub username / Google email / OIDC subject) for OAuth accounts |
+| `auth_provider` | string | `"local"`, an OAuth provider name (`"jupyterhub"`, `"google"`, `"oidc"`), or `"saml"` |
+| `external_id` | string \| null | External identity (JupyterHub username / Google email / OIDC subject / domain-stripped SAML NameID) for SSO accounts |
 | `created_at` | datetime | UTC |
 
 ---
@@ -710,7 +803,9 @@ both new additions and role corrections without a separate `PATCH` call.
   "max_days_ahead": 14,
   "su_budget": 200,
   "su_anchor_mode": "open",
+  "provisioning_source": "admin",
   "sync_with_sicad": false,
+  "sicad_course_id": null,
   "is_active": true,
   "created_at": "2026-06-01T10:00:00Z",
   "members": [
@@ -736,7 +831,9 @@ entry is a full GpuClassResponse.
 | `max_days_ahead` | integer \| null | Members cannot book more than N days out (ignored for admins and group managers) |
 | `su_budget` | number \| null | Per-member Service Unit budget: the sum of stored `su_cost` over a member's open reservations (within the window set by `su_anchor_mode`) may not exceed this (ignored for admins and group managers). `null` = unlimited |
 | `su_anchor_mode` | string | How far back the SU budget window reaches: `"open"` (only currently-open reservations; renewable ceiling), `"weekly"`, `"monthly"`, `"quarterly"`, or `"since_creation"` (cumulative, never resets). See SCHEDULING.md §5 for full semantics. |
-| `sync_with_sicad` | boolean | When `true`, the app's built-in SICAD roster sync keeps this group's membership in sync with the course roster (add-only) |
+| `provisioning_source` | string | Who may curate this group's membership: `"admin"` (administrators only; default), `"manager"` (the group's managers **and** admins), or `"sicad"` (the built-in SICAD roster sync **and** admins). Administrators may always curate regardless. Settable only by an admin via `POST`/`PUT /api/groups`. |
+| `sync_with_sicad` | boolean | Read-only derived flag (`provisioning_source == "sicad"`). When `true`, the app's built-in SICAD roster sync keeps this group's membership in sync with the course roster (add-only). Retained for backward compatibility; set `provisioning_source` to change it |
+| `sicad_course_id` | string \| null | Remote SICAD/AWSEd courseID backing the roster sync. `null` = fall back to `name`, letting the group name differ from the SICAD courseID. Only meaningful when `provisioning_source` is `"sicad"` |
 | `is_active` | boolean | Inactive groups cannot accept new reservations |
 | `created_at` | datetime | UTC |
 | `members` | array of [GroupMemberBrief](#groupmemberbrief) | |
@@ -783,7 +880,9 @@ Returned by `GET /api/groups/{group_id}/members`.
   "start_utc": "2026-09-01T15:00:00Z",
   "end_utc": "2026-09-01T23:00:00Z",
   "gpu_count": 4,
-  "su_cost": 32,
+  "su_cost_user": 32,
+  "su_cost_group": 32,
+  "su_cost_original": 32,
   "kind": "booking",
   "status": "active",
   "notes": null,
@@ -793,36 +892,38 @@ Returned by `GET /api/groups/{group_id}/members`.
   "updated_at": "2026-08-20T10:15:00Z",
   "cancelled_at": null,
   "cancelled_by_id": null,
-  "cancelled_by": null
+  "cancel_reason": null
 }
 ```
 
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | integer | |
-| `user_id` | integer \| null | Booking user |
+| `user_id` | integer \| null | Reservation holder; always set on current rows (nullable only for pre-lease-model data) |
 | `user` | UserBrief \| null | |
-| `group_id` | integer \| null | |
+| `group_id` | integer \| null | Always set on current rows (nullable only for pre-lease-model data) |
 | `group` | GroupBrief \| null | |
 | `gpu_class_id` | integer | |
 | `gpu_class` | `{id, name, label_value}` | |
-| `start_dt` | datetime (local, no suffix) | Reservation start in site-local wall-clock; may cross midnight |
-| `end_dt` | datetime (local, no suffix) | Reservation end; ≤ 48h after `start_dt` for non-privileged members; no server-side cap for admins/managers |
+| `start_dt` | datetime (local, no suffix) | Reservation start in site-local wall-clock; may cross midnight. Whole-hour for `kind="booking"`; arbitrary for `kind="on_demand"` |
+| `end_dt` | datetime (local, no suffix) | Reservation end; ≤ 48h after `start_dt` for non-privileged members' bookings; no server-side cap for admins/managers; `start + duration_seconds` for leases |
 | `date` | date | Calendar date of `start_dt` (convenience for filtering) |
 | `start_utc` | string (ISO 8601, `Z`) | Reservation start converted to UTC; use this for time comparisons |
-| `end_utc` | string (ISO 8601, `Z`) | Reservation end converted to UTC; the controller uses this to compute a pod's runtime guarantee (no `activeDeadlineSeconds` is set) |
+| `end_utc` | string (ISO 8601, `Z`) | Reservation end converted to UTC; use this for `activeDeadlineSeconds` |
 | `gpu_count` | integer | Number of GPUs reserved |
-| `su_cost` | number | Total Service Units consumed (stored at creation) |
-| `kind` | `"booking"` | Currently always `"booking"` — includes JIT on-demand reservations created via `POST /api/reservations` |
+| `su_cost_user` | number | Service Units charged to the individual user (zeroed when a manager waives a cancellation penalty) |
+| `su_cost_group` | number | Service Units charged against the group pool (only zeroed on an admin waive) |
+| `su_cost_original` | number | Service Units charged at creation time; never altered by later penalty rewrites or waives |
+| `kind` | `"booking"` \| `"on_demand"` | `"booking"` = user-scheduled reservation; `"on_demand"` = controller-requested lease (see §"Reservation kinds") |
 | `status` | `"active"` \| `"cancelled"` | |
-| `notes` | string \| null | Free-text note from the user |
-| `submitted_by_id` | integer \| null | User ID of the authenticated caller (differs from `user_id` when a manager books on behalf of a member) |
+| `notes` | string \| null | Free-text note from the user (or the controller, for leases) |
+| `submitted_by_id` | integer \| null | User ID of the authenticated caller (differs from `user_id` when a manager books on behalf of a member; `null` for leases) |
 | `submitted_by` | UserBrief \| null | Brief info for the submitter |
 | `created_at` | datetime (UTC, `Z`) | |
 | `updated_at` | datetime (UTC, `Z`) | |
 | `cancelled_at` | datetime \| null (UTC, `Z`) | |
-| `cancelled_by_id` | integer \| null | User ID of whoever cancelled |
-| `cancelled_by` | UserBrief \| null | Brief info for whoever cancelled (mirrors `submitted_by`); populated on cancelled records |
+| `cancelled_by_id` | integer \| null | User ID of whoever cancelled; `null` for a controller (service-key) cancellation |
+| `cancel_reason` | `"no-show"` \| `"controller-revoked"` \| null | Machine-readable reason recorded by `POST /api/reservations/{id}/cancel`; `null` for human cancellations |
 
 ---
 
