@@ -33,54 +33,62 @@ system is designed to accommodate greater values in the future.)
 │    GET /api/reservations?status=all                   │
 │        &date_start=today&date_end=today+LOOKAHEAD     │
 │        (paginated, 200/page)                          │
-│    GET /api/gpu-classes/{id}  → resolve label_value   │
-│    GET /api/settings  → reclaim_preempt_guard_minutes │
+│    GET /api/gpu-classes  → refresh label_value maps   │
 └──────────────────────────────────────────────────────┘
            │ updates in-memory reservation list
            ▼
 ┌──────────────────────────────────────────────────────┐
 │ 2. Pod watch  (LIST at startup, then WATCH stream)   │
-│    Pods with label gpu-class=<X> are matched against │
-│    the reservation list:                             │
-│      namespace == reservation.user.username          │
-│      gpu-class label == gpu_class.label_value        │
-│    Matched pods enter the work queue.                │
-│                                                      │
+│    Pods with label gpu-class=<X> are routed:         │
+│      a. A reservation is open now, or opens within   │
+│         ONDEMAND_HORIZON_MINUTES, with budget         │
+│           → enter the reserved work queue             │
+│      b. Else, if JIT-eligible (min-runtime annotation,│
+│         group label if required)                     │
+│           → become an on-demand candidate; attempt a  │
+│             lease request immediately                 │
+│      c. Else, if some future reservation matches      │
+│         (beyond horizon / no budget)                  │
+│           → enter the reserved work queue anyway       │
+│      d. Else → left Pending                            │
+│                                                       │
 │    Fast path: if a new pod (ADDED) arrives while its │
 │    window is already open, the toleration is applied │
 │    immediately — no wait for the queue processor.    │
 └──────────────────────────────────────────────────────┘
-           │ task queue (in memory)
+           │ task queue / on-demand candidates (in memory)
            ▼
 ┌──────────────────────────────────────────────────────┐
 │ 3. Queue processor  (every 300 s)                    │
-│    Handles pods queued before their window opened,   │
-│    and retries for pods that were over-budget:       │
+│    Reserved path — pods queued before their window   │
+│    opened, and retries for pods over-budget:          │
 │      a. Count nvidia.com/gpu already in use by other │
 │         sibling pods that hold the toleration for    │
 │         the same booking (matched via the            │
 │         horae/booking-reference annotation)          │
 │      b. If pod_gpus + sibling_gpus ≤ reserved_gpus:  │
 │           PATCH pod → add toleration + annotations   │
-│           PATCH pod → annotate runtime guarantee     │
+│           PATCH pod → annotate runtime guarantee      │
 │           Create RuntimeGuaranteed Event on pod      │
 │      c. Otherwise: retry in 2–5 min                  │
 │                                                      │
-│    On-demand path (when ONDEMAND_PLACEMENT_ENABLED): │
-│      d. Reconcile reclaim merges: re-apply persisted │
-│         merges + absorb newly-committed future       │
-│         reclaim blocks into open subject blocks      │
-│      e. Safety interlock (guard 3): if a reservation │
+│    No-show → cancel: for each reservation declared   │
+│      no-show, re-verify no pod raced in, then         │
+│      POST /api/reservations/{id}/cancel (no-show)     │
+│                                                      │
+│    JIT on-demand path (ONDEMAND_PLACEMENT_ENABLED):  │
+│      d. Safety interlock (guard 3): if a reservation │
 │         holder is stuck Pending for a GPU class,     │
-│         hold on-demand placement for that class      │
-│      f. For each on-demand candidate whose retry     │
-│         cooldown has passed, find a suitable block:  │
-│           kind="reclaim", no-show, or cancelled,     │
-│           matching GPU class, sufficient free GPUs,  │
-│           remaining window >= minimum-runtime-seconds│
-│           PATCH pod → add toleration + block-id      │
-│           PATCH pod → annotate runtime guarantee     │
-│           Create RuntimeGuaranteed Event on pod      │
+│         hold lease requests for that class            │
+│      e. For each candidate whose retry cooldown has  │
+│         passed: guard 1 (GPU-only-pending), resolve  │
+│         gpu-class → gpu_class_id, then                │
+│           POST /api/reservations (on_demand=true,     │
+│             idempotency_key=pod UID)                  │
+│           Granted → admit under it (same as 3a/3b)    │
+│           Admission failed → compensating cancel      │
+│             (reason=controller-revoked)                │
+│           Denied → retry in 2–5 min                    │
 └──────────────────────────────────────────────────────┘
            │ (independent of the task queue)
            ▼
@@ -101,118 +109,73 @@ system is designed to accommodate greater values in the future.)
 └──────────────────────────────────────────────────────┘
 ```
 
-### On-demand placement
+### Just-in-time (JIT) on-demand leases
 
-When `ONDEMAND_PLACEMENT_ENABLED=true` (the default), the controller also
-handles pods that have **no matching user reservation** but carry the
-`horae/minimum-runtime-seconds` annotation.  These pods are treated as
-*on-demand candidates* and are placed onto reclaimable capacity when it is
-available (reclaim holds, no-show windows, or cancelled-in-window windows — see
-*On-demand capacity sources* below).
+The reservation app schedules only real bookings — there is no ad-hoc
+capacity-hold type.  A pod with no reservation open now or opening soon does
+not wait indefinitely and is not placed onto ad-hoc spare capacity: the
+controller requests a **real reservation** on its behalf, just-in-time.
+On-demand jobs are therefore ordinary reservations — charged SU, protected by
+the same runtime guarantee as any booking, and able to displace overstayers
+via the existing boundary preemption.
 
-**Candidate selection** — a Pending pod becomes an on-demand candidate when:
-- It has a `gpu-class` label but no matching user reservation.
-- It carries `horae/minimum-runtime-seconds=<N>` (a positive integer).
-- Only `ADDED` events create candidates; `MODIFIED` bursts are ignored.
+**Routing** (re-evaluated on every attempt, in `pod_watch_loop`):
 
-**Block selection** — a block is eligible when:
-- It is an on-demand capacity source — a `kind == "reclaim"` hold, a no-show
-  reservation, or a cancelled-in-window reservation (see *On-demand capacity
-  sources* below).
-- Its GPU class matches the pod's `gpu-class` label.
-- Its window is currently open and has at least `minimum-runtime-seconds` remaining.
-- It has sufficient free GPU capacity for the pod's request.
-- It is not currently claimed by a live reservation holder, and it has not been
-  absorbed into another block as a merge stub.
+1. A reservation matching the pod's namespace/GPU-class (and usage group, if
+   `REQUIRED_GROUP_LABEL` is set) that is open now or opens within
+   `ONDEMAND_HORIZON_MINUTES` **and** has spare budget → the pod is queued for
+   it, same as any reserved-path pod.
+2. Otherwise, if the pod is **JIT-eligible** — `Pending`, carries
+   `horae/minimum-runtime-seconds`, and carries the group label when
+   `REQUIRED_GROUP_LABEL` is set — it becomes an on-demand candidate and a
+   lease request is attempted immediately (and again on later pod updates,
+   respecting a retry cooldown).
+3. Otherwise, if some future reservation matches at all (beyond the horizon,
+   or currently over budget), the pod is queued for it anyway — the plain
+   wait-for-window behaviour, preserved for a pod that isn't JIT-eligible.
+4. Otherwise the pod is left **Pending** (a pod missing the group label or the
+   minimum-runtime annotation is not guessed at).
 
-Among eligible blocks, the controller prefers the one whose window ends
-**latest** (maximising the pod's runtime guarantee); ties are broken by most
-free capacity.  A block that has absorbed an abutting future reclaim block
-(see *Reclaim-block merging* below) presents here as a single, longer window,
-so this same "latest end wins" rule extends the chosen guarantee automatically.
+**Requesting a lease** — the controller resolves the pod's `gpu-class` label
+to a numeric `gpu_class_id`, then calls `POST /api/reservations` with
+`duration_seconds = minimum-runtime + ONDEMAND_LEASE_BUFFER_MINUTES * 60` and
+`on_demand=true` (the app relaxes policy limits — SU, caps, minimum duration
+— never physical calendar capacity).  The request is **idempotent by the
+pod's Kubernetes UID**: a retry after a prior grant returns the same
+reservation rather than creating a duplicate.
+
+- **Denied** (409/error): the candidate cools down 2–5 min and retries.
+- **Granted**: the pod is admitted under the new reservation immediately,
+  through the same admission path as any reserved-path pod (stamps
+  `res-<id>`, records the guarantee, emits `RuntimeGuaranteed`).  If
+  admission does **not** succeed — a transient patch error, or the pod
+  vanishing in the interim — the controller issues a compensating cancel
+  (`POST /api/reservations/{id}/cancel`, `reason=controller-revoked`) so the
+  grant is never left dangling.
 
 **Safety interlock (guard 3)** — if any reservation-holder pod for a given
 GPU class is stuck in Pending (admitted but the scheduler cannot place it),
-on-demand placement is suspended for that class until the stuck pod is
-resolved.  Other GPU classes are unaffected.
+lease requests are suspended for that class until the stuck pod is resolved.
+Other GPU classes are unaffected.
 
-**On-demand capacity sources** — the blocks a candidate can land on come from
-three places, distinguished by *who* freed the capacity:
+**No-show → cancel** — if a reservation holder fails to launch a pod within
+`NOSHOW_TIMEOUT_MINUTES` of the window opening, the controller durably
+cancels the reservation (`POST /api/reservations/{id}/cancel`,
+`reason="no-show"`) so the app can re-book the window immediately.  The
+cancel is re-verified against a fresh pod snapshot first (a pod that raced in
+at the last second is never cancelled out from under it) and retried next
+tick if it fails.  A reservation a live holder is still occupying — directly
+or via a chained runtime guarantee — is **claimed** and is never declared a
+no-show.  The declaration itself is in-memory and does not survive a
+restart, but once the cancel actually lands, the reservation is durably gone
+from the app's active set, so there is nothing to re-arm.
 
-| Source | Origin | `kind` / state | booking-reference prefix |
-|--------|--------|----------------|--------------------------|
-| **Reclaim hold** | The reservation **app's** GPU recovery task tiles idle capacity into explicit reclaim rows; the controller sees them via `GET /api/reservations?status=all` | `kind == "reclaim"` | `ondemand-<id>` |
-| **No-show reclaim** | **Controller-derived:** a user reservation with no matching pod by its deadline | `kind == "booking"`, id tracked in-memory as a no-show | `noshow-<id>` |
-| **Cancelled-in-window reclaim** | **Controller-derived:** a reservation cancelled *while its window is open* — the controller evicts any admitted pods and retains the freed window | `kind == "booking"`, `status == "cancelled"`, retained in memory until its window ends | `ondemand-<id>` |
-
-Only the first is created upstream; the latter two are reclaim sources the
-controller synthesises internally from reservation state.  All three feed the
-same `find_ondemand_block` selection and the same unified occupancy map (keyed by
-reservation id), so each retains an independent GPU budget regardless of source.
-A reservation a live holder is still occupying — directly or via a chained
-runtime guarantee — is **claimed** and is never lent out as on-demand capacity.
-
-**No-show reclaim** — if a reservation holder fails to launch a pod within
-`NOSHOWN_TIMEOUT_MINUTES` of the window opening, that reservation is marked
-as a no-show and its capacity becomes available for on-demand candidates.
-If a holder's pod is later deleted mid-window (e.g. idle-culled), the next
-reservation refresh re-arms a fresh deadline of `NOSHOWN_GRACE_MINUTES`, so
-a vacated window is also reclaimed for on-demand use if the holder does not
-return.  No-show state is **in-memory only**: it is not written back to the
-reservation API, and a controller restart clears it — mid-window reservations
-then get a fresh `NOSHOWN_GRACE_MINUTES` deadline, so a late holder can
-reclaim their window across a restart.
-
-**Cancelled-in-window reclaim** — when a reservation is cancelled while its
-window is already open, the controller emits a `ReservationCancelled` Event on
-each pod admitted under it, deletes those pods, and retains the cancelled
-reservation in memory until its original window ends.  The freed GPUs are offered
-to on-demand candidates for the remainder of that window (booking-reference
-`ondemand-<id>`).  Like no-show state, this is **in-memory only** and is rebuilt
-from a fresh reservation fetch after a restart.
-
-**Reclaim-block merging** — an on-demand job's runtime guarantee is normally
-the end of the single block it lands on (no back-to-back chaining, unlike
-reserved holders).  To let a job that starts near a block boundary run
-longer, the controller merges an open on-demand **subject block** (any of the
-three sources above) with a directly **abutting** future `kind="reclaim"`
-block of the **same GPU class and equal GPU count**, provided that future
-block is **committed**.
-
-A reclaim block is committed once its start is within the reservation app's
-`reclaim_preempt_guard_minutes` — inside that guard the app will not preempt the
-hold with a new booking, so it is safe to schedule onto.  The controller judges
-this against the block's start **at the last reservation fetch**, not the
-between-fetch clock: a block still preemptible when we last fetched must not be
-merged just because the tick clock drifts it into the guard, or it could race a
-last-minute booking the controller has not yet seen.  Because the guard is sized
-to exceed the poll interval, a block legitimately entering the guard is always
-re-confirmed by a fresh fetch (still present, or gone if preempted) before it is
-merged.
-
-When a subject abuts a committed future block, the subject's window is extended
-to that block's end and the absorbed block becomes a **stub** — excluded from
-independent placement so it is never double-booked.  The longest abutting block
-is chosen, and further blocks are chained in iteratively as they enter the guard
-on later fetches.  Because the merged block presents as one longer window,
-`find_ondemand_block` and the job's runtime guarantee extend automatically —
-no separate merge-aware guarantee logic.  Merges are **persistent**: they are
-re-applied to the freshly loaded reservation list on every refresh and pruned
-only once the whole merged span has ended, so a reload never re-exposes an
-absorbed block while a guarantee-extended job is still running on it.  Merging
-is skipped entirely when on-demand placement is disabled or the guard is
-unknown (settings fetch failed or recovery disabled).
-
-**Recycling** — when an on-demand pod terminates, the freed capacity is
-immediately offered to the next waiting candidate of the same GPU class
-without waiting for the next queue-processor tick.
-
-**Occupancy tracking across restarts** — capacity for every admitted pod
-(reserved, on-demand, and no-show alike) is tracked in one occupancy map keyed
-by reservation id.  The map is rebuilt from the cluster — the reservation id
-parsed from each pod's `horae/booking-reference` — by the startup pod LIST and,
-on every queue-processor tick, from a live snapshot, so a missed event or a
-restart self-heals within one tick.
+**Occupancy tracking across restarts** — capacity for every admitted pod is
+tracked in one occupancy map keyed by reservation id.  The map is rebuilt
+from the cluster — the reservation id parsed from each pod's
+`horae/booking-reference` — by the startup pod LIST and, on every
+queue-processor tick, from a live snapshot, so a missed event or a restart
+self-heals within one tick.
 
 ### Toleration applied
 
@@ -227,16 +190,16 @@ effect:   NoSchedule
 
 | Annotation | Written when | Purpose |
 |------------|--------------|---------|
-| `horae/booking-reference` | toleration applied | Identifies the reservation the pod was admitted under (`res-<id>`, `ondemand-<id>`, or `noshow-<id>`); the id is the key for the per-reservation GPU budget and for rebuilding occupancy from the cluster |
+| `horae/booking-reference` | toleration applied | Identifies the reservation the pod was admitted under (`res-<id>` — the only prefix, since every admitted pod is tied to a real reservation, JIT or otherwise); the id is the key for the per-reservation GPU budget and for rebuilding occupancy from the cluster |
 | `horae/pod-runtime-limit-seconds` | guarantee recorded | The runtime guarantee's duration in seconds at admission time, for operator visibility and in-pod notification widgets. Legacy key name — no longer backs a hard cap; see *Runtime guarantees and demand-driven preemption* |
 | `horae/guaranteed-until` | guarantee recorded | The same guarantee as an absolute UTC ISO-8601 instant |
 
 (`horae/minimum-runtime-seconds` is the one annotation **consumed** rather
-than written — see On-demand placement above.  Both guarantee annotations are
-**informational only**: nothing in the controller reads them back to make a
-decision, and a guarantee can technically shrink after being written — e.g. a
-window shortened server-side — so treat them as best-effort, not
-authoritative.)
+than written — see *Just-in-time (JIT) on-demand leases* above.  Both
+guarantee annotations are **informational only**: nothing in the controller
+reads them back to make a decision, and a guarantee can technically shrink
+after being written — e.g. a window shortened server-side — so treat them as
+best-effort, not authoritative.)
 
 ### Runtime guarantees and demand-driven preemption
 
@@ -256,8 +219,8 @@ runtime accurately, consistently over-booked "just in case."
 
 Unlike the old cap, this is an absolute instant **recomputed live** on every
 check rather than frozen at admission — so a pod's guarantee can *grow*
-after admission (an abutting follow-on booking, a landed reclaim merge),
-something a Kubernetes deadline could never do.
+after admission (an abutting follow-on booking), something a Kubernetes
+deadline could never do.
 
 **Recording the guarantee** — after applying the toleration, the controller
 annotates the pod (see table above) and creates a Kubernetes **Event** with
@@ -281,29 +244,20 @@ pod snapshot or node-capacity-snapshot failure skips the sweep entirely
 rather than risk a kill based on unknown physical state. Preempted pods get a
 Kubernetes Event with reason `Preempted` before deletion.
 
-The take-back API below preempts too: a pod past its runtime guarantee never
-blocks a take-back, and granting one deletes such pods immediately rather
-than waiting for the next sweep.
-
-**Adopting pods into a re-booked reservation** (`POD_ADOPTION_ENABLED`, default
-on). Because pods overrun, a user may book a *fresh* reservation (a new,
-distinct id) while their pod from the previous window is still running. If the
-new window abuts the old one (same owner, GPU class, and GPU count), the
-guarantee chaining above already extends the pod's guarantee onto it — no
-action needed. For the cases chaining cannot reach, the controller instead
-*re-links* the pod: it re-annotates the pod's `horae/booking-reference` to the
-new reservation and moves the pod's occupancy accordingly, so it is credited
-against the new reservation. Eligibility differs by admission path: a
-**reserved-path** pod is only re-linked once it is **past its runtime
-guarantee** (a non-abutting follow-on window, or a different GPU count, that
-chaining cannot reach), while an **on-demand** pod is re-linked as soon as a
-matching open booking exists — a proactive upgrade to a guaranteed reservation
-that does not wait for the on-demand job to overstay, and applies even if the
-new booking's guarantee would end sooner than the on-demand block's current
-one. This runs before each preemption sweep plans any kills (so a just-re-booked
-pod is never a victim) and once per queue-processor tick. Re-linked pods get a
-Kubernetes Event with reason `OverstayRelinked` (rescue) or `OnDemandUpgraded`
-(proactive upgrade).
+**Adopting overstay pods into a re-booked reservation**
+(`POD_ADOPTION_ENABLED`, default on). Because pods overrun, a user may book a
+*fresh* reservation (a new, distinct id) while their pod from the previous
+window is still running. If the new window abuts the old one (same owner,
+GPU class, and GPU count), the guarantee chaining above already extends the
+pod's guarantee onto it — no action needed. For the cases chaining cannot
+reach (a non-abutting follow-on window, or a different GPU count), and only
+once the pod is **past its runtime guarantee**, the controller instead
+*re-links* the pod: it re-annotates the pod's `horae/booking-reference` to
+the new reservation and moves the pod's occupancy accordingly, so it is
+credited against the new reservation. This runs before each preemption sweep
+plans any kills (so a just-re-booked pod is never a victim) and once per
+queue-processor tick. Re-linked pods get a Kubernetes Event with reason
+`OverstayRelinked`.
 
 ---
 
@@ -352,27 +306,24 @@ All settings are supplied via environment variables.
 | `KUBECONFIG` | no | *(absent)* | Path to a kubeconfig file; if unset, in-cluster service-account credentials are used |
 | `HEALTH_PORT` | no | `8000` | Port for the `GET /health` liveness endpoint |
 | `TZ` | no | system default | Affects log timestamp display only; reservation window arithmetic is UTC-based and does not depend on it |
-| `ONDEMAND_PLACEMENT_ENABLED` | no | `true` | Set to `false` to disable on-demand placement and run reserved-path logic only |
-| `NOSHOW_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and opening the block to on-demand pods (legacy alias `NOSHOWN_TIMEOUT_MINUTES` still accepted) |
+| `ONDEMAND_PLACEMENT_ENABLED` | no | `true` | Set to `false` to disable the JIT on-demand lease path entirely |
+| `ONDEMAND_HORIZON_MINUTES` | no | `30` | JIT routing horizon: a pod is queued for a reservation opening within this many minutes (with budget) instead of requesting a lease |
+| `ONDEMAND_LEASE_BUFFER_MINUTES` | no | `10` | Minutes added to a pod's `horae/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
+| `NOSHOW_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and cancelling it app-side (legacy alias `NOSHOWN_TIMEOUT_MINUTES` still accepted) |
 | `NOSHOW_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress (legacy alias `NOSHOWN_GRACE_MINUTES` still accepted) |
 | `POD_LIST_TICK_INTERVAL` | no | `300` | Seconds between queue-processor ticks (pod LIST frequency) |
 | `POD_SCHEDULING_GATE_NAME` | no | *(absent)* | Name of a SchedulingGate to remove from a pod after admitting it; unset disables scheduling-gate removal |
-| `INBOUND_API_TOKEN` | no | *(absent)* | Bearer token for the inbound API (`POST /api/reservations/push` and `POST /api/reservations/take-back`); mount from a Kubernetes Secret. Unset leaves both endpoints **disabled** (returns 503) |
+| `INBOUND_API_TOKEN` | no | *(absent)* | Bearer token for the inbound push API (`POST /api/reservations/push`); mount from a Kubernetes Secret. Unset leaves the endpoint **disabled** (returns 503) |
 | `PREEMPTION_LEAD_MINUTES` | no | `15` | Minutes before a reservation slot boundary that phase-A preemption runs, proactively freeing capacity from overstaying pods |
 | `PREEMPTION_CHECK_INTERVAL` | no | `60` | Seconds between preemption sweeps |
-| `POD_ADOPTION_ENABLED` | no | `true` | Re-link an overstay pod, or proactively upgrade a within-guarantee on-demand pod, to a reservation its user has since booked. Set to `false` to disable |
-| `REQUIRED_GROUP_LABEL` | no | *(absent)* | Pod label naming the usage group a pod belongs to (e.g. `dsmlp/course`). When set, the pod's value for this label must equal the reservation's group name — an additional match constraint alongside `gpu-class` — before the controller admits it, adopts it, or chain-extends its guarantee. Unset disables the group constraint |
+| `POD_ADOPTION_ENABLED` | no | `true` | Re-link an overstay pod to a reservation its user has since booked. Set to `false` to disable |
+| `REQUIRED_GROUP_LABEL` | no | *(absent)* | Pod label naming the usage group a pod belongs to (e.g. `dsmlp/course`). When set, the pod's value for this label must equal the reservation's group name — an additional match constraint alongside `gpu-class` — before the controller admits it, adopts it, or chain-extends its guarantee; a pod without the label is also never JIT-eligible. Unset disables the group constraint |
 | `LOG_LEVEL` | no | `INFO` | Python logging level for the controller |
 
-> **Note:** `reclaim_preempt_guard_minutes` (used by reclaim-block merging) is
-> **not** an environment variable — the controller reads it from the reservation
-> app's `GET /api/settings` endpoint on each refresh cycle, so it always tracks
-> the app's own configuration.  If the settings fetch fails, the previous value
-> is kept; until the first successful fetch, reclaim-block merging is skipped.
-
-> **Security note:** The controller requires a **`read_only`**-scoped service
-> key — it only calls `GET` endpoints (`/api/reservations`, `/api/gpu-classes`,
-> and `/api/settings`).  Do not provision a `read_write` key for this daemon.
+> **Security note:** The controller needs a **`read_write`**-scoped service
+> key: besides the read endpoints (`/api/reservations`, `/api/gpu-classes`),
+> it calls `POST /api/reservations` (JIT lease requests) and
+> `POST /api/reservations/{id}/cancel` (no-show / controller-revoked cancels).
 > Always inject the key from a Kubernetes Secret rather than baking it into an
 > image or ConfigMap.
 
@@ -402,7 +353,7 @@ curl http://localhost:8000/health
 
 The controller normally learns about reservation changes by **polling** the
 reservation app every `RESERVATION_FETCH_INTERVAL` seconds. To propagate changes
-faster (e.g. a cancellation, or a future standby assignment), the reservation app
+faster (e.g. a cancellation or an owner reassignment), the reservation app
 can **push** one or more updated reservation entries:
 
 ```
@@ -437,60 +388,6 @@ To enable it under Helm, point `inboundApiTokenSecret.name` at a Secret holding
 the token (see below). No additional RBAC is required.
 
 ---
-
-## Reclaim-block take-back API
-
-Reclaim holds whose start falls inside the app's `reclaim_preempt_guard_minutes`
-are treated as **committed** to the controller — the app will not preempt them
-with a new booking. To let the app re-sell that near-term capacity anyway, it can
-ask the controller to **take back** specific reclaim blocks before committing a
-tentative booking built from them:
-
-```
-POST /api/reservations/take-back
-Authorization: Bearer <INBOUND_API_TOKEN>
-Content-Type: application/json
-
-{ "reclaim_ids": [123, 456] }
-```
-
-- **All-or-nothing**: the request succeeds only if *every* named block is idle.
-  A block is in use when a live pod **still within its runtime guarantee** is
-  admitted on it, or when it was merged into a still-guaranteed job's extended
-  window. Any in-use block rejects the whole request and **nothing changes**.
-  A pod **past** its runtime guarantee never counts as in-use — a take-back
-  request is itself explicit demand, so granting it deletes such overstaying
-  pods immediately (with a `Preempted` Event) rather than waiting for the
-  next preemption sweep.
-- On success the blocks immediately leave the controller's scheduling universe:
-  no further on-demand placement or merging can touch them, and a block absorbed
-  into a merge is detached from its subject (earlier absorbed blocks a running
-  job still reaches stay protected; later untaken blocks revert to standalone
-  capacity, reported in `detached`).
-- Granted ids are **tombstoned** until their window ends, so a poll that still
-  lists the block (a stale snapshot, or the app's DB before its replacement
-  booking commits) cannot resurrect it. If the booking falls through, **push the
-  block back** (`POST /api/reservations/push` with the entry active) — an
-  explicit push clears the tombstone and restores the capacity.
-- An id the controller has never seen (e.g. a hold created after its last poll)
-  is granted — the controller cannot have placed anything on it — tombstoned
-  defensively, and reported under `unknown`.
-- Responses: `200` (with `{"taken_back", "already_taken_back", "unknown",
-  "detached", "total_active"}`; retries are idempotent), `400` (an id is not a
-  reclaim block, listed under `detail.invalid`), `401` (missing/invalid bearer),
-  `409` (in-use block(s) listed under `detail.in_use` with reasons), or `503`
-  (endpoint disabled, or idleness could not be verified against live pods —
-  the controller fails closed and grants nothing).
-
-```bash
-curl -X POST http://localhost:8000/api/reservations/take-back \
-  -H "Authorization: Bearer $INBOUND_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"reclaim_ids": [123]}'
-```
-
-Shares the `HEALTH_PORT` listener and `INBOUND_API_TOKEN` with the push API; no
-additional RBAC is required.
 
 ---
 
@@ -680,13 +577,13 @@ python manage_service_keys.py revoke --name k8s-controller-prod
 gpu-reservation-controller/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py               FastAPI app + three background asyncio tasks
+│   ├── main.py               FastAPI app + four background asyncio tasks
 │   ├── config.py             Config dataclass from environment variables
 │   ├── schemas.py            Pydantic models for reservation API responses
-│   ├── reservation_client.py httpx async client for the reservation API
+│   ├── reservation_client.py httpx async client for the reservation API + JIT lease create/cancel
 │   ├── k8s_client.py         Kubernetes client wrapper (watch, patch, occupancy snapshot)
 │   └── controller.py         Shared state, queue, matching, window arithmetic
-├── tests/                    pytest suite (controller logic, guards, no-show, on-demand)
+├── tests/                    pytest suite (controller logic, guards, no-show, JIT leases)
 ├── helm/gpu-reservation-controller/  Helm chart (Deployment, RBAC, Service)
 ├── docs/
 │   ├── RESERVATION-API.md    Reservation management API specification

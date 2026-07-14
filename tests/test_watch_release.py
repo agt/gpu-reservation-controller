@@ -65,7 +65,8 @@ def test_deleted_pod_releases_occupancy_when_ondemand_disabled(monkeypatch):
     events = [("DELETED", _pod("uid-del"))]
     monkeypatch.setattr(main_module, "PodWatcher", lambda **kw: _FakeWatcher(events))
 
-    asyncio.run(main_module.pod_watch_loop(state, _config()))
+    # The DELETED branch never touches the reservation client.
+    asyncio.run(main_module.pod_watch_loop(state, None, _config()))
 
     # Before the fix, release_pod was gated on the on-demand flag, so the slot
     # leaked.  It must now be freed regardless of the flag.

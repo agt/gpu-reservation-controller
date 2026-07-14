@@ -219,7 +219,7 @@ def block(
     gpu_class_label: str | None = None,
     user: bool = False,
 ) -> ReservationResponse:
-    """A reservation with an explicit UTC window (the reclaim-merge test style)."""
+    """A reservation with an explicit UTC window, for tests needing precise timing."""
     return reservation(
         block_id,
         start_utc=start_utc,

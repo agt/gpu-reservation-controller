@@ -54,22 +54,6 @@ class ReservationResponse(BaseModel):
     cancelled_by: Optional[UserBrief] = None
 
 
-class AppSettings(BaseModel):
-    """Subset of GET /api/settings the controller consumes.
-
-    The endpoint returns additional UI-oriented fields which Pydantic ignores.
-    ``reclaim_preempt_guard_minutes`` is the lead time before a reclaim hold's
-    start within which the reservation app treats it as committed (non-preemptible)
-    capacity — safe for the controller to merge/schedule onto.
-    """
-
-    # Nothing consumes reclaim_window_minutes; give it a default so a renamed or
-    # omitted field doesn't fail validation and silently disable reclaim merging
-    # (fetch_settings would return None) (CODE-REVIEW H7).
-    reclaim_window_minutes: Optional[int] = None
-    reclaim_preempt_guard_minutes: int
-
-
 class GpuClassDetail(GpuClassBrief):
     """Returned by GET /api/gpu-classes/{id}.
 
@@ -109,29 +93,25 @@ class ReservationPushResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Inbound take-back API (POST /api/reservations/take-back)
+# JIT on-demand reservation request (POST /api/reservations)
 # ---------------------------------------------------------------------------
 
 
-class ReclaimTakeBackRequest(BaseModel):
-    """Body of a reclaim-block take-back request from the reservation app.
+class OnDemandReservationRequest(BaseModel):
+    """Body of a JIT on-demand booking request, sent on behalf of a pending pod.
 
-    Asks the controller to relinquish the named ``kind="reclaim"`` blocks so the
-    app can re-book that capacity (e.g. a tentative front-end offer inside the
-    preempt guard).  All-or-nothing: if any requested block is in use, the whole
-    request is rejected and nothing changes.  The envelope object leaves room
-    for future fields (e.g. a replacement reservation pushed atomically with the
-    take-back) without an API break.
+    The app anchors ``start_utc`` at its own "now" (avoids controller/app clock
+    skew) and sets ``end_utc = start_utc + duration_seconds``.
+    ``on_demand=True`` relaxes policy limits (SU/caps/min-duration) only —
+    never physical calendar capacity.  ``idempotency_key`` is the admitting
+    pod's UID: a retry with the same key returns the original reservation
+    rather than creating a duplicate.
     """
 
-    reclaim_ids: list[int]
-
-
-class ReclaimTakeBackResponse(BaseModel):
-    """Summary returned after a successful (all-or-nothing) take-back."""
-
-    taken_back: list[int]          # ids removed from the active set by this call
-    already_taken_back: list[int]  # ids relinquished by an earlier call (idempotent retry)
-    unknown: list[int]             # ids the controller had never seen; granted + tombstoned
-    detached: list[int]            # absorbed stub ids released back to standalone blocks
-    total_active: int              # size of the active reservation set afterwards
+    username: str
+    group_name: Optional[str] = None
+    gpu_class_id: int
+    gpu_count: int
+    duration_seconds: int
+    on_demand: bool = True
+    idempotency_key: str

@@ -38,11 +38,11 @@ Sources: `app/main.py` (`reservation_fetch_loop`, `_refresh_reservations`) and
 |-------|---------|-------------|
 | DEBUG † | `Reservation refresh cycle starting` | A periodic refresh cycle is beginning. Useful to confirm the loop is alive between INFO-level events. |
 | INFO | `Fetched N reservations (N active, N cancelled) (today + N days)` | The reservation client completed its paginated `status=all` fetch; emitted by `ReservationClient.fetch_reservations`. |
-| INFO | `GPU class N (name) → label_value='value'` | A previously-unseen GPU class has been resolved to its Kubernetes label value; result is cached. |
-| WARNING | `Could not fetch GPU class N: HTTP <code>` / `Could not fetch GPU class N: <exception>` | A per-class detail fetch failed (HTTP status or network error); the class is skipped this cycle and `fetch_gpu_class` returns None. |
-| WARNING | `Could not parse GPU class N response: <exception>` | The GPU-class payload failed schema validation / JSON decoding; `fetch_gpu_class` returns None rather than aborting the refresh. |
-| WARNING | `Could not fetch app settings: HTTP <code>` / `Could not fetch app settings: <exception>` | The `GET /api/settings` fetch failed; reclaim-merge guard is left unknown for this cycle. |
-| WARNING | `Could not parse app settings response: <exception>` | The settings payload failed schema validation / JSON decoding; `fetch_settings` returns None rather than aborting the refresh. |
+| WARNING | `Could not fetch GPU classes: HTTP <code>` / `Could not fetch GPU classes: <exception>` | The full-list `GET /api/gpu-classes` fetch failed; the previous cycle's label/id maps are kept rather than losing all resolution. |
+| WARNING | `Could not parse GPU classes response: <exception>` | The GPU-class list payload failed schema validation / JSON decoding; `fetch_gpu_classes` returns None rather than aborting the refresh. |
+| INFO | `GPU class N (name) → label_value='value'` | The per-id fallback resolved a class referenced by a reservation but missing from the bulk list (e.g. created since the last successful fetch). |
+| WARNING | `Could not fetch GPU class N: HTTP <code>` / `Could not fetch GPU class N: <exception>` | The per-class fallback detail fetch failed (HTTP status or network error); the class is skipped this cycle and `fetch_gpu_class` returns None. |
+| WARNING | `Could not parse GPU class N response: <exception>` | The fallback GPU-class payload failed schema validation / JSON decoding; `fetch_gpu_class` returns None rather than aborting the refresh. |
 | WARNING | `GPU class N has no label_value; pods for this class cannot be matched to reservations` | A GPU class referenced by an active reservation has no `label_value` set; pods for that class cannot be matched until the class is configured. |
 | INFO † | `Reservation refresh complete: N active reservation(s), N GPU class(es) resolved` | Periodic refresh completed successfully; current active reservation and GPU-class counts. |
 | ERROR | `Reservation refresh failed: <exception>` | An entire refresh cycle failed (network error, API error, etc.); previous state is retained. |
@@ -52,7 +52,7 @@ Sources: `app/main.py` (`reservation_fetch_loop`, `_refresh_reservations`) and
 ## Reservation cancellation
 
 Emitted when an in-window reservation is detected as cancelled.
-Sources: `app/main.py` (`_handle_cancelled_reservations`), `app/controller.py` (`record_cancelled_reservation`, `cleanup_cancelled_reservations`).
+Source: `app/main.py` (`_handle_cancelled_reservations`).
 
 | Level | Message | Description |
 |-------|---------|-------------|
@@ -60,25 +60,32 @@ Sources: `app/main.py` (`_handle_cancelled_reservations`), `app/controller.py` (
 | INFO | `Evicting N pod(s) for cancelled reservation #N (by <user>)` | N pods admitted under a now-cancelled reservation are being evicted. |
 | WARNING | `Could not emit ReservationCancelled event for pod ns/name: <exception>` | Best-effort Kubernetes event emission failed; pod deletion will still be attempted. |
 | WARNING | `Could not delete pod ns/name: <exception>` | Pod deletion failed; the pod will persist until manually removed or the next eviction cycle. |
-| INFO | `Reservation #N (user=u, gpu-class=c, N GPU(s)) cancelled mid-window; freed capacity available for on-demand placement until <time>` | Cancelled reservation's GPU capacity is now available to on-demand candidates until the window ends. |
-| DEBUG | `Cancelled reservation #N window ended; removed from on-demand pool` | The freed-capacity record for a cancelled reservation has been pruned because its window has closed. |
 
 ---
 
 ## No-show tracking
 
-Emitted during no-show deadline management.
-Source: `app/controller.py` (`initialize_noshow_tracking`, `update_noshow_tracking`, `reconcile_noshow`, `check_noshow_deadlines`, `mark_pod_seen_for_noshow`).
+Emitted during no-show deadline management and the resulting controller-issued
+cancel.  Source: `app/controller.py` (`update_noshow_tracking`,
+`reconcile_noshow`, `check_noshow_deadlines`, `mark_pod_seen_for_noshow`),
+`app/main.py` (`_cancel_pending_noshows`), `app/reservation_client.py`
+(`cancel_reservation`).
 
 | Level | Message | Description |
 |-------|---------|-------------|
-| DEBUG | `No-show tracking: reservation #N deadline=<time>` | A no-show deadline was set for a reservation during startup initialisation. |
+| DEBUG | `No-show tracking (init): reservation #N deadline=<time>` | A no-show deadline was set for a reservation during startup initialisation. |
 | DEBUG | `No-show tracking (new): reservation #N deadline=<time>` | A no-show deadline was set for a reservation newly seen in a periodic refresh. |
 | DEBUG | `No-show deadline pruned: reservation #N left active list` | A tracked deadline was removed because the reservation is no longer in the active list. |
 | INFO | `No-show reservation #N removed: left active list` | A previously declared no-show reservation has left the active list and is no longer tracked. |
-| INFO | `Reservation #N declared no-show (user=u, gpu-class=c): no matching pod appeared before deadline; capacity opened for on-demand placement` | No holder pod appeared within the timeout window; the reservation's GPU capacity is released for on-demand use for the rest of its window. |
+| DEBUG † | `Pending no-show cancel #N pruned: left active list` | A reservation queued for a no-show cancel left the active list (its cancel already landed, or the app removed it some other way); no further retry is needed. |
+| INFO | `Reservation #N declared no-show (user=u, gpu-class=c): no matching pod appeared before deadline; queued for cancellation` | No holder pod appeared within the timeout window; the reservation is queued in `pending_noshow_cancels` for a durable app-side cancel. |
 | DEBUG | `No-show deadline(s) cleared for reservation(s) [N, …]: holder pod admitted (namespace=ns, gpu-class=c)` | A reserved-path holder pod's booking reference was recognised; no-show deadlines for all windows in the holder's back-to-back chain are cleared. |
 | DEBUG | `No-show deadline cleared for reservation #N: matching pod already admitted (namespace=ns, gpu-class=c)` | Fallback path: a pod without a booking reference was matched by namespace + GPU class, and its reservation's no-show deadline was cleared. |
+| INFO † | `No-show cancel for reservation #N skipped this tick: a pod is now admitted under it` | This tick's fresh pod snapshot shows a pod admitted under the id (a last-second arrival); the cancel is skipped rather than issued out from under it. |
+| INFO † | `Reservation #N cancelled (no-show)` | `POST /api/reservations/{id}/cancel` (`reason="no-show"`) succeeded; the id is removed from the active set and `pending_noshow_cancels`. |
+| WARNING † | `Failed to cancel no-show reservation #N; will retry next tick` | The cancel request failed; the id remains in `pending_noshow_cancels` and is retried on the next queue-processor tick. |
+| INFO † | `Cancel request for reservation #N (<reason>): already gone` | The reservation was already gone (404) when cancelling; treated as success (idempotent). |
+| WARNING † | `Could not cancel reservation #N (<reason>): HTTP <code>` / `Could not cancel reservation #N (<reason>): <exception>` | The cancel request failed with an HTTP error or network error; `cancel_reservation` returns False. |
 
 ---
 
@@ -105,39 +112,41 @@ Sources: `app/controller.py` (`enqueue_pod`, `dequeue_pod`, `reconcile_queue`), 
 
 ---
 
-## On-demand pod watch
+## JIT on-demand candidate watch
 
 Emitted as pods enter and leave the on-demand candidate queue via watch events.
 Sources: `app/main.py` (`pod_watch_loop`), `app/controller.py` (`add_ondemand_candidate`, `remove_ondemand_candidate`).
 
 | Level | Message | Description |
 |-------|---------|-------------|
-| DEBUG † | `Pod ns/name ADDED: no open reservation window (gpu-class=c); routing to on-demand queue` | A newly-ADDED Pending pod has no matching user reservation; it is being routed to the on-demand placement queue. |
-| INFO | `On-demand candidate: pod ns/name (uid=uid, gpu-class=c, gpus=N, min-runtime=Ns)` | Pod has been registered as an on-demand placement candidate. |
-| INFO † | `On-demand candidate ns/name deleted before placement (gpu-class=c, gpus=N, min-runtime=Ns, submitted=<time>, deleted=<time>, waited=Ns)` | An on-demand candidate was deleted from Kubernetes before the controller could place it onto a block — unmet demand. |
-| DEBUG | `Removed on-demand candidate ns/name (uid=uid)` | Pod was removed from the on-demand candidate list (deletion, terminal phase, or successful placement). |
+| DEBUG † | `Pod ns/name ADDED: no admittable reservation (gpu-class=c); routing to JIT on-demand queue` | A newly-ADDED Pending pod has no reservation open now or opening within `ONDEMAND_HORIZON_MINUTES`; it is JIT-eligible and becomes an on-demand candidate. |
+| INFO | `On-demand candidate: pod ns/name (uid=uid, gpu-class=c, gpus=N, min-runtime=Ns)` | Pod has been registered as a JIT on-demand candidate. |
+| INFO † | `On-demand candidate ns/name deleted before a lease was granted (gpu-class=c, gpus=N, min-runtime=Ns, submitted=<time>, deleted=<time>, waited=Ns)` | An on-demand candidate was deleted from Kubernetes before the controller could secure a lease for it — unmet demand. |
+| DEBUG | `Removed on-demand candidate ns/name (uid=uid)` | Pod was removed from the on-demand candidate list (deletion, terminal phase, routed to the reserved queue instead, or a lease was granted). |
 
 ---
 
-## On-demand placement
+## JIT lease request
 
-Emitted during each attempt to place an on-demand candidate onto a reclaim/no-show block.
-Sources: `app/main.py` (`_try_place_ondemand`, `_recycle_ondemand_block`, `queue_processor_loop`), `app/controller.py` (`find_ondemand_block`), `app/k8s_client.py` (`apply_toleration`, `annotate_runtime_guarantee`, `emit_runtime_guaranteed_event`).
+Emitted during each attempt to secure a lease for an on-demand candidate
+(`main._try_request_lease`, called from the pod-watch fast path and the
+queue-processor's FIFO retry pass).
+Sources: `app/main.py` (`_try_request_lease`), `app/reservation_client.py`
+(`create_ondemand_reservation`), `app/k8s_client.py` (`apply_toleration`,
+`annotate_runtime_guarantee`, `emit_runtime_guaranteed_event`).
 
 | Level | Message | Description |
 |-------|---------|-------------|
-| DEBUG † | `Selected on-demand block #N for gpu-class=c (window start–end, N/N free)` | `find_ondemand_block` chose block #N as the best fit for the current candidate; logged before returning to the caller. |
-| DEBUG | `On-demand candidate ns/name: no suitable block available; retry in N s` | No block currently meets the class, capacity, and minimum-runtime requirements; candidate remains queued. |
-| DEBUG | `On-demand candidate ns/name: safety interlock active for gpu-class=c; retry in 30 s` | On-demand placement is held for this GPU class because a reservation-holder pod is stuck Pending (guard 3). |
-| DEBUG | `On-demand candidate ns/name: scheduling conditions not yet set; retry in 30 s` | The pod's `PodScheduled` condition is not yet populated; the GPU-only-pending check cannot run yet. |
-| INFO | `On-demand candidate ns/name is <phase>; dropping` | Pod reached a terminal phase (Succeeded/Failed/Unknown) before placement; candidate is removed. |
-| INFO | `On-demand candidate ns/name: not GPU-only-pending ('…'); dropping` | Pod is Pending for a non-GPU reason; the controller's toleration cannot unblock it, so the candidate is dropped. |
-| INFO | `On-demand pod ns/name already has toleration; recording as placed on block #N` | Pod acquired the toleration by some other means; the controller records the occupancy and removes the candidate. |
-| INFO | `Placed on-demand pod ns/name onto block #N (gpu-class=c, gpus=N, block has N/N free after placement, guaranteed until <time>)` | Toleration applied successfully; pod is now on-demand-admitted under block #N with its runtime guarantee recorded. |
-| WARNING | `Failed to record runtime guarantee on on-demand pod ns/name: <exception>` | Recording the guarantee after on-demand placement failed; best-effort, toleration is not revoked. |
-| WARNING | `Error placing on-demand pod ns/name: <exception>; retry in N s` | On-demand placement failed with a transient error; optimistic occupancy record rolled back, candidate will retry. |
-| DEBUG † | `Recycling on-demand block for gpu-class=c: N candidate(s) eligible` | A pod vacated an on-demand block; N waiting candidates of the same GPU class are being considered for immediate placement. |
-| DEBUG † | `Queue processor tick: N reserved queue entr(ies), N on-demand candidate(s)` | End-of-tick summary showing how many entries remain in each queue after processing. |
+| WARNING | `Error reading on-demand candidate ns/name: <exception>; will retry` | The pod could not be re-read at the top of the attempt; candidate is kept, cooldown applied. |
+| INFO | `On-demand candidate ns/name is <phase>; dropping` | Pod reached a terminal phase (Succeeded/Failed/Unknown) before a lease was requested; candidate is removed. |
+| INFO | `On-demand candidate ns/name: not GPU-only-pending ('…'); dropping` | Pod is Pending for a non-GPU reason; the controller's toleration cannot unblock it, so the candidate is dropped (guard 1). |
+| DEBUG | `On-demand candidate ns/name: scheduling conditions not yet set; retry shortly` | The pod's `PodScheduled` condition is not yet populated; the GPU-only-pending check cannot run yet (guard 1). |
+| DEBUG | `On-demand candidate ns/name: safety interlock active for gpu-class=c; retry shortly` | Lease requests are held for this GPU class because a reservation-holder pod is stuck Pending (guard 3). |
+| WARNING | `On-demand candidate ns/name: gpu-class=c has no known id; retry later` | The pod's `gpu-class` label has no entry in `gpu_class_ids`; cannot build a lease request yet. |
+| INFO | `On-demand lease request denied for pod ns/name (gpu-class=c, gpus=N); retrying later` | `POST /api/reservations` returned a denial (409/error); candidate cools down 2–5 min. |
+| INFO | `On-demand lease #N granted for pod ns/name (gpu-class=c, gpus=N, duration=Ns)` | A lease was granted; the controller is about to admit the pod under it. |
+| WARNING | `Admission failed after granting lease #N for pod ns/name; issuing compensating cancel` | The pod could not actually be admitted under the granted lease (budget race, transient patch error, or the pod going terminal); a compensating cancel is issued and the lease is dropped from state. |
+| — | *(shares the reserved-path admission log lines below — "Applied toleration…", "Recorded runtime guarantee…", "Emitted RuntimeGuaranteed event…" — via `_try_apply_toleration`)* | Successful admission under a granted lease reuses the exact same admission path and log lines as any reserved-path pod. |
 
 ---
 
@@ -157,20 +166,6 @@ Sources: `app/k8s_client.py` (`remove_scheduling_gate`), `app/main.py`
 
 ---
 
-## On-demand capacity — reclaim-block merging
-
-Emitted during the reclaim-block merge lifecycle.
-Source: `app/controller.py` (`reconcile_reclaim_merges`).
-
-| Level | Message | Description |
-|-------|---------|-------------|
-| INFO | `Merged reclaim block(s) [N, …] into subject reservation #N (gpu-class=c, gpu_count=N); window extended to <time>` | New future reclaim block(s) have been absorbed into a subject block; the subject's effective window is now longer, extending on-demand pod runtime guarantees. |
-| DEBUG † | `Re-applied reclaim merge: subject #N extended to <time> (absorbed: [N, …])` | A previously-created merge survived a reservation reload and has been re-applied to the freshly loaded reservation objects. |
-| INFO † | `Reclaim merge for subject #N dropped: reservation no longer active or window ended` | A persisted merge was discarded because its subject reservation is gone or the entire merged span has ended. |
-| INFO † | `Reclaim merge for subject #N: absorbed block(s) [N, …] no longer active; merge dropped` | A persisted merge was discarded because one or more of its absorbed reclaim blocks were preempted (no longer in the active list). |
-
----
-
 ## On-demand safety interlock (guard 3)
 
 Emitted when the safety interlock protecting reservation-holder pods is toggled.
@@ -178,8 +173,8 @@ Source: `app/main.py` (`queue_processor_loop`).
 
 | Level | Message | Description |
 |-------|---------|-------------|
-| WARNING | `Safety interlock activated for gpu-class=c: N reservation-holder pod(s) stuck Pending (ns/name, …); on-demand placement for this class held` | One or more holder pods are stuck Pending on this GPU class; on-demand placement is suspended for the class until they schedule. |
-| INFO | `Safety interlock cleared for gpu-class=c: on-demand placement resumed` | All holder pods for this GPU class have scheduled; on-demand placement is re-enabled. |
+| WARNING | `Safety interlock activated for gpu-class=c: N reservation-holder pod(s) stuck Pending (ns/name, …); on-demand placement for this class held` | One or more holder pods are stuck Pending on this GPU class; JIT lease requests are suspended for the class until they schedule. |
+| INFO | `Safety interlock cleared for gpu-class=c: on-demand placement resumed` | All holder pods for this GPU class have scheduled; JIT lease requests are re-enabled. |
 
 ---
 
@@ -198,14 +193,9 @@ running past their runtime guarantee. Sources: `app/main.py`
 | WARNING | `Preemption sweep boundary=<time> phase=A/B: N GPU(s) of gpu-class=c still short after preempting all eligible overstayers` | Even after preempting every eligible past-guarantee pod of this class, demand could not be fully covered — a signal that no in-hour recovery exists beyond this sweep (see README's *Runtime guarantees and demand-driven preemption*). |
 | INFO | `Preempting pod ns/name (gpu-class=c, gpus=N): <message>` | About to delete a selected victim; `<message>` explains the overstay duration and which boundary's demand triggered it. |
 | INFO | `Emitted Preempted event for pod ns/name` | A `Preempted` Kubernetes event has been created on the pod, immediately before deletion. |
-| INFO | `Deleted pod ns/name` | Pod deletion succeeded (shared log line with cancellation/owner-change eviction and take-back grant deletions — see *Kubernetes API traces*). |
+| INFO | `Deleted pod ns/name` | Pod deletion succeeded (shared log line with cancellation/owner-change eviction — see *Kubernetes API traces*). |
 | WARNING | `Could not emit Preempted event for pod ns/name: <exception>` | Best-effort event emission failed; pod deletion will still be attempted. |
 | WARNING | `Could not delete pod ns/name: <exception>` | Pod deletion failed; the pod will persist until manually removed or the next sweep. |
-
-Take-back grants (`POST /api/reservations/take-back`) reuse the same
-`_preempt_pod` path and log lines above for any past-guarantee pod deleted as
-part of a grant — there is no separate log line distinguishing a sweep-driven
-preemption from a take-back-driven one beyond the message text.
 
 ---
 
@@ -217,7 +207,7 @@ Source: `app/controller.py` (`record_placement`, `release_pod`, `reconcile_occup
 | Level | Message | Description |
 |-------|---------|-------------|
 | DEBUG | `Recorded placement: reservation #N ← pod uid=uid (N GPU(s)); N/N free` | A pod's GPU allocation has been recorded in the in-memory occupancy map; shows remaining free capacity on the reservation. |
-| INFO | `Released slot: reservation #N ← pod uid=uid freed N GPU(s)` | A pod has vacated its slot; GPU capacity on the reservation is freed. |
+| INFO | `Released capacity: reservation #N ← pod uid=uid freed N GPU(s)` | A pod has vacated its slot; GPU capacity on the reservation is freed. |
 | INFO † | `Occupancy reconciled: N reservation(s), N GPU(s) in use (was N)` | The occupancy map was rebuilt from the live cluster snapshot and the GPU-in-use count changed — a missed watch event was self-healed. |
 | DEBUG † | `Occupancy reconciled: N reservation(s), N GPU(s) in use` | Steady-state occupancy reconciliation; count matches the previous tick. |
 
@@ -240,7 +230,7 @@ Low-level traces of every outbound Kubernetes API call.  Visible only at
 | DEBUG | `k8s: create_namespaced_event ns (pod=name, reason=ReservationCancelled)` | About to create a `ReservationCancelled` event on the pod. |
 | DEBUG † | `k8s: list_node (gpu capacity snapshot)` | About to LIST all nodes to compute physical GPU capacity per class (`snapshot_node_gpu_capacity`). |
 | DEBUG † | `k8s: node gpu capacity snapshot: {class: N, …}` | Node LIST completed; shows total allocatable GPUs summed per `gpu-class-reservation` taint value. |
-| DEBUG | `k8s: delete_namespaced_pod ns/name` | About to DELETE a pod (reservation cancellation eviction, preemption sweep, or take-back grant). |
+| DEBUG | `k8s: delete_namespaced_pod ns/name` | About to DELETE a pod (reservation cancellation eviction, owner-change eviction, or preemption sweep). |
 | INFO | `Deleted pod ns/name` | Pod deletion succeeded. |
 | DEBUG | `Pod ns/name already gone (404)` | DELETE returned 404; pod had already been removed. |
 | INFO | `Emitted ReservationCancelled event for pod ns/name` | `ReservationCancelled` event created on the pod. |

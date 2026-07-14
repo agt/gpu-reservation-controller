@@ -32,10 +32,8 @@ class TestParseBookingReference:
         "reference,expected",
         [
             ("res-42", 42),
-            ("ondemand-42", 42),
-            ("noshow-42", 42),
             ("res-0", 0),
-            ("ondemand-1000000", 1000000),
+            ("res-1000000", 1000000),
         ],
     )
     def test_valid_prefixes(self, reference, expected):
@@ -43,7 +41,7 @@ class TestParseBookingReference:
 
     @pytest.mark.parametrize(
         "reference",
-        [None, "", "42", "res-", "res-abc", "unknown-42", "res_42", "noshow-12x"],
+        [None, "", "42", "res-", "res-abc", "unknown-42", "res_42", "ondemand-42", "noshow-42"],
     )
     def test_unparseable_returns_none(self, reference):
         assert parse_booking_reference(reference) is None

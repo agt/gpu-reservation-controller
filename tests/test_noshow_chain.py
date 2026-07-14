@@ -1,8 +1,8 @@
 """Unit tests for chain-aware no-show protection (the #3 double-count fix).
 
 Covers refresh_claimed_reservations and the claimed-set guards added to
-check_noshow_deadlines, update_noshow_tracking, find_ondemand_block, and the
-chain-aware branch of mark_pod_seen_for_noshow.
+check_noshow_deadlines, update_noshow_tracking, and the chain-aware branch of
+mark_pod_seen_for_noshow.
 
 No Kubernetes or HTTP calls are made.
 """
@@ -15,7 +15,7 @@ from app.schemas import GpuClassBrief, ReservationResponse, UserBrief
 
 from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, USERNAME
 from tests.conftest import make_state as _state
-from tests.conftest import reclaim_reservation as _ondemand_reservation
+from tests.conftest import reclaim_reservation as _reclaim_reservation
 from tests.conftest import user_reservation as _user_reservation
 
 NOW = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)  # 1 h into res #1's 08:00–10:00 UTC window
@@ -120,6 +120,7 @@ class TestCheckNoshowDeadlinesRespectsClaimed:
         state.claimed_reservation_ids = {1}
         state.check_noshow_deadlines(NOW)
         assert 1 not in state.noshow_reservation_ids
+        assert 1 not in state.pending_noshow_cancels  # never queued for a cancel
         assert 1 in state.noshow_deadlines  # left intact for when it unclaims
 
     def test_unclaimed_expired_still_declared(self):
@@ -151,28 +152,6 @@ class TestUpdateNoshowTrackingSkipsClaimed:
 
 
 # ---------------------------------------------------------------------------
-# find_ondemand_block excludes claimed (defense in depth)
-# ---------------------------------------------------------------------------
-
-
-class TestFindOndemandBlockExcludesClaimed:
-    def test_claimed_noshow_block_not_lent(self):
-        r = _user_reservation(1)
-        state = _state(r)
-        state.noshow_reservation_ids.add(1)  # declared no-show...
-        state.claimed_reservation_ids = {1}  # ...but a chained holder occupies it
-        assert state.find_ondemand_block(GPU_CLASS_LABEL, NOW, 1, 1) is None
-
-    def test_unclaimed_noshow_block_is_lent(self):
-        r = _user_reservation(1)
-        state = _state(r)
-        state.noshow_reservation_ids.add(1)
-        result = state.find_ondemand_block(GPU_CLASS_LABEL, NOW, 1, 1)
-        assert result is not None
-        assert result.id == 1
-
-
-# ---------------------------------------------------------------------------
 # mark_pod_seen_for_noshow — chain-aware branch
 # ---------------------------------------------------------------------------
 
@@ -189,8 +168,8 @@ class TestMarkPodSeenChainAware:
         assert 1 not in state.noshow_deadlines
         assert 2 not in state.noshow_deadlines
 
-    def test_ondemand_booking_clears_nothing(self):
-        state = _state(_ondemand_reservation(1))
+    def test_reclaim_booking_clears_nothing(self):
+        state = _state(_reclaim_reservation(1))
         state.noshow_deadlines[1] = datetime(2099, 1, 1, tzinfo=timezone.utc)
         state.mark_pod_seen_for_noshow(USERNAME, GPU_CLASS_LABEL, booking_reservation_id=1)
         assert 1 in state.noshow_deadlines  # squatter vouches for nothing
@@ -230,8 +209,6 @@ class TestChainedHolderBlocksNoshowConversion:
         state.check_noshow_deadlines(NOW)
 
         assert 2 not in state.noshow_reservation_ids
-        # And res 2 is not offered as an on-demand block while claimed.
-        assert state.find_ondemand_block(GPU_CLASS_LABEL, NOW, 1, 1) is None
 
     def test_window_converts_once_holder_gone(self):
         state = _state(

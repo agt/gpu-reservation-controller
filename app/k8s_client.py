@@ -144,55 +144,35 @@ def get_pod_booking_reference(pod) -> Optional[str]:
     return annotations.get("horae/booking-reference")
 
 
-# Booking-reference "kinds": the prefix recorded in a horae/booking-reference
-# value.  All three embed the reservation id the pod was admitted under; the
-# kind records which path admitted it (reserved / on-demand / no-show) and is
-# otherwise cosmetic.  Construction (make_booking_reference) and parsing
-# (parse_booking_reference) live together so a new admission path or a renamed
-# prefix cannot silently break occupancy reconstruction (CODE-REVIEW D2).
-BOOKING_KIND_RESERVED = "res"
-BOOKING_KIND_ONDEMAND = "ondemand"
-BOOKING_KIND_NOSHOW = "noshow"
-
-_BOOKING_REFERENCE_PREFIXES = (
-    f"{BOOKING_KIND_RESERVED}-",
-    f"{BOOKING_KIND_ONDEMAND}-",
-    f"{BOOKING_KIND_NOSHOW}-",
-)
+# Prefix recorded in a horae/booking-reference value.  Every admitted pod is a
+# real reservation now (the lease model requests one just-in-time rather than
+# placing onto an ad-hoc block), so there is only one kind.  Construction
+# (make_booking_reference) and parsing (parse_booking_reference) live together
+# so a renamed prefix cannot silently break occupancy reconstruction.
+_BOOKING_REFERENCE_PREFIX = "res-"
 
 
-def make_booking_reference(kind: str, reservation_id: int) -> str:
+def make_booking_reference(reservation_id: int) -> str:
     """Build a ``horae/booking-reference`` value for *reservation_id*.
 
-    *kind* is one of ``BOOKING_KIND_RESERVED`` / ``BOOKING_KIND_ONDEMAND`` /
-    ``BOOKING_KIND_NOSHOW``; the result round-trips through
-    ``parse_booking_reference``.
+    The result round-trips through ``parse_booking_reference``.
     """
-    return f"{kind}-{reservation_id}"
-
-
-def is_reserved_path(reference: Optional[str]) -> bool:
-    """Return True if *reference* was written by the reserved (holder) path."""
-    return bool(reference) and reference.startswith(f"{BOOKING_KIND_RESERVED}-")
+    return f"{_BOOKING_REFERENCE_PREFIX}{reservation_id}"
 
 
 def parse_booking_reference(reference: Optional[str]) -> Optional[int]:
     """Extract the reservation id embedded in a ``horae/booking-reference`` value.
 
-    ``"res-42"`` / ``"ondemand-42"`` / ``"noshow-42"`` all return ``42``.
-    Returns ``None`` for an unrecognised prefix, a non-integer suffix, or
-    ``None``/empty input.  This is the single key used to reconstruct occupancy
-    from the cluster, so it must accept every prefix ``apply_toleration`` writes.
+    ``"res-42"`` returns ``42``.  Returns ``None`` for an unrecognised prefix,
+    a non-integer suffix, or ``None``/empty input.  This is the single key
+    used to reconstruct occupancy from the cluster.
     """
-    if not reference:
+    if not reference or not reference.startswith(_BOOKING_REFERENCE_PREFIX):
         return None
-    for prefix in _BOOKING_REFERENCE_PREFIXES:
-        if reference.startswith(prefix):
-            try:
-                return int(reference[len(prefix):])
-            except ValueError:
-                return None
-    return None
+    try:
+        return int(reference[len(_BOOKING_REFERENCE_PREFIX):])
+    except ValueError:
+        return None
 
 
 def pod_has_toleration(pod, key: str, value: str, effect: str) -> bool:
@@ -637,10 +617,9 @@ async def emit_preempted_event(
 ) -> None:
     """Create a Kubernetes Event linked to *pod* with reason='Preempted'.
 
-    Emitted when the preemption sweep or a take-back grant deletes a pod
-    running past its runtime guarantee to recover capacity.  The caller builds
-    *message* (it knows whether the trigger was boundary demand or a
-    take-back grant, and how long the pod overstayed).
+    Emitted when the preemption sweep deletes a pod running past its runtime
+    guarantee to recover capacity.  The caller builds *message* (it knows how
+    long the pod overstayed).
     """
     await _emit_pod_event(
         pod,
@@ -737,44 +716,6 @@ async def emit_overstay_relinked_event(
     )
     log.info(
         "Emitted OverstayRelinked event for pod %s/%s (reservation=#%d, until=%s)",
-        namespace,
-        pod_name,
-        reservation_id,
-        until_str,
-    )
-
-
-async def emit_ondemand_upgraded_event(
-    pod,
-    pod_name: str,
-    namespace: str,
-    reservation_id: int,
-    guaranteed_until: datetime,
-) -> None:
-    """Create a Kubernetes Event linked to *pod* with reason='OnDemandUpgraded'.
-
-    Emitted when an on-demand pod, still within its own on-demand guarantee, is
-    proactively re-linked to a reservation the same user has since booked —
-    distinct from ``OverstayRelinked`` (which rescues a pod already past
-    guarantee): here the pod was never overstay, it is simply upgraded from
-    opportunistic on-demand placement to a guaranteed reservation as soon as
-    one becomes available.
-    """
-    until_str = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
-    await _emit_pod_event(
-        pod,
-        pod_name,
-        namespace,
-        name_prefix="gpu-upgrade-",
-        reason="OnDemandUpgraded",
-        action="UpgradePod",
-        message=(
-            f"Pod upgraded from on-demand placement to GPU reservation "
-            f"#{reservation_id}. GPU access now guaranteed until {until_str}."
-        ),
-    )
-    log.info(
-        "Emitted OnDemandUpgraded event for pod %s/%s (reservation=#%d, until=%s)",
         namespace,
         pod_name,
         reservation_id,

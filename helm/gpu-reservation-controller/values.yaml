@@ -52,11 +52,23 @@ config:
   # Port for the GET /health liveness endpoint.
   healthPort: 8000
 
-  # Enable on-demand pod placement (set to false to disable).
+  # Enable JIT on-demand reservation requests for pending pods with no open
+  # reservation window (set to false to disable).
   ondemandPlacementEnabled: true
 
+  # Reserved-match horizon (minutes) for the JIT trigger: a pod is queued for
+  # its own reservation when one opens now or within this many minutes and has
+  # budget; otherwise, if the pod is JIT-eligible, the controller requests an
+  # on-demand lease instead of waiting.
+  ondemandHorizonMinutes: 30
+
+  # Minutes added to a pod's horae/minimum-runtime-seconds annotation when
+  # sizing the duration of a requested JIT lease.
+  ondemandLeaseBufferMinutes: 10
+
   # Minutes after a reservation window opens before the holder is declared a
-  # no-show and the block is opened to on-demand pods.
+  # no-show and the controller durably cancels it app-side, freeing the
+  # window for re-booking.
   noshownTimeoutMinutes: 15
 
   # Grace period (minutes) after controller startup before no-shows are
@@ -92,11 +104,9 @@ config:
   # needs capacity freed, and whether any just-expired blocks need cleanup).
   preemptionCheckInterval: 60
 
-  # Re-link a pod to a reservation the same user has since booked: rescues an
-  # overstay pod (one running past its runtime guarantee) so it is no longer
-  # eligible for preemption, and proactively upgrades a within-guarantee
-  # on-demand pod to a guaranteed reservation as soon as one is open, rather
-  # than waiting for it to overstay.  Set to false to disable both.
+  # Re-link an overstay pod (one running past its runtime guarantee) to a
+  # reservation the same user has since booked, so it is no longer eligible
+  # for preemption.  Set to false to disable.
   podAdoptionEnabled: true
 
 # ---------------------------------------------------------------------------

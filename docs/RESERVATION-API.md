@@ -5,9 +5,13 @@ This document covers every endpoint needed to build two external daemons:
 - **Kubernetes controller** — reads active reservations and manages pod
   scheduling by injecting GPU-reservation tolerations and recording each
   admitted pod's runtime guarantee (informational annotations only — no
-  `activeDeadlineSeconds` is set).  Capacity is instead recovered from
-  overstaying pods on demand, only when an incoming reservation needs it; see
-  the controller's README for the demand-driven preemption model.
+  `activeDeadlineSeconds` is set).  Capacity is recovered from overstaying
+  pods on demand, only when an incoming reservation needs it (see the
+  controller's README for the demand-driven preemption model).  A pod with no
+  reservation open now or opening soon gets one just-in-time: the controller
+  requests a short on-demand booking on the pod's behalf
+  (`POST /api/reservations`) rather than being placed onto ad-hoc spare
+  capacity, so on-demand jobs are ordinary reservations start to finish.
 - **Roster sync daemon** — provisions user accounts and manages usage-group
   membership from an institutional directory.
 
@@ -273,26 +277,13 @@ and is provided for convenience filtering. `su_cost` is the total Service Units 
 booking consumes, computed at creation from the GPU class base rate
 (`su_rate_per_hour`) and the active discount schedules.
 
-### Reservation kinds and the reclaim filter
+### Reservation kinds
 
-Every reservation has a `kind` field: `"booking"` (a normal user reservation) or
-`"reclaim"` (an admin-only capacity hold created by the GPU recovery task or
-manually by an admin). Reclaim reservations have `user_id = null` and
-`group_id = null` — they carry no user or group attribution.
-
-By default `GET /api/reservations` **excludes** reclaim reservations for all
-`status` values except `"all"`:
-
-| `status` query param | booking rows | reclaim rows |
-|----------------------|-------------|--------------|
-| `active` (default)   | ✓           | ✗            |
-| `cancelled`          | ✓           | ✗            |
-| `all`                | ✓           | ✓            |
-
-The Kubernetes controller can use reclaim reservations to detect idle capacity
-that the recovery task has claimed for opportunistic scheduling. To see them,
-add `status=all` to the query; then filter on `kind == "reclaim"` to separate
-them from cancelled user bookings.
+Every reservation has a `kind` field, currently always `"booking"` — a normal
+reservation, whether booked directly by a user or requested just-in-time by
+the Kubernetes controller on a pending pod's behalf (`on_demand=True`, see
+below).  There is no separate ad-hoc capacity-hold type; the controller does
+not need to special-case `kind` at all.
 
 ### Reading the reservation time window
 
@@ -382,32 +373,54 @@ controller skips reservations for such classes.
 All gpu-class **write** endpoints (`POST`/`PUT`/`DELETE` and the
 `/overrides` sub-resource) require an admin JWT.
 
-### `GET /api/settings`
+### `POST /api/reservations`
 
-Public (no authentication required). Besides the UI fields, the response carries
-two read-only, env-driven values the controller can use to interpret reclaim
-capacity holds:
+Create an on-demand booking on behalf of a user — the just-in-time (JIT)
+counterpart to a normal front-end booking. The Kubernetes controller calls
+this for a pending pod that has no reservation open now or opening soon,
+sized to just outlast the pod's declared minimum runtime.
+
+**Body**
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `reclaim_window_minutes` | integer | How far ahead (minutes) the app tiles reclaim holds onto idle capacity (`0` = recovery disabled). |
-| `reclaim_preempt_guard_minutes` | integer | Lead time (minutes) before a reclaim hold's start within which the app treats it as **hard** capacity: a hold whose start is inside this guard will not be preempted by a new booking, so it is safe for the controller to schedule onto. A hold further out than the guard may be cancelled (preempted) by a real booking at any time. |
+| `username` | string | Owner of the new booking (the pod's namespace) |
+| `group_name` | string \| null | Usage group name (from the pod's usage-group label, when the controller has `REQUIRED_GROUP_LABEL` configured); `null` when the deployment has no group constraint |
+| `gpu_class_id` | integer | Target GPU class |
+| `gpu_count` | integer | GPUs requested |
+| `duration_seconds` | integer | Booking length; the controller sends the pod's declared minimum runtime plus a fixed buffer |
+| `on_demand` | boolean | Always `true` for this endpoint; relaxes **policy** limits (SU balance, per-user/group caps, minimum-duration floor) — it never relaxes physical calendar capacity. A request that cannot fit the actual schedule is denied like any other booking. |
+| `idempotency_key` | string | The admitting pod's Kubernetes UID. A repeated request with the same key returns the **original** reservation rather than creating a duplicate — safe for the controller to retry after a network error without double-booking. |
 
-How the controller should read these: a reclaim row (`kind == "reclaim"`, see
-§"Reservation kinds and the reclaim filter") whose `start_utc` is more than
-`reclaim_preempt_guard_minutes` away may still be preempted and should be treated
-as opportunistic/cancellable; once it is within the guard it is committed capacity.
-The guard is sized to comfortably exceed the controller's reservation poll
-interval, so a preempted hold always leaves the controller's view before it would
-be scheduled onto — no explicit coordination is needed.
+The server anchors `start_utc` at its own current time (avoiding controller/app
+clock skew) and computes `end_utc = start_utc + duration_seconds`.
 
-A within-guard block is committed *by default*, but not unconditionally: a
-controller that implements the take-back API (`POST /api/reservations/take-back`)
-may cede a specific idle within-guard block on request, at which point the app is
-free to book over it. This turns the guard's one-way promise into a handshake —
-see the take-back API's own documentation for the request/response contract. A
-controller that does not implement take-back is unaffected: it never receives
-such a request, and the guard's original one-way promise still holds.
+**Response** `201` — the created [ReservationResponse](#reservationresponse)
+(`kind: "booking"`, `status: "active"`).
+
+**Errors**
+
+| Code | Condition |
+|------|-----------|
+| 409 | No physical capacity for the requested window, or a policy limit `on_demand` does not relax (e.g. GPU class inactive) blocks it. Body carries a JSON `detail` describing the reason. |
+
+### `POST /api/reservations/{id}/cancel`
+
+Cancel a reservation, recording why. Used by the controller for two distinct
+outcomes:
+
+| `reason` | Meaning |
+|----------|---------|
+| `"no-show"` | The reservation's holder never appeared before the no-show deadline; recorded for no-show-penalty accounting per the institution's policy. |
+| `"controller-revoked"` | A JIT on-demand booking was granted but the pod could not actually be admitted (a transient Kubernetes error, or the pod finished/vanished first); the controller compensates by cancelling the lease it just requested. |
+
+**Path parameter:** `id` — integer (`reservation.id`)
+
+**Body:** `{"reason": "no-show" | "controller-revoked"}`
+
+**Response** `200` — idempotent: cancelling an already-cancelled reservation
+also returns `200` (no error on a retried or racing cancel). `404` if the id
+does not exist.
 
 ---
 
@@ -787,10 +800,10 @@ Returned by `GET /api/groups/{group_id}/members`.
 | Field | Type | Notes |
 |-------|------|-------|
 | `id` | integer | |
-| `user_id` | integer \| null | Booking user; `null` for `kind="reclaim"` |
-| `user` | UserBrief \| null | `null` for `kind="reclaim"` |
-| `group_id` | integer \| null | `null` for `kind="reclaim"` |
-| `group` | GroupBrief \| null | `null` for `kind="reclaim"` |
+| `user_id` | integer \| null | Booking user |
+| `user` | UserBrief \| null | |
+| `group_id` | integer \| null | |
+| `group` | GroupBrief \| null | |
 | `gpu_class_id` | integer | |
 | `gpu_class` | `{id, name, label_value}` | |
 | `start_dt` | datetime (local, no suffix) | Reservation start in site-local wall-clock; may cross midnight |
@@ -800,7 +813,7 @@ Returned by `GET /api/groups/{group_id}/members`.
 | `end_utc` | string (ISO 8601, `Z`) | Reservation end converted to UTC; the controller uses this to compute a pod's runtime guarantee (no `activeDeadlineSeconds` is set) |
 | `gpu_count` | integer | Number of GPUs reserved |
 | `su_cost` | number | Total Service Units consumed (stored at creation) |
-| `kind` | `"booking"` \| `"reclaim"` | `"booking"` = normal user reservation; `"reclaim"` = admin-only capacity hold |
+| `kind` | `"booking"` | Currently always `"booking"` — includes JIT on-demand reservations created via `POST /api/reservations` |
 | `status` | `"active"` \| `"cancelled"` | |
 | `notes` | string \| null | Free-text note from the user |
 | `submitted_by_id` | integer \| null | User ID of the authenticated caller (differs from `user_id` when a manager books on behalf of a member) |

@@ -23,8 +23,10 @@ class Config:
     inbound_api_token: Optional[str]  # bearer token for the inbound push API; None = endpoint disabled
     preemption_lead_minutes: int   # lead time before a slot boundary for phase-A preemption
     preemption_check_interval: int  # seconds between preemption sweeps
-    pod_adoption_enabled: bool = True  # re-link overstay/on-demand pods to a user's new booking
+    pod_adoption_enabled: bool = True  # re-link overstay pods to a user's new booking
     required_group_label: Optional[str] = None  # pod label naming the usage group to match; None = disabled
+    ondemand_horizon_minutes: int = 30    # JIT trigger: reserved-match horizon before requesting a lease
+    ondemand_lease_buffer_minutes: int = 10  # added to a pod's minimum-runtime when sizing a JIT lease
     log_level: str = "INFO"        # root log level (LOG_LEVEL)
 
     @classmethod
@@ -82,5 +84,11 @@ class Config:
                 "POD_ADOPTION_ENABLED", "true"
             ).lower()
             not in ("false", "0", "no"),
+            ondemand_horizon_minutes=int(
+                os.environ.get("ONDEMAND_HORIZON_MINUTES", "30")
+            ),
+            ondemand_lease_buffer_minutes=int(
+                os.environ.get("ONDEMAND_LEASE_BUFFER_MINUTES", "10")
+            ),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
         )
