@@ -10,7 +10,9 @@ Implements only the endpoints the controller needs:
 
 from __future__ import annotations
 
+import enum
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -25,6 +27,37 @@ from .schemas import (
 )
 
 log = logging.getLogger(__name__)
+
+
+class RenewalOutcome(enum.Enum):
+    """Outcome of a ``POST /api/reservations/{id}/renew`` call.
+
+    Distinguishes the four cases the renewal loop must act on differently
+    (unlike ``create_ondemand_reservation``'s simple ``None``-on-failure), per
+    the app's documented status codes:
+
+    - ``RENEWED``       — 200: extended (or an idempotent no-op when the lease
+                          already covers the target); carries the updated row.
+    - ``DENIED``        — 409: renewable but infeasible right now (capacity / SU
+                          / pool) — the cue to let the job checkpoint.
+    - ``NOT_RENEWABLE`` — 400/404: not an on-demand lease, already cancelled,
+                          already ended, or unknown id — retrying will not help.
+    - ``ERROR``         — network failure / other non-2xx / unparseable payload —
+                          transient, safe to retry on a later sweep.
+    """
+
+    RENEWED = "renewed"
+    DENIED = "denied"
+    NOT_RENEWABLE = "not_renewable"
+    ERROR = "error"
+
+
+@dataclass
+class RenewalResult:
+    """The typed result of ``ReservationClient.renew_reservation``."""
+
+    outcome: RenewalOutcome
+    reservation: Optional[ReservationResponse] = None
 
 
 class ReservationClient:
@@ -180,6 +213,66 @@ class ReservationClient:
                 exc,
             )
             return None
+
+    async def renew_reservation(self, reservation_id: int) -> RenewalResult:
+        """Renew (chain) an on-demand lease, extending its guaranteed block in place.
+
+        Posts to ``/api/reservations/{id}/renew`` (no body); the app extends the
+        lease's ``end_dt`` to ``ceil_to_hour(now) + 1h`` and returns the updated
+        row.  Returns a :class:`RenewalResult` classifying the outcome so the
+        caller can renew-and-re-annotate (200), warn-and-checkpoint (409), or
+        drop the lease (400/404); a transient failure (network / other non-2xx /
+        parse error) maps to ``ERROR`` for a later retry.
+
+        Idempotent within a clock hour: a repeat call in the same hour returns
+        the same lease (still a 200 ``RENEWED``), so a re-attempt is harmless.
+        """
+        try:
+            resp = await self._client.post(
+                f"/api/reservations/{reservation_id}/renew",
+                timeout=15.0,
+            )
+        except httpx.RequestError as exc:
+            log.warning(
+                "On-demand lease renewal failed for reservation #%d: %s",
+                reservation_id,
+                exc,
+            )
+            return RenewalResult(RenewalOutcome.ERROR)
+
+        if resp.status_code == 409:
+            log.info(
+                "On-demand lease renewal denied for reservation #%d: no capacity/budget",
+                reservation_id,
+            )
+            return RenewalResult(RenewalOutcome.DENIED)
+        if resp.status_code in (400, 404):
+            log.info(
+                "On-demand lease #%d not renewable: HTTP %s",
+                reservation_id,
+                resp.status_code,
+            )
+            return RenewalResult(RenewalOutcome.NOT_RENEWABLE)
+        try:
+            resp.raise_for_status()
+            return RenewalResult(
+                RenewalOutcome.RENEWED,
+                ReservationResponse.model_validate(resp.json()),
+            )
+        except httpx.HTTPStatusError as exc:
+            log.warning(
+                "On-demand lease renewal for reservation #%d returned HTTP %s",
+                reservation_id,
+                exc.response.status_code,
+            )
+            return RenewalResult(RenewalOutcome.ERROR)
+        except (ValidationError, ValueError) as exc:
+            log.warning(
+                "Could not parse renewal response for reservation #%d: %s",
+                reservation_id,
+                exc,
+            )
+            return RenewalResult(RenewalOutcome.ERROR)
 
     async def cancel_reservation(self, reservation_id: int, reason: str) -> bool:
         """Cancel *reservation_id* (no-show or controller-revoked); True on success.

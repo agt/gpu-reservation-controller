@@ -259,6 +259,20 @@ plans any kills (so a just-re-booked pod is never a victim) and once per
 queue-processor tick. Re-linked pods get a Kubernetes Event with reason
 `OverstayRelinked`.
 
+**Renewing on-demand leases** (`LEASE_RENEWAL_ENABLED`, default on). An
+on-demand lease is fixed-length; left alone its pod would run out its window
+and be preempted or expire. As a lease nears the end of its guaranteed block —
+within `LEASE_RENEWAL_LEAD_MINUTES` (default 15) of now — the `renewal_loop`
+(every `LEASE_RENEWAL_CHECK_INTERVAL` s, default 60) asks the app to renew it
+in place via `POST /api/reservations/{id}/renew`. A grant extends the lease to
+`ceil_to_hour(now) + 1h` (1–2 h of hour-aligned runway) keeping the **same
+reservation id**, so pod matching and occupancy are unchanged and the runtime
+guarantee grows with the new end; the pod gets a `LeaseRenewed` Kubernetes
+Event. If the app can't renew for lack of capacity or budget (HTTP 409), the
+controller emits a `RenewalDenied` Event **once** — the user's cue to
+checkpoint before the lease ends — and does not keep retrying that lease. Only
+on-demand leases with a live pod are renewed; ordinary bookings are untouched.
+
 ---
 
 ## Prerequisites
@@ -317,13 +331,17 @@ All settings are supplied via environment variables.
 | `PREEMPTION_LEAD_MINUTES` | no | `15` | Minutes before a reservation slot boundary that phase-A preemption runs, proactively freeing capacity from overstaying pods |
 | `PREEMPTION_CHECK_INTERVAL` | no | `60` | Seconds between preemption sweeps |
 | `POD_ADOPTION_ENABLED` | no | `true` | Re-link an overstay pod to a reservation its user has since booked. Set to `false` to disable |
+| `LEASE_RENEWAL_ENABLED` | no | `true` | Renew (chain) on-demand leases as they near expiry so a running job keeps its GPUs, or is warned to checkpoint when capacity is unavailable. Set to `false` to disable |
+| `LEASE_RENEWAL_LEAD_MINUTES` | no | `15` | Renew an on-demand lease whose guaranteed block ends within this many minutes of now |
+| `LEASE_RENEWAL_CHECK_INTERVAL` | no | `60` | Seconds between lease-renewal sweeps |
 | `REQUIRED_GROUP_LABEL` | no | *(absent)* | Pod label naming the usage group a pod belongs to (e.g. `dsmlp/course`). When set, the pod's value for this label must equal the reservation's group name — an additional match constraint alongside `gpu-class` — before the controller admits it, adopts it, or chain-extends its guarantee; a pod without the label is also never JIT-eligible. Unset disables the group constraint |
 | `LOG_LEVEL` | no | `INFO` | Python logging level for the controller |
 
 > **Security note:** The controller needs a **`read_write`**-scoped service
 > key: besides the read endpoints (`/api/reservations`, `/api/gpu-classes`),
-> it calls `POST /api/reservations` (JIT lease requests) and
-> `POST /api/reservations/{id}/cancel` (no-show / controller-revoked cancels).
+> it calls `POST /api/reservations` (JIT lease requests),
+> `POST /api/reservations/{id}/cancel` (no-show / controller-revoked cancels),
+> and `POST /api/reservations/{id}/renew` (on-demand lease renewals).
 > Always inject the key from a Kubernetes Secret rather than baking it into an
 > image or ConfigMap.
 
@@ -577,7 +595,7 @@ python manage_service_keys.py revoke --name k8s-controller-prod
 gpu-reservation-controller/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py               FastAPI app + four background asyncio tasks
+│   ├── main.py               FastAPI app + five background asyncio tasks
 │   ├── config.py             Config dataclass from environment variables
 │   ├── schemas.py            Pydantic models for reservation API responses
 │   ├── reservation_client.py httpx async client for the reservation API + JIT lease create/cancel

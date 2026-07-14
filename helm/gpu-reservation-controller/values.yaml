@@ -109,6 +109,19 @@ config:
   # for preemption.  Set to false to disable.
   podAdoptionEnabled: true
 
+  # Renew (chain) an on-demand lease as it nears the end of its guaranteed
+  # block, so a still-running job keeps its GPUs when capacity exists, or is
+  # warned to checkpoint (RenewalDenied event) when it doesn't.  Set to false
+  # to disable.
+  leaseRenewalEnabled: true
+
+  # Renew an on-demand lease whose guaranteed block ends within this many
+  # minutes of now.
+  leaseRenewalLeadMinutes: 15
+
+  # Seconds between lease-renewal sweeps.
+  leaseRenewalCheckInterval: 60
+
 # ---------------------------------------------------------------------------
 # ServiceAccount and RBAC
 # ---------------------------------------------------------------------------
