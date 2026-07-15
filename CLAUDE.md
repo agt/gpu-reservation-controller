@@ -413,14 +413,9 @@ Every `LEASE_RENEWAL_CHECK_INTERVAL` s (default 60) the sweep:
 Because the app computes the renewal window from **its own** `now`
 (`ceil_to_hour(now) + 1h`), a renewal is idempotent within a clock hour and a
 granted extension pushes `end_utc` 1–2 h out — so the 15-min lead naturally
-prevents re-renewal until the lease again nears expiry.  As a belt-and-suspenders
-guard the controller also records the clock hour of each successful renewal
-(`ControllerState.renewal_last_hour`) and skips re-attempting a lease it already
-renewed **this clock hour** — a repeat would only no-op app-side.  This caps
-renew RPCs at one per lease per hour and keeps `LEASE_RENEWAL_LEAD_MINUTES` safe
-at **any** value (a large lead ≥ the app's ~1 h minimum extension can no longer
-make a just-renewed lease re-trigger every sweep).  **RBAC**: unchanged (the
-renew call is outbound HTTP; re-annotation reuses the existing pod-patch path).
+prevents re-renewal until the lease again nears expiry.  **RBAC**: unchanged
+(the renew call is outbound HTTP; re-annotation reuses the existing pod-patch
+path).
 
 ### Inbound push API
 
