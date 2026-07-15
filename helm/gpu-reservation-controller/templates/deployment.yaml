@@ -65,9 +65,11 @@ spec:
               value: {{ .Values.config.ondemandLeaseBufferMinutes | quote }}
             - name: ONDEMAND_DELEGATE_ADMISSION
               value: {{ .Values.config.ondemandDelegateAdmission | quote }}
-            - name: NOSHOWN_TIMEOUT_MINUTES
+            # Canonical spellings; the code still honors the legacy NOSHOWN_*
+            # names, so out-of-chart deployments keep working.
+            - name: NOSHOW_TIMEOUT_MINUTES
               value: {{ .Values.config.noshownTimeoutMinutes | quote }}
-            - name: NOSHOWN_GRACE_MINUTES
+            - name: NOSHOW_GRACE_MINUTES
               value: {{ .Values.config.noshownGraceMinutes | quote }}
             - name: LOG_LEVEL
               value: {{ .Values.config.logLevel | quote }}
@@ -85,6 +87,8 @@ spec:
               value: {{ .Values.config.preemptionCheckInterval | quote }}
             - name: POD_ADOPTION_ENABLED
               value: {{ .Values.config.podAdoptionEnabled | quote }}
+            - name: PREEMPTION_DELEGATE_SELECTION
+              value: {{ .Values.config.preemptionDelegateSelection | quote }}
             {{- if .Values.inboundApiTokenSecret.name }}
             # Enables the inbound reservation-push API (POST /api/reservations/push).
             # Omit the secret to leave the endpoint disabled (returns 503).

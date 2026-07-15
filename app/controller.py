@@ -30,18 +30,24 @@ log = logging.getLogger(__name__)
 def canceller_description(r: ReservationResponse) -> str:
     """Return the 'by X' fragment for a ReservationCancelled event message.
 
+    The API carries only ``cancelled_by_id`` (RESERVATION-API.md §6 — there is
+    no nested canceller object), so the best available distinction is
+    self-vs-other; a machine-readable ``cancel_reason`` (controller cancel,
+    supersede) is appended when present.
+
     Priority:
-    1. ``cancelled_by`` UserBrief present and is a different user → "by <username>"
-    2. ``cancelled_by_id`` set, differs from owner, no name available → "by another user"
-    3. Fallback → "by user" (self-cancellation or unknown canceller)
+    1. ``cancelled_by_id`` set and differs from the owner → "by another user"
+    2. Fallback → "by user" (self-cancellation or unknown canceller)
     """
-    if r.cancelled_by is not None:
-        if r.user_id is None or r.cancelled_by.id != r.user_id:
-            return f"by {r.cancelled_by.username}"
-    elif r.cancelled_by_id is not None:
-        if r.user_id is None or r.cancelled_by_id != r.user_id:
-            return "by another user"
-    return "by user"
+    if r.cancelled_by_id is not None and (
+        r.user_id is None or r.cancelled_by_id != r.user_id
+    ):
+        desc = "by another user"
+    else:
+        desc = "by user"
+    if r.cancel_reason:
+        desc += f" (reason: {r.cancel_reason})"
+    return desc
 
 # Toleration key applied by the controller.  The full toleration is:
 #   gpu-class-reservation=<gpu-class-label>:NoSchedule
@@ -152,6 +158,11 @@ class OnDemandCandidate:
     pod_created_at: datetime  # metadata.creationTimestamp; used for FIFO ordering
     next_attempt_at: datetime  # earliest time to try requesting a lease
     group_label: Optional[str] = None  # value of REQUIRED_GROUP_LABEL pod label; None when disabled
+    # Usage group the lease ask carries as its required group_name: the group
+    # label value when REQUIRED_GROUP_LABEL is on, else the pod's
+    # horae/usage-group annotation.  JIT eligibility requires it, so it is only
+    # Optional to keep dataclass field ordering.
+    usage_group: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1117,12 +1128,14 @@ class ControllerState:
         min_runtime_seconds: int,
         pod_created_at: datetime,
         group_label: Optional[str] = None,
+        usage_group: Optional[str] = None,
     ) -> None:
         """Register a pod as a JIT on-demand lease candidate (idempotent).
 
         If the pod is already registered with the same parameters this is a
         no-op.  A pod already tracked in ``occupancy`` (already placed) is also
-        left untouched.
+        left untouched.  *usage_group* is the group name the lease ask will
+        carry (see ``OnDemandCandidate.usage_group``).
         """
         # Already placed — don't re-add as a candidate.
         for occupants in self.occupancy.values():
@@ -1142,17 +1155,19 @@ class ControllerState:
             pod_created_at=pod_created_at,
             next_attempt_at=datetime.now(timezone.utc),
             group_label=group_label,
+            usage_group=usage_group,
         )
         self.ondemand_candidates[pod_uid] = candidate
         log.info(
             "On-demand candidate: pod %s/%s (uid=%s, gpu-class=%s, "
-            "gpus=%d, min-runtime=%ds)",
+            "gpus=%d, min-runtime=%ds, group=%s)",
             pod_namespace,
             pod_name,
             pod_uid,
             gpu_class_label,
             gpu_requested,
             min_runtime_seconds,
+            usage_group,
         )
 
     def remove_ondemand_candidate(self, pod_uid: str) -> None:

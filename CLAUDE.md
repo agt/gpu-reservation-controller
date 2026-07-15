@@ -343,8 +343,10 @@ without the toleration,
    queued for it (`enqueue_pod`), with the same fast-path immediate-apply
    when the window is already open.
 2. Otherwise, if the pod is **JIT-eligible** — `ONDEMAND_PLACEMENT_ENABLED`,
-   `Pending`, carries `horae/minimum-runtime-seconds`, and carries the group
-   label when `REQUIRED_GROUP_LABEL` is set — it becomes an
+   `Pending`, carries `horae/minimum-runtime-seconds`, and names its usage
+   group (the group label when `REQUIRED_GROUP_LABEL` is set, else the
+   `horae/usage-group` annotation — the lease request's `group_name` is a
+   **required** natural key app-side) — it becomes an
    `OnDemandCandidate` and, on the **ADDED** event, kicks an immediate
    admission batch (`main._run_ondemand_admission`) covering it plus every
    other due waiter.  `MODIFIED` events do **not** re-trigger a batch — denial
@@ -459,8 +461,12 @@ source of truth.
 - **Semantics**: entries are **upserted by id** (`apply_push_to_active` in
   `controller.py`); an entry whose `status` is not `"active"` drops that id from
   the active set, and an in-window cancellation evicts its admitted pod and
-  releases its capacity — the *same* path a mid-window cancellation takes on a
-  fetch.  An entry that keeps its id but changes owner (**adoption** — a
+  releases its capacity — after first attempting an adoption re-link onto
+  another currently-open booking the same user holds (`POD_ADOPTION_ENABLED`;
+  this is what carries a pod forward when the app supersedes its reservation
+  via `POST /api/reservations/{id}/continue` and pushes the `superseded`
+  source together with its replacement) — the *same* path a mid-window
+  cancellation takes on a fetch.  An entry that keeps its id but changes owner (**adoption** — a
   reservation reassigned to a teammate) evicts the prior owner's admitted pod
   from its namespace and releases the capacity, so the new owner can claim the
   still-active window (`detect_owner_changed_in_window` + `_handle_owner_changes`).

@@ -8,6 +8,7 @@ Public surface
 init_k8s(kubeconfig_path)                    — load credentials once at startup
 get_pod_gpu_count(pod)                       — sum nvidia.com/gpu requests
 get_pod_booking_reference(pod)               — read horae/booking-reference annotation
+get_pod_usage_group(pod)                     — read horae/usage-group annotation (JIT lease group)
 parse_booking_reference(ref)                 — reservation id from a booking-reference
 pod_has_toleration(pod, ...)                 — check for a specific toleration
 is_gpu_only_pending(pod)                      — guard 1: GPU-only scheduling failure check
@@ -122,6 +123,21 @@ def get_pod_min_runtime_seconds(pod) -> Optional[int]:
             raw,
         )
         return None
+
+
+def get_pod_usage_group(pod) -> Optional[str]:
+    """Read the ``horae/usage-group`` annotation from *pod*.
+
+    Names the usage group a JIT on-demand lease should be created under —
+    ``group_name`` is a required natural key on the app's lease-create endpoint
+    (RESERVATION-API.md §"Creating on-demand reservations": the user supplies
+    their group via this pod annotation).  Only consulted when
+    ``REQUIRED_GROUP_LABEL`` is disabled; when that feature is on, the group
+    label is both the match axis and the group source.  Returns ``None`` when
+    the annotation is absent or empty.
+    """
+    annotations: dict = getattr(pod.metadata, "annotations", None) or {}
+    return annotations.get("horae/usage-group") or None
 
 
 def get_pod_gpu_count(pod) -> int:

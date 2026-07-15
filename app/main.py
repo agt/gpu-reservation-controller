@@ -63,6 +63,7 @@ from .k8s_client import (
     get_pod_gpu_count,
     get_pod_min_runtime_seconds,
     get_pod_phase,
+    get_pod_usage_group,
     get_unschedulable_message,
     init_k8s,
     is_gpu_only_pending,
@@ -133,6 +134,7 @@ def _short_retry_at(now: datetime) -> datetime:
 async def _reconcile_after_reservation_change(
     state: ControllerState,
     client: ReservationClient,
+    config: Config,
     active_reservations: list[ReservationResponse],
     cancelled_in_window: list[ReservationResponse],
     owner_changes: list[tuple[ReservationResponse, str]],
@@ -194,9 +196,11 @@ async def _reconcile_after_reservation_change(
     # Occupancy is rebuilt from a live cluster snapshot each queue-processor
     # tick (reconcile_occupancy), so no reservation-driven prune is needed here.
 
-    # Handle mid-window cancellations: evict pods and reclaim capacity.
+    # Handle mid-window cancellations: re-link each admitted pod onto another
+    # open booking its user holds where possible (the Continue/supersede flow),
+    # evicting only the pods with nowhere to go.
     if cancelled_in_window:
-        await _handle_cancelled_reservations(state, cancelled_in_window)
+        await _handle_cancelled_reservations(state, config, cancelled_in_window, now)
 
     # Handle owner changes (adoption): evict the prior owner's admitted pod so
     # the new owner can claim the still-active reservation.
@@ -239,6 +243,7 @@ async def _refresh_reservations(
         await _reconcile_after_reservation_change(
             state,
             client,
+            config,
             active_reservations + preserved,
             cancelled_in_window,
             owner_changes,
@@ -253,14 +258,27 @@ async def _refresh_reservations(
 
 async def _handle_cancelled_reservations(
     state: ControllerState,
+    config: Config,
     cancelled_in_window: list[ReservationResponse],
+    now: datetime,
 ) -> None:
-    """Evict pods admitted under cancelled reservations and reclaim capacity.
+    """Re-link or evict pods admitted under cancelled reservations.
 
-    For each in-window cancelled reservation (already carrying ``cancelled_by``
-    info from the ``status=all`` fetch):
+    For each in-window cancelled reservation (already carrying canceller info
+    from the ``status=all`` fetch):
     1. Snapshot live tolerated pods and filter those admitted under this reservation.
-    2. Emit a ReservationCancelled event on each pod, then delete it.
+    2. **Adoption first** (``POD_ADOPTION_ENABLED``): a cancelled reservation's
+       pod is by definition past its guarantee, so ``_adopt_pods`` re-links it
+       onto another currently-open booking its user holds with spare budget —
+       this is what carries a running job forward when the app supersedes its
+       source via ``POST /api/reservations/{id}/continue`` (the new booking
+       arrives in the same push/fetch as the ``superseded`` cancellation), and
+       it matches the lazy re-link the next queue tick would do anyway, minus
+       the eviction race.  The caller has already replaced
+       ``state.reservations`` with the merged set, so the follow-on booking is
+       visible to ``find_open_booking_for``.
+    3. Emit a ReservationCancelled event on each pod still unclaimed, then
+       delete it.
     """
     # One pod snapshot serves the whole batch.
     pod_snapshot = []
@@ -273,6 +291,22 @@ async def _handle_cancelled_reservations(
         cancelled_by_desc = canceller_description(cancelled_res)
 
         pods_for_res = [p for p in pod_snapshot if p.reservation_id == cancelled_res.id]
+
+        if pods_for_res and config.pod_adoption_enabled:
+            views = [_pod_view(p) for p in pods_for_res]
+            await _adopt_pods(state, config, views, now)
+            adopted_uids = {
+                v.uid for v in views if v.reservation_id != cancelled_res.id
+            }
+            if adopted_uids:
+                log.info(
+                    "Re-linked %d pod(s) from cancelled reservation #%d instead "
+                    "of evicting",
+                    len(adopted_uids),
+                    cancelled_res.id,
+                )
+                pods_for_res = [p for p in pods_for_res if p.uid not in adopted_uids]
+
         if pods_for_res:
             log.info(
                 "Evicting %d pod(s) for cancelled reservation #%d (%s)",
@@ -682,7 +716,7 @@ async def _preflight_ondemand_candidate(
     ask = OnDemandAdmissionCandidate(
         pod_uid=uid,
         username=candidate.pod_namespace,
-        group_name=candidate.group_label,
+        group_name=candidate.usage_group,
         gpu_class_id=gpu_class_id,
         gpu_count=candidate.gpu_requested,
         duration_seconds=duration_seconds,
@@ -717,6 +751,7 @@ async def _grant_and_admit(
         gpu_count=ask.gpu_count,
         duration_seconds=ask.duration_seconds,
         idempotency_key=uid,
+        notes=f"on-demand lease for pod {candidate.pod_namespace}/{candidate.pod_name}",
     )
     lease = await client.create_ondemand_reservation(request)
     if lease is None:
@@ -1013,9 +1048,11 @@ async def pod_watch_loop(
     JIT on-demand path (when ``config.ondemand_placement_enabled``): a pod with
     no reservation admittable now or within ``ONDEMAND_HORIZON_MINUTES`` is
     routed here instead of waiting — see ``_try_request_lease``.
-    - ADDED, Pending, has ``horae/minimum-runtime-seconds`` annotation, group
-      label present when REQUIRED_GROUP_LABEL is set → add as a candidate and
-      attempt a lease request immediately
+    - ADDED, Pending, has ``horae/minimum-runtime-seconds`` annotation, and
+      names its usage group (the group label when REQUIRED_GROUP_LABEL is set,
+      else the ``horae/usage-group`` annotation — the lease ask's required
+      ``group_name``) → add as a candidate and attempt a lease request
+      immediately
     - MODIFIED for a tracked candidate (respecting its retry cooldown) →
       attempt again, so a guard-1 short retry resolves quickly
     - DELETED or terminal (Succeeded/Failed) → release any held slot, and if the
@@ -1155,11 +1192,19 @@ async def pod_watch_loop(
                 continue
 
             min_rt = get_pod_min_runtime_seconds(pod)
+            # Usage group a JIT lease ask would carry: group_name is a
+            # *required* natural key on the app's lease-create endpoint, so a
+            # pod must name its group to be JIT-eligible — via the group label
+            # when REQUIRED_GROUP_LABEL is on (the label doubles as the group
+            # source), else via the horae/usage-group annotation.
+            usage_group: str | None = (
+                group_label if config.required_group_label else get_pod_usage_group(pod)
+            )
             jit_eligible = (
                 config.ondemand_placement_enabled
                 and phase == "Pending"
                 and min_rt is not None
-                and (group_label is not None or config.required_group_label is None)
+                and usage_group is not None
             )
 
             if jit_eligible:
@@ -1176,7 +1221,7 @@ async def pod_watch_loop(
                     )
                     state.add_ondemand_candidate(
                         uid, name, namespace, gpu_class_label, gpu_count, min_rt,
-                        pod_created_at, group_label,
+                        pod_created_at, group_label, usage_group,
                     )
                     # Responsive path: a newly-discovered candidate kicks an
                     # immediate admission batch covering it plus every other due
@@ -1188,10 +1233,11 @@ async def pod_watch_loop(
                     await _run_ondemand_admission(state, client, config)
                 continue
 
-            # Not JIT-eligible (missing the min-runtime annotation or the
-            # required group label): preserve the existing wait-for-window
-            # behaviour if some future reservation matches, however far off
-            # or over budget; otherwise leave the pod Pending.
+            # Not JIT-eligible (missing the min-runtime annotation, the
+            # required group label, or the horae/usage-group annotation):
+            # preserve the existing wait-for-window behaviour if some future
+            # reservation matches, however far off or over budget; otherwise
+            # leave the pod Pending.
             any_match = state.find_best_reservation(namespace, gpu_class_label, group_label)
             if any_match is not None:
                 state.enqueue_pod(
@@ -1875,7 +1921,10 @@ async def push_reservations(
     controller-initiated pull).  Entries are upserted by id; an entry whose
     ``status`` is not ``"active"`` (e.g. a cancellation) drops the reservation
     from the active set, and any in-window cancellation evicts its admitted pod
-    and reclaims the freed capacity — the same path a mid-window cancellation
+    and reclaims the freed capacity — after first re-linking the pod onto
+    another open booking its user holds when adoption is enabled (the
+    Continue/supersede flow pushes the ``superseded`` source together with its
+    replacement booking) — the same path a mid-window cancellation
     takes on a normal fetch.  An entry that keeps the same id but changes owner
     (adoption) evicts the prior owner's admitted pod from its namespace so the
     new owner can claim the still-active reservation.  The next full pull remains
@@ -1900,6 +1949,7 @@ async def push_reservations(
         await _reconcile_after_reservation_change(
             state,
             client,
+            config,
             merged_active,
             cancelled_in_window,
             owner_changes,

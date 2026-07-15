@@ -293,7 +293,7 @@ Every reservation has a `kind` field:
 
 | `kind` | Created by | Time grid | Attribution |
 |--------|-----------|-----------|-------------|
-| `"booking"` | A user through the web UI (or an admin/manager on a user's behalf) | Whole hours | `user_id` + `group_id` always set |
+| `"booking"` | A user through the web UI (or an admin/manager on a user's behalf) | Whole hours — **except** a booking minted by `POST /api/reservations/{id}/continue`, which is anchored at "now" with an arbitrary second-granularity window (`continued_from_id` set) | `user_id` + `group_id` always set |
 | `"on_demand"` | The Kubernetes controller via §"Creating on-demand reservations" | Arbitrary timestamps, anchored at creation time | `user_id` + `group_id` always set |
 
 Both kinds are returned by `GET /api/reservations` under every `status` filter —
@@ -403,6 +403,134 @@ full, plus the fraction-of-cost penalty on the unused remainder inside the next
 | 404 | Reservation not found |
 | 422 | Unknown `reason` |
 
+### `POST /api/reservations/{id}/continue`
+
+Continue a **still-running job** under a fresh guaranteed reservation. Mints a
+new `kind="booking"` reservation for the source's user/group/GPU class, anchored
+at the app's own "now" with an arbitrary second-granularity `duration_seconds`
+(so it can cover a job that never aligned to the whole-hour grid), then returns
+it. The sibling controller re-links (adopts) the running pod onto the new
+reservation, so the job keeps running with no relaunch. Callable by the source's
+**owner** (JWT), an admin, or a manager of its group — **not** service keys.
+
+```json
+{ "duration_seconds": 7200, "gpu_count": 2, "notes": "extending training run" }
+```
+
+| Field | Meaning |
+|-------|---------|
+| `duration_seconds` | Length of the new guaranteed window from now (60 … 604 800). Required. |
+| `gpu_count` | GPUs for the new reservation; defaults to the source's count. Optional. |
+| `notes` | Stored on the new reservation; defaults to the source's notes. Optional. |
+
+Eligible sources (must be `status="active"`):
+
+- a `kind="on_demand"` lease — **during** its window or **after** it lapses (an
+  overstaying pod); and
+- a `kind="booking"` that is **in progress** (started, not yet ended) — a cleaner
+  path than re-running the booking wizard. A not-yet-started or already-ended
+  booking is rejected.
+
+Semantics:
+
+- **Off-grid, anchored at "now"** — like an on-demand lease, `start_dt` is the
+  app's `local_now()` and `end_dt = start + duration_seconds`; whole-hour
+  alignment and the 15-minute lead do **not** apply. The resulting
+  `kind="booking"` row may therefore be off the hourly grid.
+- **Supersede** — when the source still holds future time (`end_dt > now`) it is
+  cancelled with the standard unwaived cancellation penalty (charging only the
+  time already consumed and freeing its remaining capacity), then set
+  `cancel_reason="superseded"`, so the new reservation is admitted against freed
+  resources and the two never double-count. An already-ended on-demand overstay
+  is left untouched.
+- **Same admission analysis as a booking** — the three capacity tiers (+
+  borrowing), the per-member/team SU budget and group SU pool, and
+  `max_gpus_per_reservation`, with privilege judged **as-if-self-booked** (the
+  owner being an admin/manager of the group skips budgets and earns the ±90-day
+  validity grace).
+- The new row records `continued_from_id` (the source reservation's id). No
+  confirmation email is sent. Both the new booking and any superseded source are
+  pushed to the controller (best-effort) so the pod is carried forward promptly.
+
+**Responses**
+
+| Code | Condition |
+|------|-----------|
+| 201 | Created — the new [ReservationResponse](#reservationresponse), `kind="booking"`, `continued_from_id` set |
+| 400 | Source not active / not an eligible kind or phase, or the window can't be admitted on budget |
+| 403 | Caller is not the owner, an admin, or a manager of the group |
+| 404 | Reservation, group, or GPU class not found / inactive |
+| 409 | Capacity would be exceeded |
+
+### `POST /api/reservations/ondemand-admission`
+
+Choose which pending pods the controller should admit on-demand this round.
+Requires a `read_write` service key (or an admin JWT) — the same gate as the
+on-demand create, cancel, and preemption-victims endpoints. Advisory and
+**read-only**: it creates nothing and returns only a selection; the controller
+then creates a real lease for each granted pod via `POST /api/reservations` (see
+**Creating on-demand reservations**).
+
+This is the delegation point for **LAS (least-attained-service) prioritization**
+and any future admission policy. The controller has already determined *which*
+pending pods are eligible for a JIT lease this round (GPU-only-pending, not
+matched by an open reservation, past their retry cooldown, of a class that is
+not under the stuck-holder safety interlock). This endpoint decides *which* of
+those eligible pods to admit now, so prioritisation policy lives in the app
+rather than the controller. Each candidate is the exact "ask" a
+`POST /api/reservations` create would carry, so the app can weigh it against
+priority **and** the same feasibility analysis a create performs.
+
+```json
+{
+  "candidates": [
+    { "pod_uid": "abc-123", "username": "alice", "group_name": "cse142",
+      "gpu_class_id": 10, "gpu_count": 1, "duration_seconds": 1800 },
+    { "pod_uid": "def-456", "username": "bob", "group_name": null,
+      "gpu_class_id": 10, "gpu_count": 2, "duration_seconds": 1200 }
+  ]
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `candidates[].pod_uid` | Opaque pod identifier; echoed back verbatim in the response (equals the create's `idempotency_key`) |
+| `candidates[].username` | Reservation owner the lease would be created for (the pod's namespace) |
+| `candidates[].group_name` | Usage group the lease would be created under, or `null` when group matching is disabled |
+| `candidates[].gpu_class_id` | Numeric GPU-class id the lease would target |
+| `candidates[].gpu_count` | GPUs the pod requests |
+| `candidates[].duration_seconds` | Lease duration the controller would request (pod minimum-runtime + buffer) |
+
+The app returns the subset of `pod_uid`s it grants admission this round:
+
+```json
+{ "granted_pod_uids": ["abc-123"] }
+```
+
+The controller admits only pods it offered — a `pod_uid` in the response that was
+not in the request is ignored. An **empty** list is a deliberate "grant none this
+round" decision and is respected (the non-granted pods simply retry on a later
+tick). The controller falls back to granting **every** offered candidate (its
+prior greedy per-pod behaviour) only when the call itself fails (network error,
+non-2xx, or the endpoint being absent on an older app), or when
+`ONDEMAND_DELEGATE_ADMISSION` is disabled controller-side.
+
+Selection is currently **grant-all** — the endpoint exists so that admission
+prioritisation policy can live in the app (`_prioritize_ondemand_candidates` in
+`app/routers/reservations.py` is the seam where it will be imposed). For each
+granted pod the controller then issues an idempotent `POST /api/reservations`
+(keyed by `pod_uid`); a `409` there still applies — a grant this endpoint returns
+is an admission *decision*, and the subsequent create remains the authoritative
+feasibility check.
+
+**Responses**
+
+| Code | Condition |
+|------|-----------|
+| 200 | The response body `{ "granted_pod_uids": [...] }` (`OnDemandAdmissionResponse`) |
+| 403 | Read-only key / non-admin JWT |
+| 422 | Malformed body (e.g. `gpu_count <= 0`) |
+
 ### `POST /api/reservations/preemption-victims`
 
 Choose which overstay pods the controller should preempt. Requires a
@@ -459,72 +587,6 @@ an older app).
 | Code | Condition |
 |------|-----------|
 | 200 | The response body `{ "victim_pod_uids": [...] }` (`PreemptionSelectionResponse`) |
-| 403 | Read-only key / non-admin JWT |
-| 422 | Malformed body (e.g. `gpu_count <= 0`) |
-
-### `POST /api/reservations/ondemand-admission`
-
-Choose which pending pods the controller should admit on-demand this round.
-Requires a `read_write` service key (or an admin JWT) — the same gate as the
-on-demand create, cancel, and preemption-victims endpoints. Advisory and
-**read-only**: it creates nothing and returns only a selection; the controller
-then creates a real lease for each granted pod via `POST /api/reservations` (see
-**Creating on-demand reservations**).
-
-This is the delegation point for **LAS (least-attained-service) prioritization**
-and any future admission policy. The controller has already determined *which*
-pending pods are eligible for a JIT lease this round (GPU-only-pending, not
-matched by an open reservation, past their retry cooldown, of a class that is
-not under the stuck-holder safety interlock). This endpoint decides *which* of
-those eligible pods to admit now, so prioritisation policy lives in the app
-rather than the controller. Each candidate is the exact "ask" a
-`POST /api/reservations` create would carry, so the app can weigh it against
-priority **and** the same feasibility analysis a create performs.
-
-```json
-{
-  "candidates": [
-    { "pod_uid": "abc-123", "username": "alice", "group_name": "cse142",
-      "gpu_class_id": 10, "gpu_count": 1, "duration_seconds": 1800 },
-    { "pod_uid": "def-456", "username": "bob", "group_name": null,
-      "gpu_class_id": 10, "gpu_count": 2, "duration_seconds": 1200 }
-  ]
-}
-```
-
-| Field | Meaning |
-|-------|---------|
-| `candidates[].pod_uid` | Opaque pod identifier; echoed back verbatim in the response (equals the create's `idempotency_key`) |
-| `candidates[].username` | Reservation owner the lease would be created for (the pod's namespace) |
-| `candidates[].group_name` | Usage group the lease would be created under, or `null` when group matching is disabled |
-| `candidates[].gpu_class_id` | Numeric GPU-class id the lease would target |
-| `candidates[].gpu_count` | GPUs the pod requests |
-| `candidates[].duration_seconds` | Lease duration the controller would request (pod minimum-runtime + buffer) |
-
-The app returns the subset of `pod_uid`s it grants admission this round:
-
-```json
-{ "granted_pod_uids": ["abc-123"] }
-```
-
-The controller admits only pods it offered — a `pod_uid` in the response that was
-not in the request is ignored. An **empty** list is a deliberate "grant none this
-round" decision and is respected (the non-granted pods simply retry on a later
-tick). The controller falls back to granting **every** offered candidate (its
-prior greedy per-pod behaviour) only when the call itself fails (network error,
-non-2xx, or the endpoint being absent on an older app), or when
-`ONDEMAND_DELEGATE_ADMISSION` is disabled controller-side.
-
-For each granted pod the controller then issues an idempotent
-`POST /api/reservations` (keyed by `pod_uid`); a `409` there still applies — a
-grant this endpoint returns is an admission *decision*, and the subsequent create
-remains the authoritative feasibility check.
-
-**Responses**
-
-| Code | Condition |
-|------|-----------|
-| 200 | The response body `{ "granted_pod_uids": [...] }` (`OnDemandAdmissionResponse`) |
 | 403 | Read-only key / non-admin JWT |
 | 422 | Malformed body (e.g. `gpu_count <= 0`) |
 
@@ -928,7 +990,7 @@ both new additions and role corrections without a separate `PATCH` call.
   "min_days_ahead": 0,
   "max_days_ahead": 14,
   "su_budget": 200,
-  "su_anchor_mode": "open",
+  "su_anchor_mode": "weekly",
   "provisioning_source": "admin",
   "sync_with_sicad": false,
   "sicad_course_id": null,
@@ -956,7 +1018,7 @@ entry is a full GpuClassResponse.
 | `min_days_ahead` | integer \| null | Members must book at least N days in advance (ignored for admins and group managers) |
 | `max_days_ahead` | integer \| null | Members cannot book more than N days out (ignored for admins and group managers) |
 | `su_budget` | number \| null | Per-member Service Unit budget: the sum of stored `su_cost` over a member's open reservations (within the window set by `su_anchor_mode`) may not exceed this (ignored for admins and group managers). `null` = unlimited |
-| `su_anchor_mode` | string | How far back the SU budget window reaches: `"open"` (only currently-open reservations; renewable ceiling), `"weekly"`, `"monthly"`, `"quarterly"`, or `"since_creation"` (cumulative, never resets). See SCHEDULING.md §5 for full semantics. |
+| `su_anchor_mode` | string | How far back the SU budget window reaches: `"weekly"` (default), `"open"` (only currently-open reservations; renewable ceiling), `"monthly"`, `"quarterly"`, or `"since_creation"` (cumulative, never resets). See SCHEDULING.md §5 for full semantics. |
 | `provisioning_source` | string | Who may curate this group's membership: `"admin"` (administrators only; default), `"manager"` (the group's managers **and** admins), or `"sicad"` (the built-in SICAD roster sync **and** admins). Administrators may always curate regardless. Settable only by an admin via `POST`/`PUT /api/groups`. |
 | `sync_with_sicad` | boolean | Read-only derived flag (`provisioning_source == "sicad"`). When `true`, the app's built-in SICAD roster sync keeps this group's membership in sync with the course roster (add-only). Retained for backward compatibility; set `provisioning_source` to change it |
 | `sicad_course_id` | string \| null | Remote SICAD/AWSEd courseID backing the roster sync. `null` = fall back to `name`, letting the group name differ from the SICAD courseID. Only meaningful when `provisioning_source` is `"sicad"` |
@@ -1049,7 +1111,8 @@ Returned by `GET /api/groups/{group_id}/members`.
 | `updated_at` | datetime (UTC, `Z`) | |
 | `cancelled_at` | datetime \| null (UTC, `Z`) | |
 | `cancelled_by_id` | integer \| null | User ID of whoever cancelled; `null` for a controller (service-key) cancellation |
-| `cancel_reason` | `"no-show"` \| `"controller-revoked"` \| `"pod-terminated"` \| null | Machine-readable reason recorded by `POST /api/reservations/{id}/cancel`; `null` for human cancellations |
+| `cancel_reason` | `"no-show"` \| `"controller-revoked"` \| `"pod-terminated"` \| `"superseded"` \| null | Machine-readable reason recorded by `POST /api/reservations/{id}/cancel` (or `"superseded"` when a source was continued via `POST /api/reservations/{id}/continue`); `null` for human cancellations |
+| `continued_from_id` | integer \| null | Set on a booking minted via `POST /api/reservations/{id}/continue`: the id of the superseded source reservation whose pod it carries forward; `null` otherwise |
 
 ---
 

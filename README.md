@@ -132,15 +132,17 @@ than preempting them.)
    `ONDEMAND_HORIZON_MINUTES` **and** has spare budget → the pod is queued for
    it, same as any reserved-path pod.
 2. Otherwise, if the pod is **JIT-eligible** — `Pending`, carries
-   `horae/minimum-runtime-seconds`, and carries the group label when
-   `REQUIRED_GROUP_LABEL` is set — it becomes an on-demand candidate and, when
+   `horae/minimum-runtime-seconds`, and names its usage group (the group label
+   when `REQUIRED_GROUP_LABEL` is set, else the `horae/usage-group`
+   annotation; the lease request's `group_name` is a required natural key
+   app-side) — it becomes an on-demand candidate and, when
    first discovered, kicks an immediate admission batch covering it plus every
    other waiting candidate.  Later retries ride the queue-processor tick.
 3. Otherwise, if some future reservation matches at all (beyond the horizon,
    or currently over budget), the pod is queued for it anyway — the plain
    wait-for-window behaviour, preserved for a pod that isn't JIT-eligible.
-4. Otherwise the pod is left **Pending** (a pod missing the group label or the
-   minimum-runtime annotation is not guessed at).
+4. Otherwise the pod is left **Pending** (a pod missing its usage-group source
+   or the minimum-runtime annotation is not guessed at).
 
 **Batch admission** — each attempt gathers all due candidates, vets each
 (re-routing, the guards below, and resolving its `gpu-class` label to a numeric
@@ -207,7 +209,9 @@ effect:   NoSchedule
 | `horae/pod-runtime-limit-seconds` | guarantee recorded | The runtime guarantee's duration in seconds at admission time, for operator visibility and in-pod notification widgets. Legacy key name — no longer backs a hard cap; see *Runtime guarantees and demand-driven preemption* |
 | `horae/guaranteed-until` | guarantee recorded | The same guarantee as an absolute UTC ISO-8601 instant |
 
-(`horae/minimum-runtime-seconds` is the one annotation **consumed** rather
+(`horae/minimum-runtime-seconds` and `horae/usage-group` — the usage-group
+name a JIT lease is created under when `REQUIRED_GROUP_LABEL` is not in use —
+are the two annotations **consumed** rather
 than written — see *Just-in-time (JIT) on-demand leases* above.  Both
 guarantee annotations are **informational only**: nothing in the controller
 reads them back to make a decision, and a guarantee can technically shrink
