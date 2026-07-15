@@ -376,6 +376,25 @@ The queue-processor tick retries any still-pending candidate in FIFO order
 the same way; there is no separate on-demand admission function — both call
 sites share `_try_request_lease`.
 
+**Surviving the fetch that hasn't seen the grant yet.**  The grant upserts the
+lease locally, but the periodic `reservation_fetch_loop` takes its
+`GET /api/reservations` snapshot **before** acquiring `reservation_lock` and then
+**wholesale-replaces** `state.reservations`.  A lease granted in the gap between
+that snapshot and the replace is absent from the snapshot, and a naive replace
+would drop it even though its pod is live inside its guarantee — leaving
+`guarantee_end` unresolvable (`None`), which the preemption planner treats as
+*past guarantee* and hence a valid victim.  To close that race, the fetch loop
+re-adds any locally-granted on-demand lease the snapshot omits
+(`ControllerState.preserve_local_ondemand_leases`): a `kind="on_demand"`,
+locally-`active` lease whose window is still open (`slot_end > now`) and whose id
+does **not** appear anywhere in the full `status=all` response.  Checking the full
+response (not just the active subset) means a lease the app reports **cancelled**
+carries its id and is therefore **not** preserved — a genuine server-side cancel,
+including the controller's own compensating cancel, still wins and its pod is
+released.  Only replication lag (grant not yet surfaced) is bridged; the push path
+is unaffected because it merges deltas (`apply_push_to_active`) instead of
+replacing.
+
 **RBAC / config**: no new Kubernetes permissions (admission reuses the
 existing pod-patch path); `ONDEMAND_HORIZON_MINUTES` and
 `ONDEMAND_LEASE_BUFFER_MINUTES` tune the routing horizon and lease sizing.
