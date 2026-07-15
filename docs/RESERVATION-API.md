@@ -402,6 +402,65 @@ full, plus the fraction-of-cost penalty on the unused remainder inside the next
 | 404 | Reservation not found |
 | 422 | Unknown `reason` |
 
+### `POST /api/reservations/preemption-victims`
+
+Choose which overstay pods the controller should preempt. Requires a
+`read_write` service key (or an admin JWT) — the same gate as the on-demand and
+cancel endpoints. Purely advisory and **read-only**: it inspects nothing it
+mutates and returns a decision; the controller performs the deletions.
+
+The controller has already determined *which* pods are eligible (live, past
+their runtime guarantee, admitted by the controller, of the class in question)
+and how many GPUs it must reclaim per class near an upcoming reservation
+boundary. This endpoint decides *which* of those eligible pods to sacrifice, so
+that prioritisation policy lives in the app rather than the controller.
+
+```json
+{
+  "needed_by_class": { "h100": 2 },
+  "candidates": [
+    { "pod_uid": "abc-123", "namespace": "alice", "pod_name": "train-7c9",
+      "gpu_class": "h100", "gpu_count": 1, "reservation_id": 4412 },
+    { "pod_uid": "def-456", "namespace": "bob", "pod_name": "notebook-2",
+      "gpu_class": "h100", "gpu_count": 1, "reservation_id": 4380 }
+  ]
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `needed_by_class` | GPUs still to reclaim, keyed by the GPU-class **label value** (e.g. `"h100"`) |
+| `candidates[].pod_uid` | Opaque pod identifier; echoed back verbatim in the response |
+| `candidates[].gpu_class` | GPU-class label value the candidate belongs to |
+| `candidates[].gpu_count` | GPUs the candidate holds (used for greedy coverage) |
+| `candidates[].reservation_id` | The candidate's booking-reference — the app's handle to the reservation (owner/group/kind) for prioritisation |
+
+Per class, the app orders that class's candidates by its selection policy
+(**uniform-random for now**) and greedily accepts them until the class's
+`needed` GPU shortfall is covered — which may overshoot when a chosen pod holds
+more GPUs than the residual need. A class whose candidate pool cannot cover its
+shortfall contributes every candidate it has (the controller records the
+remainder as unmet). The response lists the chosen `pod_uid`s:
+
+```json
+{ "victim_pod_uids": ["abc-123", "def-456"] }
+```
+
+The controller kills only pods it offered — a `pod_uid` in the response that was
+not in the request is ignored. An **empty** list is a deliberate "spare
+everyone" decision and is respected (the controller does **not** fall back to
+its own selection); the controller only reverts to local random selection when
+the call itself fails (network error, non-2xx, or the endpoint being absent on
+an older app).
+
+**Responses**
+
+| Code | Condition |
+|------|-----------|
+| 200 | The response body `{ "victim_pod_uids": [...] }` (`PreemptionSelectionResponse`) |
+| 403 | Read-only key / non-admin JWT |
+| 422 | Malformed body (e.g. `gpu_count <= 0`) |
+
 ### Reading the reservation time window
 
 Every `ReservationResponse` includes pre-computed UTC timestamps:

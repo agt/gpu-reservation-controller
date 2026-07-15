@@ -24,6 +24,7 @@ class Config:
     preemption_lead_minutes: int   # lead time before a slot boundary for phase-A preemption
     preemption_check_interval: int  # seconds between preemption sweeps
     pod_adoption_enabled: bool = True  # re-link overstay pods to a user's new booking
+    preemption_delegate_selection: bool = True  # ask the app to choose victims; local random fallback
     required_group_label: Optional[str] = None  # pod label naming the usage group to match; None = disabled
     ondemand_horizon_minutes: int = 30    # JIT trigger: reserved-match horizon before requesting a lease
     ondemand_lease_buffer_minutes: int = 10  # added to a pod's minimum-runtime when sizing a JIT lease
@@ -82,6 +83,10 @@ class Config:
             ),
             pod_adoption_enabled=os.environ.get(
                 "POD_ADOPTION_ENABLED", "true"
+            ).lower()
+            not in ("false", "0", "no"),
+            preemption_delegate_selection=os.environ.get(
+                "PREEMPTION_DELEGATE_SELECTION", "true"
             ).lower()
             not in ("false", "0", "no"),
             ondemand_horizon_minutes=int(

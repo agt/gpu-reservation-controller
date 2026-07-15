@@ -12,7 +12,13 @@ from __future__ import annotations
 import random
 from datetime import datetime, timedelta, timezone
 
-from app.controller import PodRuntimeView, free_capacity_by_class
+from app.controller import (
+    BoundaryPreemptionNeed,
+    PodRuntimeView,
+    build_preemption_plan,
+    free_capacity_by_class,
+    select_victims_locally,
+)
 
 from tests.conftest import (
     GPU_CLASS_ID,
@@ -474,6 +480,128 @@ class TestPlanBoundaryPreemption:
             BOUNDARY, {GPU_CLASS_LABEL: 999}, [], BOUNDARY, rng=random.Random(0)
         )
         assert plan.phase == "B"
+
+
+# ---------------------------------------------------------------------------
+# plan_boundary_candidates (shortfall + eligible pool, no selection)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanBoundaryCandidates:
+    def _demand_state(self, gpu_count=4):
+        res = reservation(
+            1,
+            start_utc=BOUNDARY,
+            end_utc=BOUNDARY + timedelta(hours=2),
+            gpu_count=gpu_count,
+            gpu_class_label=GPU_CLASS_LABEL,
+        )
+        return _state(res)
+
+    def test_shortfall_and_eligible_pool(self):
+        state = self._demand_state(gpu_count=2)
+        victims = [
+            _view(f"v{i}", reservation_id=100 + i, gpu_count=1) for i in range(3)
+        ]
+        need = state.plan_boundary_candidates(
+            BOUNDARY, {GPU_CLASS_LABEL: 3}, victims, NOW
+        )
+        # demand=2, free=0 → 2 GPUs must be reclaimed; all three overstayers
+        # are eligible candidates (none is selected here).
+        assert need.kills_needed_by_class == {GPU_CLASS_LABEL: 2}
+        assert set(need.candidates_by_class[GPU_CLASS_LABEL]) == set(victims)
+
+    def test_no_shortfall_omits_class(self):
+        state = self._demand_state(gpu_count=2)
+        overstayer = _view("v1", reservation_id=None, gpu_count=5)
+        # capacity=7, usage=5 → free=2 == demand → no shortfall.
+        need = state.plan_boundary_candidates(
+            BOUNDARY, {GPU_CLASS_LABEL: 7}, [overstayer], NOW
+        )
+        assert need.kills_needed_by_class == {}
+        assert need.candidates_by_class == {}
+
+    def test_within_guarantee_never_a_candidate(self):
+        state = self._demand_state(gpu_count=2)
+        holder_res = reservation(
+            2,
+            start_utc=NOW - timedelta(minutes=30),
+            end_utc=NOW + timedelta(hours=1),
+            gpu_count=1,
+            gpu_class_label=GPU_CLASS_LABEL,
+        )
+        state.reservations.append(holder_res)
+        within = _view("in-guarantee", reservation_id=2, gpu_count=1)
+        need = state.plan_boundary_candidates(
+            BOUNDARY, {GPU_CLASS_LABEL: 1}, [within], NOW
+        )
+        assert need.kills_needed_by_class == {GPU_CLASS_LABEL: 2}
+        assert need.candidates_by_class[GPU_CLASS_LABEL] == []
+
+
+# ---------------------------------------------------------------------------
+# select_victims_locally / build_preemption_plan
+# ---------------------------------------------------------------------------
+
+
+def _need(kills, candidates, *, phase="A"):
+    return BoundaryPreemptionNeed(
+        boundary=BOUNDARY,
+        phase=phase,
+        demand_by_class={},
+        free_by_class={},
+        kills_needed_by_class=kills,
+        candidates_by_class=candidates,
+    )
+
+
+class TestSelectVictimsLocally:
+    def test_greedy_cover_shortfall(self):
+        cands = [_view(f"v{i}", reservation_id=100 + i, gpu_count=1) for i in range(4)]
+        need = _need({GPU_CLASS_LABEL: 2}, {GPU_CLASS_LABEL: cands})
+        picked = select_victims_locally(need, rng=random.Random(0))
+        assert len(picked[GPU_CLASS_LABEL]) == 2
+
+    def test_overshoot_when_victim_larger(self):
+        big = _view("big", reservation_id=1, gpu_count=4)
+        need = _need({GPU_CLASS_LABEL: 1}, {GPU_CLASS_LABEL: [big]})
+        picked = select_victims_locally(need, rng=random.Random(0))
+        assert picked[GPU_CLASS_LABEL] == [big]
+
+    def test_empty_pool_selects_nothing(self):
+        need = _need({GPU_CLASS_LABEL: 3}, {GPU_CLASS_LABEL: []})
+        picked = select_victims_locally(need, rng=random.Random(0))
+        assert picked[GPU_CLASS_LABEL] == []
+
+    def test_seeded_rng_deterministic(self):
+        cands = [_view(f"v{i}", reservation_id=100 + i, gpu_count=1) for i in range(5)]
+        need = _need({GPU_CLASS_LABEL: 5}, {GPU_CLASS_LABEL: list(cands)})
+        p1 = select_victims_locally(need, rng=random.Random(42))
+        p2 = select_victims_locally(need, rng=random.Random(42))
+        assert p1[GPU_CLASS_LABEL] == p2[GPU_CLASS_LABEL]
+
+
+class TestBuildPreemptionPlan:
+    def test_covered_selection_has_no_unmet(self):
+        cands = [_view(f"v{i}", reservation_id=100 + i, gpu_count=1) for i in range(2)]
+        need = _need({GPU_CLASS_LABEL: 2}, {GPU_CLASS_LABEL: cands})
+        plan = build_preemption_plan(need, {GPU_CLASS_LABEL: cands})
+        assert plan.victims == cands
+        assert plan.unmet_by_class == {}
+
+    def test_partial_selection_records_unmet(self):
+        cands = [_view("v0", reservation_id=100, gpu_count=1)]
+        need = _need({GPU_CLASS_LABEL: 3}, {GPU_CLASS_LABEL: cands})
+        # Selector covered only 1 of the 3 GPUs needed.
+        plan = build_preemption_plan(need, {GPU_CLASS_LABEL: cands})
+        assert plan.victims == cands
+        assert plan.unmet_by_class == {GPU_CLASS_LABEL: 2}
+
+    def test_empty_selection_is_all_unmet(self):
+        need = _need({GPU_CLASS_LABEL: 2}, {GPU_CLASS_LABEL: []})
+        plan = build_preemption_plan(need, {})
+        assert plan.victims == []
+        assert plan.unmet_by_class == {GPU_CLASS_LABEL: 2}
 
 
 # ---------------------------------------------------------------------------

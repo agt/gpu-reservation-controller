@@ -204,14 +204,25 @@ in `main.py`), which on every tick:
    multi-GPU booking is not under-counted.
 4. Computes **free** capacity (`free_capacity_by_class`): physical capacity
    minus GPUs used by node-resident, non-terminating pods.
-5. If `demand > free`, `ControllerState.plan_boundary_preemption` selects
-   **random** victims — same GPU class, admitted by this controller, live,
-   not already terminating, and **past their runtime guarantee**
-   (`guarantee_end` is `None` or `<= now`) — until the shortfall is covered.
-   A pod within its guarantee is **never** selected, however severe the
-   shortfall (logged as an "unmet" warning instead — priority ranking among
-   overstayers is a deliberately deferred future design; selection is
-   uniform-random for now).
+5. If `demand > free`, the controller identifies the **eligible candidate
+   pool** per class (`ControllerState.plan_boundary_candidates`) — pods of the
+   same GPU class, admitted by this controller, live, not already terminating,
+   and **past their runtime guarantee** (`guarantee_end` is `None` or `<= now`)
+   — and the per-class GPU shortfall (`kills_needed`).  A pod within its
+   guarantee is **never** a candidate, however severe the shortfall.  **Which**
+   candidates become victims is then **delegated to the reservation app**
+   (`POST /api/reservations/preemption-victims`, write-scope key; see
+   `ReservationClient.select_preemption_victims`), so prioritisation policy
+   (by reservation owner/group/kind) can live in the app rather than the
+   controller.  The controller kills only pods it offered — an unknown uid in
+   the response is ignored, and an **empty** response ("spare everyone") is
+   respected.  When delegation is disabled (`PREEMPTION_DELEGATE_SELECTION=false`)
+   or the app call **fails** (network/non-2xx/absent endpoint), the sweep falls
+   back to local **uniform-random** selection (`select_victims_locally`) so
+   preemption still works — this is the same greedy random pick the controller
+   did before delegation existed.  A shortfall the returned victims do not cover
+   is logged as an "unmet" warning (priority ranking within the app's random
+   policy is deferred future design; the controller's own fallback is uniform).
 6. Selected victims are deleted (`_preempt_pod`: emit a `Normal` Event with
    `reason: Preempted`, `action: PreemptPod`, then delete and release
    occupancy — all best-effort, mirroring the cancellation-eviction shape in
@@ -476,6 +487,7 @@ the claimed set and the grace re-arm path above applies.
 | `REQUIRED_GROUP_LABEL` | *(absent)* | Pod label naming the usage group (e.g. `dsmlp/course`); when set, the pod's value must equal the reservation's `group.name` — an extra match axis alongside `gpu-class` (see **Matching pods to reservations**), and a pod without the label is never JIT-eligible either. Unset = disabled |
 | `PREEMPTION_LEAD_MINUTES` | `15` | Minutes before a reservation slot boundary that phase-A preemption runs |
 | `PREEMPTION_CHECK_INTERVAL` | `60` | Seconds between preemption sweeps |
+| `PREEMPTION_DELEGATE_SELECTION` | `true` | Ask the app to choose preemption victims from the eligible pool (`POST /api/reservations/preemption-victims`); `false` (or any app-call failure) falls back to local uniform-random selection |
 | `POD_ADOPTION_ENABLED` | `true` | Re-link an overstay pod to a reservation its user has since booked (see **Adopting overstay pods into a re-booked reservation**); `false` disables |
 | `LOG_LEVEL` | `INFO` | Root Python logging level (parsed by `config.py`) |
 

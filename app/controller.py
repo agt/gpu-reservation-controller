@@ -186,6 +186,87 @@ class PreemptionPlan:
     unmet_by_class: dict[str, int]    # shortfall remaining after all eligible kills
 
 
+@dataclass
+class BoundaryPreemptionNeed:
+    """What must be reclaimed at one boundary/phase, *before* victims are chosen.
+
+    ``ControllerState.plan_boundary_candidates`` computes this: per GPU class,
+    how many GPUs still have to be freed (``kills_needed_by_class``) and which
+    live, past-guarantee, controller-admitted pods are *eligible* to supply them
+    (``candidates_by_class``).  It deliberately stops short of picking victims —
+    that choice is delegated to the reservation app (which can prioritise by
+    owner/group/kind), with a local uniform-random fallback
+    (``select_victims_locally``) when the app is unreachable or delegation is
+    disabled.  Only classes with a non-zero shortfall appear in either map.
+    """
+
+    boundary: datetime
+    phase: str                       # "A" (lead-time) or "B" (at-boundary)
+    demand_by_class: dict[str, int]
+    free_by_class: dict[str, int]
+    kills_needed_by_class: dict[str, int]
+    candidates_by_class: dict[str, list[PodRuntimeView]]
+
+
+def select_victims_locally(
+    need: BoundaryPreemptionNeed,
+    rng: Optional[random.Random] = None,
+) -> dict[str, list[PodRuntimeView]]:
+    """Pick victims from *need*'s candidate pool with a uniform-random policy.
+
+    The local fallback for what the reservation app does when victim selection
+    is delegated to it: per GPU class, shuffle the eligible candidates and
+    greedily accumulate until ``kills_needed`` GPUs are covered (which may
+    overshoot when a victim is larger than the residual shortfall).  Returns the
+    chosen victims grouped by GPU-class label.  Pure — no I/O, no mutation.
+    """
+    rng = rng or random.Random()
+    selected: dict[str, list[PodRuntimeView]] = {}
+    for gpu_class, kills_needed in need.kills_needed_by_class.items():
+        eligible = list(need.candidates_by_class.get(gpu_class, []))
+        rng.shuffle(eligible)
+        picked: list[PodRuntimeView] = []
+        killed_gpus = 0
+        for p in eligible:
+            if killed_gpus >= kills_needed:
+                break
+            picked.append(p)
+            killed_gpus += p.gpu_count
+        selected[gpu_class] = picked
+    return selected
+
+
+def build_preemption_plan(
+    need: BoundaryPreemptionNeed,
+    selected_by_class: dict[str, list[PodRuntimeView]],
+) -> PreemptionPlan:
+    """Assemble a ``PreemptionPlan`` from a boundary's need + the chosen victims.
+
+    ``selected_by_class`` is whatever the selector (app or local fallback)
+    returned — the victims are taken as-is, and ``unmet_by_class`` records any
+    per-class shortfall the selection did not cover (fewer GPUs chosen than
+    ``kills_needed`` — e.g. the pool was too small, or the app deliberately
+    spared pods).  Victim order follows ``kills_needed_by_class`` iteration.
+    Pure — no I/O, no mutation.
+    """
+    victims: list[PodRuntimeView] = []
+    unmet: dict[str, int] = {}
+    for gpu_class, kills_needed in need.kills_needed_by_class.items():
+        picked = selected_by_class.get(gpu_class, [])
+        victims.extend(picked)
+        killed_gpus = sum(p.gpu_count for p in picked)
+        if killed_gpus < kills_needed:
+            unmet[gpu_class] = kills_needed - killed_gpus
+    return PreemptionPlan(
+        boundary=need.boundary,
+        phase=need.phase,
+        demand_by_class=need.demand_by_class,
+        free_by_class=need.free_by_class,
+        victims=victims,
+        unmet_by_class=unmet,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Shared controller state
 # ---------------------------------------------------------------------------
@@ -1302,6 +1383,58 @@ class ControllerState:
                 demand[label] = demand.get(label, 0) + need
         return demand
 
+    def plan_boundary_candidates(
+        self,
+        boundary: datetime,
+        capacity_by_class: dict[str, int],
+        pods: list[PodRuntimeView],
+        now: datetime,
+    ) -> BoundaryPreemptionNeed:
+        """Compute *boundary*'s shortfall and eligible victim pool per GPU class.
+
+        Per GPU class: ``kills_needed = max(0, demand - free)``.  Eligible
+        candidates are pods of that class admitted by this controller
+        (``reservation_id`` set), physically running or about to
+        (``node_resident``), not already ``terminating``, requesting at least
+        one GPU, and past their runtime guarantee (``guarantee_end`` is
+        ``None`` — unresolvable, treated as already over — or ``<= now``).  A
+        pod within its guarantee is never a candidate, regardless of shortfall.
+        Only classes with a non-zero shortfall are included (their candidate
+        list may still be empty → an unmet shortfall).  Pure — no I/O, no state
+        mutation, and **no victim selection**: choosing which candidates to
+        preempt is left to the caller (delegated to the reservation app, or the
+        local random fallback ``select_victims_locally``).
+        """
+        demand = self.boundary_demand(boundary, pods, now)
+        free = free_capacity_by_class(capacity_by_class, pods)
+
+        kills_needed: dict[str, int] = {}
+        candidates: dict[str, list[PodRuntimeView]] = {}
+        for gpu_class, need in demand.items():
+            shortfall = max(0, need - free.get(gpu_class, 0))
+            if shortfall == 0:
+                continue
+            kills_needed[gpu_class] = shortfall
+            candidates[gpu_class] = [
+                p
+                for p in pods
+                if p.gpu_class == gpu_class
+                and p.reservation_id is not None
+                and p.node_resident
+                and not p.terminating
+                and p.gpu_count > 0
+                and self._past_guarantee(p, now)
+            ]
+
+        return BoundaryPreemptionNeed(
+            boundary=boundary,
+            phase="B" if boundary <= now else "A",
+            demand_by_class=demand,
+            free_by_class=free,
+            kills_needed_by_class=kills_needed,
+            candidates_by_class=candidates,
+        )
+
     def plan_boundary_preemption(
         self,
         boundary: datetime,
@@ -1312,59 +1445,17 @@ class ControllerState:
     ) -> PreemptionPlan:
         """Plan (but do not execute) the kills needed to clear *boundary*'s demand.
 
-        Per GPU class: ``kills_needed = max(0, demand - free)``.  Eligible
-        victims are pods of that class admitted by this controller
-        (``reservation_id`` set), physically running or about to
-        (``node_resident``), not already ``terminating``, requesting at least
-        one GPU, and past their runtime guarantee (``guarantee_end`` is
-        ``None`` — unresolvable, treated as already over — or ``<= now``).  A
-        pod within its guarantee is never selected, regardless of shortfall.
-        Selection is uniform-random among eligible victims (priority ranking
-        is future work) and greedy — it stops once enough GPUs are covered,
-        which may overshoot when victims aren't exactly the shortfall size.
-        Classes are planned independently; a victim from one class's plan
-        cannot be re-selected for another (they don't share a GPU class, so
-        this only matters for bookkeeping clarity).  Pure — no I/O, no state
-        mutation; the caller executes the deletions and marks bookkeeping.
+        The all-in-one local planner: computes the shortfall/candidate pool
+        (``plan_boundary_candidates``), selects victims **locally** at random
+        (``select_victims_locally``), and assembles the ``PreemptionPlan``
+        (``build_preemption_plan``).  This is the fallback path — the sweep
+        uses it verbatim whenever victim selection is not delegated to the app
+        (delegation disabled, no client, or the app call failed).  Pure — no
+        I/O, no state mutation; the caller executes the deletions.
         """
-        rng = rng or random.Random()
-        demand = self.boundary_demand(boundary, pods, now)
-        free = free_capacity_by_class(capacity_by_class, pods)
-
-        victims: list[PodRuntimeView] = []
-        unmet: dict[str, int] = {}
-        for gpu_class, need in demand.items():
-            kills_needed = max(0, need - free.get(gpu_class, 0))
-            if kills_needed == 0:
-                continue
-            eligible = [
-                p
-                for p in pods
-                if p.gpu_class == gpu_class
-                and p.reservation_id is not None
-                and p.node_resident
-                and not p.terminating
-                and p.gpu_count > 0
-                and self._past_guarantee(p, now)
-            ]
-            rng.shuffle(eligible)
-            killed_gpus = 0
-            for p in eligible:
-                if killed_gpus >= kills_needed:
-                    break
-                victims.append(p)
-                killed_gpus += p.gpu_count
-            if killed_gpus < kills_needed:
-                unmet[gpu_class] = kills_needed - killed_gpus
-
-        return PreemptionPlan(
-            boundary=boundary,
-            phase="B" if boundary <= now else "A",
-            demand_by_class=demand,
-            free_by_class=free,
-            victims=victims,
-            unmet_by_class=unmet,
-        )
+        need = self.plan_boundary_candidates(boundary, capacity_by_class, pods, now)
+        selected = select_victims_locally(need, rng)
+        return build_preemption_plan(need, selected)
 
     def prune_preemption_marks(self, now: datetime, lead: timedelta) -> None:
         """Drop boundary bookkeeping once phase B's grace window has closed.
