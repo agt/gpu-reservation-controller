@@ -324,3 +324,142 @@ class TestMultipleBoundariesOneSweep:
 
         asyncio.run(m._run_preemption_sweep(state, config, now=S))
         assert "v1" not in state.occupancy.get(2, {})
+
+
+class _FakeSelectClient:
+    """Stand-in ReservationClient exposing only ``select_preemption_victims``."""
+
+    def __init__(self, response):
+        self._response = response
+        self.requests: list = []
+
+    async def select_preemption_victims(self, req):
+        self.requests.append(req)
+        return self._response
+
+
+def _overstayer(res_id, username, user_id):
+    return reservation(
+        res_id,
+        start_utc=S - timedelta(hours=4),
+        end_utc=S - timedelta(hours=2),  # well past guarantee
+        gpu_count=1,
+        gpu_class_label=GPU_CLASS_LABEL,
+        username=username,
+        user_id=user_id,
+    )
+
+
+class TestDelegatedVictimSelection:
+    def test_app_selection_is_honoured(self, monkeypatch):
+        """The app is asked to choose; the pod it names is the one killed, and
+        the request carries the shortfall and the full candidate pool."""
+        m = _main_module(monkeypatch)
+        state = _state(_boundary_reservation(1, gpu_count=1))
+        state.reservations.append(_overstayer(2, "alice", 1))
+        config = _config(preemption_lead_minutes=15)
+
+        pod = _pod("v1", booking_reference="res-2", reservation_id=2, gpu_count=1)
+        deleted, _events = _patch_snapshots(
+            monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 1}
+        )
+        client = _FakeSelectClient(["v1"])
+
+        asyncio.run(m._run_preemption_sweep(state, config, client, now=S))
+        assert deleted == [(USERNAME, "pod-v1")]
+        assert len(client.requests) == 1
+        req = client.requests[0]
+        assert req.needed_by_class == {GPU_CLASS_LABEL: 1}
+        assert [c.pod_uid for c in req.candidates] == ["v1"]
+        assert req.candidates[0].reservation_id == 2
+
+    def test_app_chooses_among_multiple_candidates(self, monkeypatch):
+        """With two eligible overstayers and a 1-GPU shortfall, exactly the
+        app's named victim is killed — proving selection is the app's, not the
+        controller's random pick."""
+        m = _main_module(monkeypatch)
+        state = _state(_boundary_reservation(1, gpu_count=1))
+        state.reservations.append(_overstayer(2, "alice", 1))
+        state.reservations.append(_overstayer(3, "dave", 4))
+        config = _config(preemption_lead_minutes=15)
+
+        pods = [
+            _pod("v1", booking_reference="res-2", reservation_id=2, gpu_count=1),
+            _pod("v2", booking_reference="res-3", reservation_id=3, gpu_count=1),
+        ]
+        deleted, _events = _patch_snapshots(
+            monkeypatch, m, pods=pods, capacity={GPU_CLASS_LABEL: 2}
+        )
+        client = _FakeSelectClient(["v2"])
+
+        asyncio.run(m._run_preemption_sweep(state, config, client, now=S))
+        assert deleted == [(USERNAME, "pod-v2")]
+
+    def test_empty_selection_is_respected(self, monkeypatch):
+        """An empty app response means 'spare everyone' — nothing is killed even
+        though an eligible candidate exists (no fallback to local)."""
+        m = _main_module(monkeypatch)
+        state = _state(_boundary_reservation(1, gpu_count=1))
+        state.reservations.append(_overstayer(2, "alice", 1))
+        config = _config(preemption_lead_minutes=15)
+
+        pod = _pod("v1", booking_reference="res-2", reservation_id=2, gpu_count=1)
+        deleted, _events = _patch_snapshots(
+            monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 1}
+        )
+        client = _FakeSelectClient([])
+
+        asyncio.run(m._run_preemption_sweep(state, config, client, now=S))
+        assert deleted == []
+
+    def test_none_response_falls_back_to_local(self, monkeypatch):
+        """A failed app call (None) falls back to local random selection so
+        preemption still happens when the app is unreachable."""
+        m = _main_module(monkeypatch)
+        state = _state(_boundary_reservation(1, gpu_count=1))
+        state.reservations.append(_overstayer(2, "alice", 1))
+        config = _config(preemption_lead_minutes=15)
+
+        pod = _pod("v1", booking_reference="res-2", reservation_id=2, gpu_count=1)
+        deleted, _events = _patch_snapshots(
+            monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 1}
+        )
+        client = _FakeSelectClient(None)
+
+        asyncio.run(m._run_preemption_sweep(state, config, client, now=S))
+        assert deleted == [(USERNAME, "pod-v1")]
+
+    def test_unknown_uid_is_ignored(self, monkeypatch):
+        """A response naming a pod the controller never offered kills nothing —
+        the controller only ever deletes candidates it deemed preemptable."""
+        m = _main_module(monkeypatch)
+        state = _state(_boundary_reservation(1, gpu_count=1))
+        state.reservations.append(_overstayer(2, "alice", 1))
+        config = _config(preemption_lead_minutes=15)
+
+        pod = _pod("v1", booking_reference="res-2", reservation_id=2, gpu_count=1)
+        deleted, _events = _patch_snapshots(
+            monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 1}
+        )
+        client = _FakeSelectClient(["ghost-pod"])
+
+        asyncio.run(m._run_preemption_sweep(state, config, client, now=S))
+        assert deleted == []
+
+    def test_delegation_disabled_skips_app(self, monkeypatch):
+        """With PREEMPTION_DELEGATE_SELECTION off, the app is never called and
+        the local random selection kills the overstayer."""
+        m = _main_module(monkeypatch)
+        state = _state(_boundary_reservation(1, gpu_count=1))
+        state.reservations.append(_overstayer(2, "alice", 1))
+        config = _config(preemption_lead_minutes=15, preemption_delegate_selection=False)
+
+        pod = _pod("v1", booking_reference="res-2", reservation_id=2, gpu_count=1)
+        deleted, _events = _patch_snapshots(
+            monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 1}
+        )
+        client = _FakeSelectClient(["v1"])
+
+        asyncio.run(m._run_preemption_sweep(state, config, client, now=S))
+        assert deleted == [(USERNAME, "pod-v1")]
+        assert client.requests == []

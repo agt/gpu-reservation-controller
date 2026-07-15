@@ -115,3 +115,46 @@ class OnDemandReservationRequest(BaseModel):
     duration_seconds: int
     on_demand: bool = True
     idempotency_key: str
+
+
+# ---------------------------------------------------------------------------
+# Preemption victim selection (POST /api/reservations/preemption-victims)
+# ---------------------------------------------------------------------------
+
+
+class PreemptionCandidate(BaseModel):
+    """One eligible overstay pod offered to the app for victim selection.
+
+    The controller has already decided this pod is *preemptable* — live,
+    past its runtime guarantee, admitted by this controller, of the class in
+    question.  ``reservation_id`` is the pod's booking-reference id: the app's
+    handle for looking the reservation (and thus its owner/group/kind) up when
+    it prioritises.  ``pod_uid`` is opaque to the app — it is echoed back in the
+    response so the controller can map the choice to a pod to delete.
+    """
+
+    pod_uid: str
+    namespace: str
+    pod_name: str
+    gpu_class: str          # Kubernetes label value (e.g. "h100")
+    gpu_count: int
+    reservation_id: int     # booking-reference id (always set — eligibility requires it)
+
+
+class PreemptionSelectionRequest(BaseModel):
+    """Body of ``POST /api/reservations/preemption-victims``.
+
+    ``needed_by_class`` is how many GPUs must be reclaimed per gpu-class label
+    at one boundary; ``candidates`` is the full eligible pool the app chooses
+    from.  The app returns the victims it selects; the controller kills only
+    those (and only ones it offered).
+    """
+
+    needed_by_class: dict[str, int]
+    candidates: list[PreemptionCandidate]
+
+
+class PreemptionSelectionResponse(BaseModel):
+    """Victims the app chose to preempt, as the ``pod_uid``s it was offered."""
+
+    victim_pod_uids: list[str]

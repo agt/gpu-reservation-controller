@@ -34,12 +34,15 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from .config import Config
 from .controller import (
     TOLERATION_KEY,
+    BoundaryPreemptionNeed,
     ControllerState,
     OnDemandCandidate,
     PodRuntimeView,
     QueueEntry,
     apply_push_to_active,
+    build_preemption_plan,
     canceller_description,
+    select_victims_locally,
     slot_end,
     slot_start,
 )
@@ -74,6 +77,8 @@ from .k8s_client import (
 from .reservation_client import ReservationClient
 from .schemas import (
     OnDemandReservationRequest,
+    PreemptionCandidate,
+    PreemptionSelectionRequest,
     ReservationPushRequest,
     ReservationPushResponse,
     ReservationResponse,
@@ -1286,8 +1291,89 @@ async def _adopt_pods(
             )
 
 
+def _build_selection_request(need: BoundaryPreemptionNeed) -> PreemptionSelectionRequest:
+    """Flatten a boundary's per-class candidate pool into an app request body."""
+    candidates = [
+        PreemptionCandidate(
+            pod_uid=p.uid,
+            namespace=p.namespace,
+            pod_name=p.name,
+            gpu_class=gpu_class,
+            gpu_count=p.gpu_count,
+            reservation_id=p.reservation_id,
+        )
+        for gpu_class, cands in need.candidates_by_class.items()
+        for p in cands
+    ]
+    return PreemptionSelectionRequest(
+        needed_by_class=dict(need.kills_needed_by_class),
+        candidates=candidates,
+    )
+
+
+def _map_selected_victims(
+    need: BoundaryPreemptionNeed, uids: list[str]
+) -> dict[str, list[PodRuntimeView]]:
+    """Resolve the app's chosen ``pod_uid``s back to candidate views, by class.
+
+    Only pods the controller actually *offered* can be selected: an unknown or
+    duplicate uid is dropped (the app can choose among the candidates but can
+    never introduce a new victim), so a buggy or malicious response can never
+    make the controller kill a pod it did not independently deem preemptable.
+    """
+    by_uid = {
+        p.uid: (gpu_class, p)
+        for gpu_class, cands in need.candidates_by_class.items()
+        for p in cands
+    }
+    selected: dict[str, list[PodRuntimeView]] = {}
+    seen: set[str] = set()
+    for uid in uids:
+        entry = by_uid.get(uid)
+        if entry is None:
+            log.warning(
+                "Preemption victim selection returned unknown pod uid=%s; ignoring",
+                uid,
+            )
+            continue
+        if uid in seen:
+            continue
+        seen.add(uid)
+        gpu_class, view = entry
+        selected.setdefault(gpu_class, []).append(view)
+    return selected
+
+
+async def _select_boundary_victims(
+    config: Config,
+    client: Optional[ReservationClient],
+    need: BoundaryPreemptionNeed,
+) -> dict[str, list[PodRuntimeView]]:
+    """Choose victims for one boundary, delegating to the app when possible.
+
+    When delegation is enabled and a client is available, the eligible pool is
+    sent to the app (``POST /api/reservations/preemption-victims``) so it can
+    prioritise; the returned uids are mapped back to candidate views.  A
+    ``None`` return (endpoint absent / network / parse failure) falls back to
+    local uniform-random selection so preemption still works when the app is
+    unreachable — an empty list, by contrast, is a deliberate app decision and
+    is respected as-is.
+    """
+    if config.preemption_delegate_selection and client is not None:
+        uids = await client.select_preemption_victims(_build_selection_request(need))
+        if uids is not None:
+            return _map_selected_victims(need, uids)
+        log.warning(
+            "Preemption victim selection unavailable; using local random fallback"
+        )
+    return select_victims_locally(need)
+
+
 async def _run_preemption_sweep(
-    state: ControllerState, config: Config, now: Optional[datetime] = None
+    state: ControllerState,
+    config: Config,
+    client: Optional[ReservationClient] = None,
+    now: Optional[datetime] = None,
 ) -> None:
     """One preemption-sweep evaluation: clear demand at any in-scope boundary.
 
@@ -1340,7 +1426,15 @@ async def _run_preemption_sweep(
                 continue
             fired.add(phase)
             available_pods = [p for p in pods if p.uid not in doomed]
-            plan = state.plan_boundary_preemption(boundary, capacity, available_pods, now)
+            need = state.plan_boundary_candidates(boundary, capacity, available_pods, now)
+            # Delegate the *choice* of victims to the app (it can prioritise);
+            # the controller still owns which pods are eligible at all.  Skip the
+            # round-trip entirely when nothing needs reclaiming here.
+            if need.kills_needed_by_class:
+                selected = await _select_boundary_victims(config, client, need)
+            else:
+                selected = {}
+            plan = build_preemption_plan(need, selected)
             if plan.demand_by_class:
                 log.info(
                     "Preemption sweep boundary=%s phase=%s: demand=%s free=%s kills=%d",
@@ -1375,12 +1469,19 @@ async def _run_preemption_sweep(
             await _preempt_pod(state, victim.namespace, victim.name, victim.uid, message)
 
 
-async def preemption_loop(state: ControllerState, config: Config) -> None:
-    """Every ``config.preemption_check_interval`` s, run a preemption sweep."""
+async def preemption_loop(
+    state: ControllerState, client: ReservationClient, config: Config
+) -> None:
+    """Every ``config.preemption_check_interval`` s, run a preemption sweep.
+
+    Passes the reservation *client* through so the sweep can delegate victim
+    selection to the app (``PREEMPTION_DELEGATE_SELECTION``); the sweep falls
+    back to local random selection if that call fails.
+    """
     while True:
         await asyncio.sleep(config.preemption_check_interval)
         try:
-            await _run_preemption_sweep(state, config)
+            await _run_preemption_sweep(state, config, client)
         except Exception as exc:  # noqa: BLE001
             log.error("Preemption sweep failed: %s", exc, exc_info=True)
 
@@ -1447,7 +1548,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         asyncio.create_task(
             queue_processor_loop(state, client, config), name="queue-processor"
         ),
-        asyncio.create_task(preemption_loop(state, config), name="preemption"),
+        asyncio.create_task(preemption_loop(state, client, config), name="preemption"),
     ]
     log.info("GPU reservation controller started")
 

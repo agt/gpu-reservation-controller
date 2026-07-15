@@ -21,6 +21,8 @@ from .config import Config
 from .schemas import (
     GpuClassDetail,
     OnDemandReservationRequest,
+    PreemptionSelectionRequest,
+    PreemptionSelectionResponse,
     ReservationResponse,
 )
 
@@ -178,6 +180,41 @@ class ReservationClient:
                 "Could not parse on-demand reservation response for pod uid=%s: %s",
                 req.idempotency_key,
                 exc,
+            )
+            return None
+
+    async def select_preemption_victims(
+        self, req: PreemptionSelectionRequest
+    ) -> Optional[list[str]]:
+        """Ask the app to choose which overstay candidates to preempt.
+
+        Returns the selected pod UIDs (possibly empty — the app may deliberately
+        spare pods), or ``None`` on any failure (endpoint missing on an older
+        app, network error, non-2xx, unparseable body).  A ``None`` return tells
+        the caller to fall back to local random selection; an empty list is a
+        deliberate app decision and is respected.  Degrades like the other
+        client calls so a transient failure never aborts the preemption sweep.
+        """
+        try:
+            resp = await self._client.post(
+                "/api/reservations/preemption-victims",
+                json=req.model_dump(mode="json"),
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            return PreemptionSelectionResponse.model_validate(resp.json()).victim_pod_uids
+        except httpx.HTTPStatusError as exc:
+            log.warning(
+                "Preemption victim selection request failed: HTTP %s",
+                exc.response.status_code,
+            )
+            return None
+        except httpx.RequestError as exc:
+            log.warning("Preemption victim selection request failed: %s", exc)
+            return None
+        except (ValidationError, ValueError) as exc:
+            log.warning(
+                "Could not parse preemption victim selection response: %s", exc
             )
             return None
 
