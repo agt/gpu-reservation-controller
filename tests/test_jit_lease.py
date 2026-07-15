@@ -304,19 +304,30 @@ def _state_ready() -> ControllerState:
 
 
 class _FakeClient:
-    def __init__(self, *, lease=None, cancel_result=True):
+    def __init__(self, *, lease=None, leases=None, cancel_result=True, select_response=None):
         self._lease = lease
+        # Per-uid leases (keyed by idempotency_key = pod uid) so a batch grant
+        # gives each pod its own reservation id; falls back to ``lease``.
+        self._leases = leases or {}
         self.cancel_result = cancel_result
+        # Return value for select_ondemand_admissions: a list of granted uids,
+        # or None to simulate an unavailable endpoint (fallback to grant-all).
+        self._select_response = select_response
         self.create_requests: list = []
         self.cancel_calls: list = []
+        self.select_requests: list = []
 
     async def create_ondemand_reservation(self, req):
         self.create_requests.append(req)
-        return self._lease
+        return self._leases.get(req.idempotency_key, self._lease)
 
     async def cancel_reservation(self, reservation_id, reason):
         self.cancel_calls.append((reservation_id, reason))
         return self.cancel_result
+
+    async def select_ondemand_admissions(self, req):
+        self.select_requests.append(req)
+        return self._select_response
 
 
 def _patch_admission(monkeypatch, m, *, apply_error=None):
@@ -583,3 +594,204 @@ class TestTryRequestLease:
         assert result is True
         assert client.create_requests == []  # no lease requested
         assert state.occupancy.get(9, {}).get("uid-1") == 1  # admitted under the reservation
+
+
+# ---------------------------------------------------------------------------
+# main._run_ondemand_admission (batch, app-delegated selection)
+# ---------------------------------------------------------------------------
+
+
+def _admission_config(*, placement=True, delegate=True):
+    return SimpleNamespace(
+        ondemand_placement_enabled=placement,
+        ondemand_delegate_admission=delegate,
+        ondemand_horizon_minutes=30,
+        ondemand_lease_buffer_minutes=10,
+        scheduling_gate_name=None,
+    )
+
+
+def _ready_state_with_candidates(uids):
+    state = _state_ready()
+    for uid in uids:
+        state.ondemand_candidates[uid] = _candidate(uid)
+    return state
+
+
+class TestRunOndemandAdmission:
+    def test_delegation_grants_only_selected_uids(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        # Distinct lease per pod so occupancy does not collide.
+        leases = {"uid-1": _lease(701), "uid-2": _lease(702), "uid-3": _lease(703)}
+        client = _FakeClient(leases=leases, select_response=["uid-1", "uid-3"])
+        state = _ready_state_with_candidates(["uid-1", "uid-2", "uid-3"])
+        deferred_before = state.ondemand_candidates["uid-2"].next_attempt_at
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_gpu_only_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        _patch_admission(monkeypatch, m)
+
+        asyncio.run(m._run_ondemand_admission(state, client, _admission_config()))
+
+        # Exactly one selection call, offering all three.
+        assert len(client.select_requests) == 1
+        offered = {c.pod_uid for c in client.select_requests[0].candidates}
+        assert offered == {"uid-1", "uid-2", "uid-3"}
+        # Only granted pods got a lease + occupancy and were removed.
+        assert {r.idempotency_key for r in client.create_requests} == {"uid-1", "uid-3"}
+        assert state.occupancy.get(701, {}).get("uid-1") == 1
+        assert state.occupancy.get(703, {}).get("uid-3") == 1
+        assert "uid-1" not in state.ondemand_candidates
+        assert "uid-3" not in state.ondemand_candidates
+        # The deferred pod is kept and cooled down for a later tick.
+        assert "uid-2" in state.ondemand_candidates
+        assert state.ondemand_candidates["uid-2"].next_attempt_at > deferred_before
+
+    def test_none_response_falls_back_to_grant_all(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        leases = {"uid-1": _lease(711), "uid-2": _lease(712)}
+        client = _FakeClient(leases=leases, select_response=None)  # endpoint unavailable
+        state = _ready_state_with_candidates(["uid-1", "uid-2"])
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_gpu_only_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        _patch_admission(monkeypatch, m)
+
+        asyncio.run(m._run_ondemand_admission(state, client, _admission_config()))
+
+        # The app was asked, but on None every offered candidate is granted.
+        assert len(client.select_requests) == 1
+        assert {r.idempotency_key for r in client.create_requests} == {"uid-1", "uid-2"}
+        assert state.ondemand_candidates == {}
+
+    def test_flag_off_grants_all_without_calling_app(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        leases = {"uid-1": _lease(721), "uid-2": _lease(722)}
+        client = _FakeClient(leases=leases, select_response=["uid-1"])  # would only grant 1
+        state = _ready_state_with_candidates(["uid-1", "uid-2"])
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_gpu_only_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        _patch_admission(monkeypatch, m)
+
+        asyncio.run(
+            m._run_ondemand_admission(state, client, _admission_config(delegate=False))
+        )
+
+        # Delegation off: the app is never consulted and everyone is granted.
+        assert client.select_requests == []
+        assert {r.idempotency_key for r in client.create_requests} == {"uid-1", "uid-2"}
+        assert state.ondemand_candidates == {}
+
+    def test_empty_response_grants_none(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=_lease(731), select_response=[])  # spare all
+        state = _ready_state_with_candidates(["uid-1", "uid-2"])
+        before = {u: c.next_attempt_at for u, c in state.ondemand_candidates.items()}
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_gpu_only_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        _patch_admission(monkeypatch, m)
+
+        asyncio.run(m._run_ondemand_admission(state, client, _admission_config()))
+
+        # Empty grant is respected: no leases, both candidates kept + cooled down.
+        assert client.create_requests == []
+        assert set(state.ondemand_candidates) == {"uid-1", "uid-2"}
+        for uid, cand in state.ondemand_candidates.items():
+            assert cand.next_attempt_at > before[uid]
+
+    def test_unknown_granted_uid_is_ignored(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        client = _FakeClient(
+            leases={"uid-1": _lease(741)}, select_response=["uid-1", "ghost-uid"]
+        )
+        state = _ready_state_with_candidates(["uid-1"])
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_gpu_only_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        _patch_admission(monkeypatch, m)
+
+        asyncio.run(m._run_ondemand_admission(state, client, _admission_config()))
+
+        # Only the offered uid is created; the phantom uid never becomes a create.
+        assert {r.idempotency_key for r in client.create_requests} == {"uid-1"}
+        assert state.ondemand_candidates == {}
+
+    def test_preflight_drop_removes_candidate_and_omits_from_offer(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        client = _FakeClient(leases={"uid-1": _lease(751)}, select_response=["uid-1"])
+        state = _ready_state_with_candidates(["uid-1", "gone-uid"])
+        # Drive read_pod by pod name: the gone pod reads terminal (Succeeded).
+        state.ondemand_candidates["gone-uid"].pod_name = "gone-pod"
+
+        async def routing_read_pod(name, namespace):
+            if name == "gone-pod":
+                return _pod(phase="Succeeded")
+            return _pod(conditions=[_gpu_only_condition()])
+
+        monkeypatch.setattr(m, "read_pod", routing_read_pod)
+        _patch_admission(monkeypatch, m)
+
+        asyncio.run(m._run_ondemand_admission(state, client, _admission_config()))
+
+        # The terminal pod is dropped before the offer; only uid-1 is offered.
+        assert len(client.select_requests) == 1
+        assert {c.pod_uid for c in client.select_requests[0].candidates} == {"uid-1"}
+        assert "gone-uid" not in state.ondemand_candidates
+        assert state.ondemand_candidates == {}
+
+    def test_placement_disabled_is_a_noop(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=_lease(761), select_response=["uid-1"])
+        state = _ready_state_with_candidates(["uid-1"])
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_gpu_only_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+
+        asyncio.run(
+            m._run_ondemand_admission(state, client, _admission_config(placement=False))
+        )
+
+        assert client.select_requests == []
+        assert client.create_requests == []
+        assert "uid-1" in state.ondemand_candidates  # untouched
+
+    def test_reentrant_trigger_coalesces_into_one_trailing_run(self, monkeypatch):
+        """A trigger arriving while a batch runs sets the rerun flag and returns
+        immediately; exactly one trailing pass runs afterwards."""
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=_lease(771), select_response=[])
+        state = _ready_state_with_candidates(["uid-1"])
+
+        reentered = {"count": 0}
+
+        async def fake_read_pod(name, namespace):
+            # Re-enter once while the lock is held: the nested call must not
+            # start its own batch, only request a rerun.
+            if reentered["count"] == 0:
+                reentered["count"] += 1
+                await m._run_ondemand_admission(state, client, _admission_config())
+                assert state.ondemand_rerun_requested is True
+            return _pod(conditions=[_gpu_only_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        _patch_admission(monkeypatch, m)
+
+        asyncio.run(m._run_ondemand_admission(state, client, _admission_config()))
+
+        # The nested trigger did not launch a parallel batch; the outer loop ran
+        # the trailing pass and cleared the flag.
+        assert state.ondemand_rerun_requested is False

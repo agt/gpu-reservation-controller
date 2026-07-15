@@ -81,6 +81,8 @@ from .schemas import (
     ForecastClassSummary,
     ForecastPod,
     ForecastPodBucket,
+    OnDemandAdmissionCandidate,
+    OnDemandAdmissionRequest,
     OnDemandReservationRequest,
     PreemptionCandidate,
     PreemptionRiskForecastResponse,
@@ -539,37 +541,41 @@ async def _try_apply_toleration(
 
 
 # ---------------------------------------------------------------------------
-# JIT on-demand lease request coroutine
+# JIT on-demand admission: preflight, grant, and the batch orchestrator
 # ---------------------------------------------------------------------------
 
+# Preflight outcomes (see _preflight_ondemand_candidate).
+_PREFLIGHT_REMOVE = "remove"  # candidate is done: gone/terminal, rerouted, or ineligible
+_PREFLIGHT_RETRY = "retry"    # keep it; candidate.next_attempt_at already pushed forward
+_PREFLIGHT_READY = "ready"    # candidate is a valid on-demand ask (2nd tuple element set)
 
-async def _try_request_lease(
+
+async def _preflight_ondemand_candidate(
     state: ControllerState,
-    client: ReservationClient,
     config: Config,
     uid: str,
     candidate: OnDemandCandidate,
-) -> bool:
-    """Attempt to secure GPU access for a JIT on-demand candidate.
+) -> tuple[str, Optional[OnDemandAdmissionCandidate]]:
+    """Vet a JIT candidate before it is offered to the app for admission.
 
-    Returns ``True``  — candidate should be removed (routed to the reserved
-                        queue instead, dropped, or admitted under a granted lease).
-    Returns ``False`` — candidate should remain; ``candidate.next_attempt_at``
-                        has been pushed forward.
+    Runs the controller-owned eligibility checks (formerly steps 1-5 of
+    ``_try_request_lease``):
 
-    Steps:
     1. Re-read the pod; drop if gone/terminal/Unknown.
     2. Re-run the reserved-path routing check: a matching reservation may have
        appeared since the candidate was queued (a new booking, or simply time
        passing into the horizon) — route there instead of requesting a lease.
     3. Guard 1 (GPU-only-pending).
     4. Guard 3 (stuck reservation-holder safety interlock).
-    5. Resolve the pod's gpu-class label to a numeric id.
-    6. Request a JIT lease (``create_ondemand_reservation``); a denial cools
-       the candidate down for a retry.
-    7. On grant, admit the pod under the new lease; if admission does not
-       succeed, issue a compensating cancel (``reason="controller-revoked"``)
-       so the lease is not left dangling.
+    5. Resolve the pod's gpu-class label to a numeric id and size the lease.
+
+    Returns one of:
+    - ``(_PREFLIGHT_REMOVE, None)`` — drop the candidate (gone/terminal, routed
+      to the reserved queue, or not GPU-only-pending).
+    - ``(_PREFLIGHT_RETRY, None)`` — keep it; ``candidate.next_attempt_at`` has
+      been pushed forward (transient read error, conditions not yet set, guard-3
+      interlock, or unknown gpu-class id).
+    - ``(_PREFLIGHT_READY, ask)`` — the candidate is a valid on-demand ask.
     """
     now = datetime.now(timezone.utc)
     try:
@@ -582,7 +588,7 @@ async def _try_request_lease(
             exc,
         )
         candidate.next_attempt_at = _jittered_retry_at(now)
-        return False
+        return _PREFLIGHT_RETRY, None
 
     phase = get_pod_phase(fresh_pod)
     if phase in TERMINAL_PHASES or phase == "Unknown":
@@ -592,7 +598,7 @@ async def _try_request_lease(
             candidate.pod_name,
             phase,
         )
-        return True
+        return _PREFLIGHT_REMOVE, None
 
     # Step 2: a matching reservation may have appeared since this candidate
     # was queued (or since its last attempt) — prefer it over requesting a
@@ -627,7 +633,7 @@ async def _try_request_lease(
             ):
                 if await _try_apply_toleration(state, uid, entry, config.scheduling_gate_name):
                     state.dequeue_pod(uid)
-        return True
+        return _PREFLIGHT_REMOVE, None
 
     # Guard 1: GPU-only-pending check.
     gpu_only = is_gpu_only_pending(fresh_pod)
@@ -638,7 +644,7 @@ async def _try_request_lease(
             candidate.pod_name,
             get_unschedulable_message(fresh_pod),
         )
-        return True
+        return _PREFLIGHT_REMOVE, None
     if gpu_only is None:
         log.debug(
             "On-demand candidate %s/%s: scheduling conditions not yet set; retry shortly",
@@ -646,7 +652,7 @@ async def _try_request_lease(
             candidate.pod_name,
         )
         candidate.next_attempt_at = _short_retry_at(now)
-        return False
+        return _PREFLIGHT_RETRY, None
 
     # Guard 3: safety interlock — hold JIT requests for any GPU class that has
     # a stuck reservation-holder pod.  Other classes are unaffected.
@@ -659,7 +665,7 @@ async def _try_request_lease(
             candidate.gpu_class_label,
         )
         candidate.next_attempt_at = _short_retry_at(now)
-        return False
+        return _PREFLIGHT_RETRY, None
 
     gpu_class_id = state.gpu_class_ids.get(candidate.gpu_class_label)
     if gpu_class_id is None:
@@ -670,15 +676,46 @@ async def _try_request_lease(
             candidate.gpu_class_label,
         )
         candidate.next_attempt_at = _jittered_retry_at(now)
-        return False
+        return _PREFLIGHT_RETRY, None
 
     duration_seconds = candidate.min_runtime_seconds + config.ondemand_lease_buffer_minutes * 60
-    request = OnDemandReservationRequest(
+    ask = OnDemandAdmissionCandidate(
+        pod_uid=uid,
         username=candidate.pod_namespace,
         group_name=candidate.group_label,
         gpu_class_id=gpu_class_id,
         gpu_count=candidate.gpu_requested,
         duration_seconds=duration_seconds,
+    )
+    return _PREFLIGHT_READY, ask
+
+
+async def _grant_and_admit(
+    state: ControllerState,
+    client: ReservationClient,
+    config: Config,
+    uid: str,
+    candidate: OnDemandCandidate,
+    ask: OnDemandAdmissionCandidate,
+) -> bool:
+    """Create a JIT lease for a preflight-approved candidate and admit its pod.
+
+    (Formerly steps 6-7 of ``_try_request_lease``.)  Requests the lease
+    (``create_ondemand_reservation``, idempotent by pod UID); on grant, admits
+    the pod under it and, if admission does not land, issues a compensating
+    cancel (``reason="controller-revoked"``) so the lease is not left dangling.
+
+    Returns ``True`` if the candidate is done (admitted, or the pod went terminal
+    while granting and the compensating cancel released the lease); ``False`` to
+    retry — ``candidate.next_attempt_at`` has been pushed forward.
+    """
+    now = datetime.now(timezone.utc)
+    request = OnDemandReservationRequest(
+        username=ask.username,
+        group_name=ask.group_name,
+        gpu_class_id=ask.gpu_class_id,
+        gpu_count=ask.gpu_count,
+        duration_seconds=ask.duration_seconds,
         idempotency_key=uid,
     )
     lease = await client.create_ondemand_reservation(request)
@@ -702,7 +739,7 @@ async def _try_request_lease(
         candidate.pod_name,
         candidate.gpu_class_label,
         candidate.gpu_requested,
-        duration_seconds,
+        ask.duration_seconds,
     )
 
     async with state.reservation_lock:
@@ -739,6 +776,144 @@ async def _try_request_lease(
     # request a fresh lease on its next attempt.
     candidate.next_attempt_at = _jittered_retry_at(now)
     return False
+
+
+async def _try_request_lease(
+    state: ControllerState,
+    client: ReservationClient,
+    config: Config,
+    uid: str,
+    candidate: OnDemandCandidate,
+) -> bool:
+    """Single-pod JIT admission: preflight, then (if ready) grant + admit.
+
+    Thin wrapper preserving the original bool contract — ``True`` = remove the
+    candidate (rerouted, dropped, or admitted), ``False`` = keep it
+    (``next_attempt_at`` pushed forward).  The batch orchestrator
+    (``_run_ondemand_admission``) calls the two seams separately so it can insert
+    the app's admission decision between preflight and grant.
+    """
+    status, ask = await _preflight_ondemand_candidate(state, config, uid, candidate)
+    if status == _PREFLIGHT_READY:
+        assert ask is not None
+        return await _grant_and_admit(state, client, config, uid, candidate, ask)
+    return status == _PREFLIGHT_REMOVE
+
+
+def _build_admission_request(
+    ready: list[tuple[str, OnDemandCandidate, OnDemandAdmissionCandidate]],
+) -> OnDemandAdmissionRequest:
+    """Flatten preflight-approved candidates into an app request body."""
+    return OnDemandAdmissionRequest(candidates=[ask for _, _, ask in ready])
+
+
+def _map_granted_uids(
+    ready: list[tuple[str, OnDemandCandidate, OnDemandAdmissionCandidate]],
+    granted: list[str],
+) -> set[str]:
+    """Resolve the app's granted uids to the offered set, dropping unknowns.
+
+    Only pods the controller actually *offered* can be granted: an unknown uid
+    is ignored (the app chooses among the candidates but can never introduce a
+    new one), so a buggy or malicious response can never make the controller
+    admit a pod it did not independently deem eligible this round.
+    """
+    offered = {uid for uid, _, _ in ready}
+    result: set[str] = set()
+    for uid in granted:
+        if uid in offered:
+            result.add(uid)
+        else:
+            log.warning(
+                "On-demand admission selection returned unknown pod uid=%s; ignoring",
+                uid,
+            )
+    return result
+
+
+async def _run_ondemand_admission_once(
+    state: ControllerState,
+    client: ReservationClient,
+    config: Config,
+) -> None:
+    """Run one on-demand admission pass over all due candidates.
+
+    Preflights every due candidate (FIFO by creation time), offers the survivors
+    to the app for LAS prioritisation when delegation is enabled, and creates +
+    admits a lease for each granted candidate.  A non-granted survivor cools down
+    for a normal-clock retry (same backoff as a denial).
+    """
+    now = datetime.now(timezone.utc)
+    ordered = sorted(
+        state.ondemand_candidates.items(), key=lambda kv: kv[1].pod_created_at
+    )
+    ready: list[tuple[str, OnDemandCandidate, OnDemandAdmissionCandidate]] = []
+    for uid, candidate in ordered:
+        if now < candidate.next_attempt_at:
+            continue
+        status, ask = await _preflight_ondemand_candidate(state, config, uid, candidate)
+        if status == _PREFLIGHT_REMOVE:
+            state.remove_ondemand_candidate(uid)
+        elif status == _PREFLIGHT_READY:
+            assert ask is not None
+            ready.append((uid, candidate, ask))
+        # _PREFLIGHT_RETRY: leave in place; next_attempt_at already stamped.
+
+    if not ready:
+        return
+
+    # Default (and fallback): grant every offered candidate — today's greedy
+    # per-pod behaviour.  When delegation is enabled and the app answers, its
+    # subset wins; an empty answer is respected (grant none this round).
+    granted = {uid for uid, _, _ in ready}
+    if config.ondemand_delegate_admission:
+        result = await client.select_ondemand_admissions(_build_admission_request(ready))
+        if result is not None:
+            granted = _map_granted_uids(ready, result)
+        else:
+            log.warning(
+                "On-demand admission selection unavailable; granting all %d "
+                "due candidate(s)",
+                len(ready),
+            )
+
+    deferred_at = datetime.now(timezone.utc)
+    for uid, candidate, ask in ready:
+        if uid in granted:
+            if await _grant_and_admit(state, client, config, uid, candidate, ask):
+                state.remove_ondemand_candidate(uid)
+        else:
+            # The app deferred this pod this round — cool it down like a denial
+            # so it is re-offered on a later tick, not spun on every trigger.
+            candidate.next_attempt_at = _jittered_retry_at(deferred_at)
+
+
+async def _run_ondemand_admission(
+    state: ControllerState,
+    client: ReservationClient,
+    config: Config,
+) -> None:
+    """Drive a coalesced batch of JIT on-demand admissions.
+
+    Serialised by ``state.ondemand_admission_lock``: only one batch runs at a
+    time.  A trigger arriving while a batch is in flight sets
+    ``ondemand_rerun_requested`` and returns immediately (non-blocking), so an
+    ADDED burst collapses into at most one in-flight + one trailing batch rather
+    than launching a full batch per event.  (The lock check precedes the first
+    ``await``, so the check-then-acquire is race-free under asyncio's
+    single-threaded model.)
+    """
+    if not config.ondemand_placement_enabled:
+        return
+    if state.ondemand_admission_lock.locked():
+        state.ondemand_rerun_requested = True
+        return
+    async with state.ondemand_admission_lock:
+        while True:
+            state.ondemand_rerun_requested = False
+            await _run_ondemand_admission_once(state, client, config)
+            if not state.ondemand_rerun_requested:
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -1003,14 +1178,14 @@ async def pod_watch_loop(
                         uid, name, namespace, gpu_class_label, gpu_count, min_rt,
                         pod_created_at, group_label,
                     )
-                # Attempt immediately (ADDED) and on every subsequent MODIFIED
-                # re-check (respecting the retry cooldown), so a guard-1 "not
-                # yet scheduled" short retry resolves quickly rather than
-                # waiting a full queue-processor tick.
-                candidate = state.ondemand_candidates.get(uid)
-                if candidate is not None and now >= candidate.next_attempt_at:
-                    if await _try_request_lease(state, client, config, uid, candidate):
-                        state.remove_ondemand_candidate(uid)
+                    # Responsive path: a newly-discovered candidate kicks an
+                    # immediate admission batch covering it plus every other due
+                    # waiter (coalesced, so an ADDED burst does not launch a
+                    # batch per event).  MODIFIED events deliberately do NOT
+                    # re-trigger — denial and guard retries ride the
+                    # queue-processor tick — so a burst of reconcile MODIFIEDs
+                    # cannot hammer the reservation app.
+                    await _run_ondemand_admission(state, client, config)
                 continue
 
             # Not JIT-eligible (missing the min-runtime annotation or the
@@ -1203,16 +1378,10 @@ async def queue_processor_loop(
         for uid in to_remove:
             state.dequeue_pod(uid)
 
-        # --- JIT on-demand path: request leases for due candidates, FIFO ---
-        if config.ondemand_placement_enabled:
-            ordered = sorted(
-                state.ondemand_candidates.items(), key=lambda kv: kv[1].pod_created_at
-            )
-            for cand_uid, candidate in ordered:
-                if now < candidate.next_attempt_at:
-                    continue
-                if await _try_request_lease(state, client, config, cand_uid, candidate):
-                    state.remove_ondemand_candidate(cand_uid)
+        # --- JIT on-demand path: batch-admit all due candidates in one pass
+        #     (app-delegated LAS selection when enabled; grant-all fallback
+        #     otherwise).  Coalesces with any watch-triggered batch. ---
+        await _run_ondemand_admission(state, client, config)
 
         log.debug(
             "Queue processor tick: %d reserved queue entr(ies), %d on-demand candidate(s)",

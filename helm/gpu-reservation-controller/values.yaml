@@ -66,6 +66,13 @@ config:
   # sizing the duration of a requested JIT lease.
   ondemandLeaseBufferMinutes: 10
 
+  # Delegate on-demand admission selection to the app for LAS prioritization:
+  # the controller offers the batch of eligible pending pods to
+  # POST /api/reservations/ondemand-admission and admits only the subset the app
+  # grants. Opt-in — leave false until the app implements the endpoint; false
+  # (or any app-call failure) grants every eligible candidate (greedy per-pod).
+  ondemandDelegateAdmission: false
+
   # Minutes after a reservation window opens before the holder is declared a
   # no-show and the controller durably cancels it app-side, freeing the
   # window for re-booking.

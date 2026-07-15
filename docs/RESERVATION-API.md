@@ -462,6 +462,72 @@ an older app).
 | 403 | Read-only key / non-admin JWT |
 | 422 | Malformed body (e.g. `gpu_count <= 0`) |
 
+### `POST /api/reservations/ondemand-admission`
+
+Choose which pending pods the controller should admit on-demand this round.
+Requires a `read_write` service key (or an admin JWT) — the same gate as the
+on-demand create, cancel, and preemption-victims endpoints. Advisory and
+**read-only**: it creates nothing and returns only a selection; the controller
+then creates a real lease for each granted pod via `POST /api/reservations` (see
+**Creating on-demand reservations**).
+
+This is the delegation point for **LAS (least-attained-service) prioritization**
+and any future admission policy. The controller has already determined *which*
+pending pods are eligible for a JIT lease this round (GPU-only-pending, not
+matched by an open reservation, past their retry cooldown, of a class that is
+not under the stuck-holder safety interlock). This endpoint decides *which* of
+those eligible pods to admit now, so prioritisation policy lives in the app
+rather than the controller. Each candidate is the exact "ask" a
+`POST /api/reservations` create would carry, so the app can weigh it against
+priority **and** the same feasibility analysis a create performs.
+
+```json
+{
+  "candidates": [
+    { "pod_uid": "abc-123", "username": "alice", "group_name": "cse142",
+      "gpu_class_id": 10, "gpu_count": 1, "duration_seconds": 1800 },
+    { "pod_uid": "def-456", "username": "bob", "group_name": null,
+      "gpu_class_id": 10, "gpu_count": 2, "duration_seconds": 1200 }
+  ]
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `candidates[].pod_uid` | Opaque pod identifier; echoed back verbatim in the response (equals the create's `idempotency_key`) |
+| `candidates[].username` | Reservation owner the lease would be created for (the pod's namespace) |
+| `candidates[].group_name` | Usage group the lease would be created under, or `null` when group matching is disabled |
+| `candidates[].gpu_class_id` | Numeric GPU-class id the lease would target |
+| `candidates[].gpu_count` | GPUs the pod requests |
+| `candidates[].duration_seconds` | Lease duration the controller would request (pod minimum-runtime + buffer) |
+
+The app returns the subset of `pod_uid`s it grants admission this round:
+
+```json
+{ "granted_pod_uids": ["abc-123"] }
+```
+
+The controller admits only pods it offered — a `pod_uid` in the response that was
+not in the request is ignored. An **empty** list is a deliberate "grant none this
+round" decision and is respected (the non-granted pods simply retry on a later
+tick). The controller falls back to granting **every** offered candidate (its
+prior greedy per-pod behaviour) only when the call itself fails (network error,
+non-2xx, or the endpoint being absent on an older app), or when
+`ONDEMAND_DELEGATE_ADMISSION` is disabled controller-side.
+
+For each granted pod the controller then issues an idempotent
+`POST /api/reservations` (keyed by `pod_uid`); a `409` there still applies — a
+grant this endpoint returns is an admission *decision*, and the subsequent create
+remains the authoritative feasibility check.
+
+**Responses**
+
+| Code | Condition |
+|------|-----------|
+| 200 | The response body `{ "granted_pod_uids": [...] }` (`OnDemandAdmissionResponse`) |
+| 403 | Read-only key / non-admin JWT |
+| 422 | Malformed body (e.g. `gpu_count <= 0`) |
+
 ### Reading the reservation time window
 
 Every `ReservationResponse` includes pre-computed UTC timestamps:

@@ -508,6 +508,16 @@ class ControllerState:
         # an inbound HTTP handler runs concurrently with the background loops.)
         self.reservation_lock: asyncio.Lock = asyncio.Lock()
 
+        # Serialises the batch on-demand admission run (``_run_ondemand_admission``
+        # in main): the pod-watch loop fires it immediately on a newly-discovered
+        # candidate while the queue-processor tick also drives it.  Only one batch
+        # runs at a time; a trigger arriving mid-batch sets ``ondemand_rerun_requested``
+        # so exactly one trailing batch runs afterwards, collapsing an ADDED burst
+        # into at most one in-flight + one trailing pass.  Distinct from
+        # ``reservation_lock`` (which the grant/admit step still takes briefly).
+        self.ondemand_admission_lock: asyncio.Lock = asyncio.Lock()
+        self.ondemand_rerun_requested: bool = False
+
     # ------------------------------------------------------------------
     # No-show tracking
     # ------------------------------------------------------------------

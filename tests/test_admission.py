@@ -83,6 +83,8 @@ class TestConfigFromEnv:
         assert c.scheduling_gate_name is None
         assert c.preemption_lead_minutes == 15
         assert c.preemption_check_interval == 60
+        # Delegation is opt-in: default off until the app ships the endpoint.
+        assert c.ondemand_delegate_admission is False
 
     def test_noshow_new_name_preferred_over_legacy(self, monkeypatch):
         from app.config import Config
@@ -115,6 +117,21 @@ class TestConfigFromEnv:
         monkeypatch.setenv("RESERVATION_API_KEY", "k")
         monkeypatch.setenv("ONDEMAND_PLACEMENT_ENABLED", value)
         assert Config.from_env().ondemand_placement_enabled is expected
+
+    @pytest.mark.parametrize("value,expected", [
+        ("true", True), ("1", True), ("yes", True), ("TRUE", True),
+        ("false", False), ("0", False), ("no", False), ("anything-else", False),
+    ])
+    def test_ondemand_delegate_admission_truthy_parsing(self, monkeypatch, value, expected):
+        # Opt-in flag: only explicit truthy values enable it (mirrors the
+        # inverse of the falsy-default flags).
+        from app.config import Config
+
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("RESERVATION_API_URL", "http://x")
+        monkeypatch.setenv("RESERVATION_API_KEY", "k")
+        monkeypatch.setenv("ONDEMAND_DELEGATE_ADMISSION", value)
+        assert Config.from_env().ondemand_delegate_admission is expected
 
 
 # ---------------------------------------------------------------------------
