@@ -29,8 +29,8 @@ class GpuClassBrief(BaseModel):
 
 class ReservationResponse(BaseModel):
     id: int
-    user_id: Optional[int] = None   # always set on current rows (nullability is legacy)
-    user: Optional[UserBrief] = None  # always set on current rows (nullability is legacy)
+    user_id: Optional[int] = None   # null for kind="reclaim"
+    user: Optional[UserBrief] = None  # null for kind="reclaim"
     group_id: Optional[int] = None
     group: Optional[GroupBrief] = None
     gpu_class_id: int
@@ -43,7 +43,7 @@ class ReservationResponse(BaseModel):
     gpu_count: int           # number of GPUs reserved
     su_cost: Optional[float] = None  # total Service Units; not consumed by the controller
     status: str              # "active" | "cancelled"
-    kind: str                # "booking" | "on_demand"
+    kind: str                # "booking" | "reclaim"
     notes: Optional[str] = None
     submitted_by_id: Optional[int] = None
     submitted_by: Optional[UserBrief] = None

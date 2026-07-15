@@ -20,7 +20,7 @@ Emitted once at process start and stop.  Source: `app/main.py` (`lifespan`).
 | INFO | `Initial fetch complete: N reservation(s), N GPU class(es) resolved` | Initial fetch succeeded; shows active reservation and resolved GPU-class counts. |
 | INFO | `No-show tracking initialised: N reservation(s) watched` | No-show deadline tracking armed for N user reservations. |
 | ERROR | `Initial reservation fetch failed (…); controller will retry in N s, pod matching may be delayed` | Startup fetch failed; controller continues but pod matching is degraded until the next retry succeeds. |
-| INFO | `GPU reservation controller started` | All five background loops are running. |
+| INFO | `GPU reservation controller started` | All four background loops are running. |
 | INFO | `Shutting down GPU reservation controller…` | SIGTERM or lifespan exit received; background tasks being cancelled. |
 | INFO | `Controller stopped` | All tasks have exited cleanly. |
 | INFO | `Kubernetes: loaded kubeconfig from <path>` | Out-of-cluster mode: kubeconfig loaded from the given path. |
@@ -199,29 +199,6 @@ running past their runtime guarantee. Sources: `app/main.py`
 
 ---
 
-## Lease renewal
-
-Emitted by the periodic sweep that renews (chains) on-demand leases nearing the
-end of their guaranteed block. Sources: `app/main.py` (`renewal_loop`,
-`_run_renewal_sweep`), `app/reservation_client.py` (`renew_reservation`),
-`app/k8s_client.py` (`emit_lease_renewed_event`, `emit_renewal_denied_event`).
-
-| Level | Message | Description |
-|-------|---------|-------------|
-| WARNING | `Renewal sweep: failed to snapshot pods: <exception>` | The pod LIST needed to find leases with a live pod failed; the entire sweep is skipped — no renewal is attempted on unknown state. |
-| INFO | `On-demand lease renewal denied for reservation #N: no capacity/budget` | The app returned 409 (`renew_reservation`); the lease cannot be extended right now. |
-| INFO | `On-demand lease #N not renewable: HTTP 400/404` | The lease ended, was cancelled, or is not on-demand; retrying will not help. |
-| INFO | `On-demand lease #N renewed for pod ns/name: end <old> -> <new>` | A renewal was granted and the lease's window was extended in place. |
-| WARNING | `On-demand lease #N could not be renewed for pod ns/name (no capacity/budget); lease ends <time> — job should checkpoint` | Capacity/budget was unavailable; the lease runs out its remaining time. Emitted once per lease (the id is marked to suppress repeats). |
-| INFO | `Emitted LeaseRenewed event for pod ns/name (reservation=#N, until=<time>)` | A `LeaseRenewed` Kubernetes event announced the later guarantee after a successful renewal. |
-| INFO | `Emitted RenewalDenied event for pod ns/name (reservation=#N, ends=<time>)` | A `RenewalDenied` Kubernetes event warned the user to checkpoint before the lease ends. |
-| DEBUG | `On-demand lease #N renewal was a no-op (end unchanged at <time>)` | An idempotent 200 (the lease already covered the target end, e.g. a same-hour retry); no event or re-annotation is emitted. |
-| WARNING | `On-demand lease renewal failed for reservation #N: <exception>` / `... returned HTTP <code>` | A transient network error or unexpected non-2xx; the lease is left un-marked and retried on the next sweep. |
-| WARNING | `Could not re-record guarantee / emit LeaseRenewed for pod ns/name: <exception>` | Best-effort re-annotation/event after a successful renewal failed; the renewal itself still stands. |
-| WARNING | `Could not emit RenewalDenied event for pod ns/name: <exception>` | Best-effort denial event emission failed; the lease is still marked to avoid repeat attempts. |
-
----
-
 ## Occupancy
 
 Emitted as the controller tracks GPU utilisation across all admission paths.
@@ -251,8 +228,6 @@ Low-level traces of every outbound Kubernetes API call.  Visible only at
 | DEBUG | `k8s: create_namespaced_event ns (pod=name, reason=RuntimeGuaranteed)` | About to create a `RuntimeGuaranteed` event on the pod. |
 | DEBUG | `k8s: create_namespaced_event ns (pod=name, reason=Preempted)` † | About to create a `Preempted` event on a pod being deleted to recover capacity. |
 | DEBUG | `k8s: create_namespaced_event ns (pod=name, reason=ReservationCancelled)` | About to create a `ReservationCancelled` event on the pod. |
-| DEBUG | `k8s: create_namespaced_event ns (pod=name, reason=LeaseRenewed)` | About to create a `LeaseRenewed` event on a pod whose on-demand lease was renewed. |
-| DEBUG | `k8s: create_namespaced_event ns (pod=name, reason=RenewalDenied)` | About to create a `RenewalDenied` event on a pod whose on-demand lease could not be renewed. |
 | DEBUG † | `k8s: list_node (gpu capacity snapshot)` | About to LIST all nodes to compute physical GPU capacity per class (`snapshot_node_gpu_capacity`). |
 | DEBUG † | `k8s: node gpu capacity snapshot: {class: N, …}` | Node LIST completed; shows total allocatable GPUs summed per `gpu-class-reservation` taint value. |
 | DEBUG | `k8s: delete_namespaced_pod ns/name` | About to DELETE a pod (reservation cancellation eviction, owner-change eviction, or preemption sweep). |

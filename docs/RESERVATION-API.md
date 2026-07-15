@@ -402,38 +402,6 @@ full, plus the fraction-of-cost penalty on the unused remainder inside the next
 | 404 | Reservation not found |
 | 422 | Unknown `reason` |
 
-### `POST /api/reservations/{id}/renew`
-
-Renew (chain) an on-demand lease, extending its guaranteed block **in place** as
-it nears expiry. Requires a `read_write` service key (or an admin JWT). No
-request body. The controller owns the trigger — it calls this as a lease
-approaches its end (e.g. ~15 minutes ahead), giving the job runway to keep
-running if capacity exists, or to checkpoint before eviction if not.
-
-A granted renewal extends `end_dt` to **`ceil_to_hour(now) + 1h`** — the
-remainder of the current partial hour plus the following full hour (so 1–2 h of
-hour-aligned runway; e.g. renewing at `14:22` extends to `16:00`). The window is
-computed from the app's own `now`, so the renewal is **idempotent within a clock
-hour**: a retry in the same hour is a no-op, while renewing again in a later hour
-chains the lease further.
-
-The lease keeps the **same id/row** (so pod matching and the reservation
-reference are unchanged); only the added tail segment is capacity-checked and
-SU-charged (the incremental cost is added to `su_cost_user`/`su_cost_group`;
-`su_cost_original` is never altered). Feasibility uses the **same analysis** as
-lease creation — the three capacity tiers + borrowing, the per-member/team SU
-budget, and the group SU pool (privilege judged as-if-self-booked).
-
-**Responses**
-
-| Code | Condition |
-|------|-----------|
-| 200 | Extended — the updated [ReservationResponse](#reservationresponse) (new `end_dt`/`end_utc`, higher `su_cost*`). **Idempotent**: when the lease already covers the target end (e.g. a same-hour retry) it returns 200 unchanged |
-| 400 | Not a renewable target: not a `kind: "on_demand"` lease, already cancelled, or already ended |
-| 403 | Read-only key / non-admin JWT |
-| 404 | Reservation not found |
-| 409 | Renewable but **not feasible right now** — insufficient capacity, SU budget, or pool. The controller's cue to stop retrying and let the job checkpoint |
-
 ### Reading the reservation time window
 
 Every `ReservationResponse` includes pre-computed UTC timestamps:
