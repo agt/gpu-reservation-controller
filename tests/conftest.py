@@ -26,6 +26,7 @@ OTHER_CLASS_ID = 20
 OTHER_CLASS_LABEL = "a100"
 USERNAME = "alice"
 ADMIN_USERNAME = "sysadmin"
+GROUP_NAME = "cse151b"    # usage-group name carried by JIT lease asks
 FIXED_DATE = date(2024, 1, 15)    # past; window timing controlled via explicit `now`
 FUTURE_DATE = date(2099, 6, 15)   # far future; slot_end always > datetime.now(utc)
 
@@ -79,7 +80,7 @@ def reservation(
     gpu_count: int = 2,
     status: str = "active",
     cancelled_by_id: int | None = None,
-    cancelled_by: UserBrief | None = None,
+    cancel_reason: str | None = None,
     group: str | None = None,
     group_id: int | None = None,
     day: date | None = None,
@@ -118,7 +119,7 @@ def reservation(
         created_at=_EPOCH,
         updated_at=_EPOCH,
         cancelled_by_id=cancelled_by_id,
-        cancelled_by=cancelled_by,
+        cancel_reason=cancel_reason,
     )
 
 
@@ -136,7 +137,7 @@ def user_reservation(
     user_id: int = 1,
     status: str = "active",
     cancelled_by_id: int | None = None,
-    cancelled_by: UserBrief | None = None,
+    cancel_reason: str | None = None,
 ) -> ReservationResponse:
     """A ``kind="booking"`` reservation whose window comes from date + slot fields."""
     start_utc, end_utc = window(reservation_date, start_time, slot_index, duration_minutes)
@@ -152,7 +153,7 @@ def user_reservation(
         gpu_count=gpu_count,
         status=status,
         cancelled_by_id=cancelled_by_id,
-        cancelled_by=cancelled_by,
+        cancel_reason=cancel_reason,
         day=reservation_date,
     )
 

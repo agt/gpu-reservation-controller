@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 from app.controller import ControllerState, OnDemandCandidate, slot_start
 
-from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, USERNAME
+from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, GROUP_NAME, USERNAME
 from tests.conftest import make_state as _state
 from tests.conftest import ondemand_block as _ondemand_block
 from tests.conftest import reservation, user_reservation as _user_reservation
@@ -273,7 +273,8 @@ def _non_gpu_condition():
     )
 
 
-def _candidate(uid="uid-1", *, gpu_requested=1, min_runtime_seconds=600, group_label=None):
+def _candidate(uid="uid-1", *, gpu_requested=1, min_runtime_seconds=600,
+               group_label=None, usage_group=GROUP_NAME):
     return OnDemandCandidate(
         pod_uid=uid, pod_name="pod-1", pod_namespace=USERNAME,
         gpu_class_label=GPU_CLASS_LABEL, gpu_requested=gpu_requested,
@@ -281,6 +282,7 @@ def _candidate(uid="uid-1", *, gpu_requested=1, min_runtime_seconds=600, group_l
         pod_created_at=datetime.now(timezone.utc),
         next_attempt_at=datetime.now(timezone.utc),
         group_label=group_label,
+        usage_group=usage_group,
     )
 
 

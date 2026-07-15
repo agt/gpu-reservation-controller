@@ -6,6 +6,30 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
+# Boolean env-var vocabulary, shared with the reservation app's
+# ``config_utils`` (keep the two in step): a recognised truthy/falsy word wins,
+# anything else — including junk — falls back to the flag's default.
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSY = frozenset({"0", "false", "no", "off"})
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean-ish environment variable with an explicit default.
+
+    Replaces the per-flag ``.lower() not in (...)`` / ``in (...)`` one-liners,
+    which disagreed with each other (and with the app) on which spellings count
+    — e.g. ``on`` enabled an app flag but not a controller one.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _TRUTHY:
+        return True
+    if value in _FALSY:
+        return False
+    return default
+
 
 @dataclass(frozen=True)
 class Config:
@@ -60,10 +84,7 @@ class Config:
             ),
             kubeconfig_path=os.environ.get("KUBECONFIG") or None,
             health_port=int(os.environ.get("HEALTH_PORT", "8000")),
-            ondemand_placement_enabled=os.environ.get(
-                "ONDEMAND_PLACEMENT_ENABLED", "true"
-            ).lower()
-            not in ("false", "0", "no"),
+            ondemand_placement_enabled=_env_bool("ONDEMAND_PLACEMENT_ENABLED", True),
             noshown_timeout_minutes=int(
                 _noshow("NOSHOW_TIMEOUT_MINUTES", "NOSHOWN_TIMEOUT_MINUTES", "15")
             ),
@@ -82,18 +103,13 @@ class Config:
             preemption_check_interval=int(
                 os.environ.get("PREEMPTION_CHECK_INTERVAL", "60")
             ),
-            pod_adoption_enabled=os.environ.get(
-                "POD_ADOPTION_ENABLED", "true"
-            ).lower()
-            not in ("false", "0", "no"),
-            preemption_delegate_selection=os.environ.get(
-                "PREEMPTION_DELEGATE_SELECTION", "true"
-            ).lower()
-            not in ("false", "0", "no"),
-            ondemand_delegate_admission=os.environ.get(
-                "ONDEMAND_DELEGATE_ADMISSION", "false"
-            ).lower()
-            in ("true", "1", "yes"),
+            pod_adoption_enabled=_env_bool("POD_ADOPTION_ENABLED", True),
+            preemption_delegate_selection=_env_bool(
+                "PREEMPTION_DELEGATE_SELECTION", True
+            ),
+            ondemand_delegate_admission=_env_bool(
+                "ONDEMAND_DELEGATE_ADMISSION", False
+            ),
             ondemand_horizon_minutes=int(
                 os.environ.get("ONDEMAND_HORIZON_MINUTES", "30")
             ),

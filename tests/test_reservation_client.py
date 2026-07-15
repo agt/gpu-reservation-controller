@@ -154,12 +154,13 @@ def test_fetch_gpu_classes_returns_none_on_invalid_json():
 def _ondemand_request(**overrides) -> OnDemandReservationRequest:
     base = dict(
         username="alice",
-        group_name=None,
+        group_name="cse151b",
         gpu_class_id=10,
         gpu_count=1,
         duration_seconds=1200,
         on_demand=True,
         idempotency_key="pod-uid-1",
+        notes="on-demand lease for pod alice/train-1",
     )
     base.update(overrides)
     return OnDemandReservationRequest(**base)
@@ -174,6 +175,10 @@ def test_create_ondemand_reservation_201_returns_reservation():
         body = json.loads(request.content)
         assert body["idempotency_key"] == "pod-uid-1"
         assert body["on_demand"] is True
+        # group_name is a required natural key on the app side; notes carry
+        # which pod the lease covers for admin traceability.
+        assert body["group_name"] == "cse151b"
+        assert body["notes"] == "on-demand lease for pod alice/train-1"
         return httpx.Response(201, json=res.model_dump(mode="json"))
 
     client = _client_with_handler(_config(), handler)

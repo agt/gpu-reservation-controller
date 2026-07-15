@@ -39,9 +39,12 @@ class ReservationResponse(BaseModel):
     end_dt: Optional[datetime] = None    # site-local wall-clock (naive); display only
     date: date               # calendar date of the reservation (local time, for display)
     start_utc: datetime      # UTC start; use this for all time comparisons
-    end_utc: datetime        # UTC end; use this for activeDeadlineSeconds
+    end_utc: datetime        # UTC end; use this for guarantee arithmetic
     gpu_count: int           # number of GPUs reserved
-    su_cost: Optional[float] = None  # total Service Units; not consumed by the controller
+    # SU accounting fields (RESERVATION-API.md §6); informational to the controller.
+    su_cost_user: float = 0.0      # SU charged to the individual user
+    su_cost_group: float = 0.0     # SU charged against the group pool
+    su_cost_original: float = 0.0  # SU charged at creation; never rewritten
     status: str              # "active" | "cancelled"
     kind: str                # "booking" | "on_demand"  (JIT lease)
     notes: Optional[str] = None
@@ -51,7 +54,12 @@ class ReservationResponse(BaseModel):
     updated_at: datetime
     cancelled_at: Optional[datetime] = None
     cancelled_by_id: Optional[int] = None
-    cancelled_by: Optional[UserBrief] = None
+    # "no-show" | "controller-revoked" | "pod-terminated" | "superseded" for
+    # controller- or continue-driven cancellations; null for human cancels.
+    cancel_reason: Optional[str] = None
+    # Set on a booking minted via POST /api/reservations/{id}/continue: the id
+    # of the superseded source reservation whose pod it carries forward.
+    continued_from_id: Optional[int] = None
 
 
 class GpuClassDetail(GpuClassBrief):
@@ -106,15 +114,24 @@ class OnDemandReservationRequest(BaseModel):
     never physical calendar capacity.  ``idempotency_key`` is the admitting
     pod's UID: a retry with the same key returns the original reservation
     rather than creating a duplicate.
+
+    ``username`` / ``group_name`` are both **required** natural keys on the
+    app side (the user must be an active member of the named group) — the
+    JIT-eligibility gate guarantees a group source (the REQUIRED_GROUP_LABEL
+    value, or the pod's ``horae/usage-group`` annotation) before an ask is
+    built, and requiring it here catches a regression at construction time
+    rather than as a 422 on the wire.  ``notes`` is stored on the lease for
+    admin traceability (which pod it covers).
     """
 
     username: str
-    group_name: Optional[str] = None
+    group_name: str
     gpu_class_id: int
     gpu_count: int
     duration_seconds: int
     on_demand: bool = True
     idempotency_key: str
+    notes: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

@@ -116,6 +116,12 @@ config:
   # for preemption.  Set to false to disable.
   podAdoptionEnabled: true
 
+  # Delegate preemption victim selection to the reservation app
+  # (POST /api/reservations/preemption-victims) so prioritisation policy lives
+  # there.  Set to false — or let any app-call failure occur — to fall back to
+  # local uniform-random selection.
+  preemptionDelegateSelection: true
+
 # ---------------------------------------------------------------------------
 # ServiceAccount and RBAC
 # ---------------------------------------------------------------------------

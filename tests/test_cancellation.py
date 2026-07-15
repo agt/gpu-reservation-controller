@@ -10,9 +10,9 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from app.controller import canceller_description, slot_end
-from app.schemas import ReservationResponse, UserBrief
+from app.schemas import ReservationResponse
 
-from tests.conftest import ADMIN_USERNAME, FIXED_DATE, GPU_CLASS_LABEL, USERNAME
+from tests.conftest import FIXED_DATE, GPU_CLASS_LABEL, USERNAME
 from tests.conftest import make_state as _state_with_label
 from tests.conftest import reservation, window_from_minutes
 
@@ -31,7 +31,7 @@ def _user_res(
     user_id: int = 1,
     username: str = USERNAME,
     cancelled_by_id: int | None = None,
-    cancelled_by: UserBrief | None = None,
+    cancel_reason: str | None = None,
     day: date = FIXED_DATE,
 ) -> ReservationResponse:
     """Booking reservation from a minutes-past-midnight offset; ``status`` follows
@@ -48,7 +48,7 @@ def _user_res(
         gpu_class_label=GPU_CLASS_LABEL,
         status="cancelled" if cancelled_by_id else "active",
         cancelled_by_id=cancelled_by_id,
-        cancelled_by=cancelled_by,
+        cancel_reason=cancel_reason,
         day=day,
     )
 
@@ -128,41 +128,43 @@ class TestDetectCancelledInWindow:
 
 
 class TestCancellerDescription:
-    """Tests for the _canceller_description helper in main.py."""
+    """Tests for the canceller_description helper.
+
+    The API carries only ``cancelled_by_id`` (RESERVATION-API.md §6 — no nested
+    canceller object), so the helper distinguishes self-vs-other and appends the
+    machine-readable ``cancel_reason`` when one is recorded.
+    """
 
     def _make_res(
         self,
         user_id: int | None,
         cancelled_by_id: int | None,
-        cancelled_by: UserBrief | None,
+        cancel_reason: str | None = None,
     ) -> ReservationResponse:
         return _user_res(
             1,
             user_id=user_id or 1,
             cancelled_by_id=cancelled_by_id,
-            cancelled_by=cancelled_by,
+            cancel_reason=cancel_reason,
         )
 
     def test_self_cancel_returns_by_user(self):
-        res = self._make_res(
-            user_id=7,
-            cancelled_by_id=7,
-            cancelled_by=UserBrief(id=7, username=USERNAME),
-        )
+        res = self._make_res(user_id=7, cancelled_by_id=7)
         assert canceller_description(res) == "by user"
 
-    def test_admin_cancel_with_brief_returns_username(self):
-        res = self._make_res(
-            user_id=7,
-            cancelled_by_id=99,
-            cancelled_by=UserBrief(id=99, username=ADMIN_USERNAME),
-        )
-        assert canceller_description(res) == f"by {ADMIN_USERNAME}"
-
-    def test_different_id_no_brief_returns_by_another_user(self):
-        res = self._make_res(user_id=7, cancelled_by_id=99, cancelled_by=None)
+    def test_different_id_returns_by_another_user(self):
+        res = self._make_res(user_id=7, cancelled_by_id=99)
         assert canceller_description(res) == "by another user"
 
     def test_no_canceller_info_returns_by_user(self):
-        res = self._make_res(user_id=7, cancelled_by_id=None, cancelled_by=None)
+        res = self._make_res(user_id=7, cancelled_by_id=None)
         assert canceller_description(res) == "by user"
+
+    def test_cancel_reason_appended(self):
+        res = self._make_res(user_id=7, cancelled_by_id=7, cancel_reason="superseded")
+        assert canceller_description(res) == "by user (reason: superseded)"
+
+    def test_controller_cancel_reason_appended(self):
+        # A controller (service-key) cancel carries no cancelled_by_id.
+        res = self._make_res(user_id=7, cancelled_by_id=None, cancel_reason="no-show")
+        assert canceller_description(res) == "by user (reason: no-show)"
