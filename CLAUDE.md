@@ -20,9 +20,9 @@ The app schedules only real reservations (`kind="booking"`) — there is no
 ad-hoc "reclaim" capacity type.  A pod with no reservation open now or soon
 gets one **just-in-time (JIT)**: the controller requests a short on-demand
 booking on the pod's behalf (`POST /api/reservations`), so on-demand jobs are
-ordinary reservations — charged SU, protected by runtime guarantees, and able
-to displace overstayers via the same boundary preemption as any other booking
-(see **Just-in-time (JIT) on-demand leases**).
+ordinary reservations — charged SU and protected by runtime guarantees.  (A
+granted lease does **not** itself trigger boundary preemption of overstayers —
+see the caveat in **Just-in-time (JIT) on-demand leases**.)
 
 ---
 
@@ -30,7 +30,7 @@ to displace overstayers via the same boundary preemption as any other booking
 
 | Choice | Rationale |
 |--------|-----------|
-| **FastAPI** | Provides the `GET /health` liveness endpoint, the `POST /api/reservations/push` inbound API, and clean lifespan management for background tasks; no routers or static files needed |
+| **FastAPI** | Provides the `GET /health` liveness endpoint, the `POST /api/reservations/push` inbound API, the `GET /api/forecast/preemption-risk` forecast, and clean lifespan management for background tasks; no routers or static files needed |
 | **asyncio** | Single event loop drives all four background loops concurrently without threads for the application logic |
 | **httpx** | Async HTTP client for the reservation management API; supports connection pooling and clean timeout handling |
 | **kubernetes** (official Python client) | LIST + WATCH pod streams; strategic-merge-patch for toleration injection; supports both in-cluster and kubeconfig auth |
@@ -51,7 +51,7 @@ app/
 ├── schemas.py            Pydantic models mirroring RESERVATION-API.md §6
 ├── reservation_client.py httpx async client — fetches reservations + GPU classes; creates/cancels JIT on-demand reservations
 ├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, annotate_runtime_guarantee, emit_preempted_event, snapshot_tolerated_pods / snapshot_node_gpu_capacity (occupancy + capacity)
-└── controller.py         ControllerState, QueueEntry, matching, window arithmetic, preemption planning
+└── controller.py         ControllerState, QueueEntry, matching, window arithmetic, preemption planning, preemption-risk forecast
 ```
 
 ### Background tasks (started in `lifespan`, cancelled on shutdown)
@@ -322,9 +322,16 @@ A pod with the `gpu-class` label but no reservation open now or opening soon
 does not wait indefinitely and is not opportunistically placed onto ad-hoc
 spare capacity — instead the controller requests a **real reservation** on
 its behalf, just-in-time.  On-demand jobs are therefore ordinary
-reservations: charged SU, protected by the same runtime guarantee as any
-booking, and able to displace overstayers via the existing boundary
-preemption — none of that machinery needed a separate on-demand code path.
+reservations: charged SU and protected by the same runtime guarantee as any
+booking — most of that machinery needed no separate on-demand code path.
+One asymmetry remains: the preemption sweep enumerates boundaries and demand
+only for `kind == "booking"` reservations (`upcoming_boundaries`,
+`boundary_demand`), so a granted lease (`kind="on_demand"`) never *triggers*
+boundary preemption of overstayers on its own behalf — a JIT pod that lands on
+squatted GPUs waits (guard 3) rather than displacing them.  Extending the
+sweep to on-demand boundaries is possible future work; until then the
+preemption-risk forecast reports pending JIT pressure as informational only
+for the same reason (see **Preemption-risk forecast API**).
 
 **Routing** (`pod_watch_loop`, re-evaluated on every attempt): for a pod
 without the toleration,
@@ -448,6 +455,51 @@ source of truth.
 - **RBAC**: unchanged — eviction reuses the existing `pods: delete` /
   `events: create` permissions.
 
+### Preemption-risk forecast API
+
+`GET /api/forecast/preemption-risk` (optional `?namespace=`) answers, per
+controller-admitted pod, "how likely is this job to be preempted during the
+remainder of the current hour and the next two full hours?" — computed
+entirely from in-memory state (reservation map, occupancy, pending JIT
+candidates) plus the same two cluster snapshots the preemption sweep takes
+(pods, node capacity; either failing ⇒ 503 — the sweep's fail-safe rule,
+never report risk from unknown physical state).
+
+- **Auth / wiring**: guarded by the same `INBOUND_API_TOKEN` bearer check as
+  the push API (`_require_inbound_auth`; unset ⇒ 503, bad bearer ⇒ 401) and
+  rides the same FastAPI app / `HEALTH_PORT` — no new port, Service, or RBAC.
+- **Model** (`ControllerState.forecast_preemption_risk`, pure and
+  synchronous, computed under `reservation_lock` with snapshots awaited
+  outside it): three calendar-aligned buckets (`[now, top of next hour)` plus
+  two full hours).  For every future booking boundary in `(now, horizon_end +
+  lead]` — the tail extension mirrors the front, a boundary just past the
+  last bucket still lands its phase-A kill inside it — demand reuses
+  `boundary_demand` and free capacity `free_capacity_by_class`; an eligible
+  pod's single-boundary risk is `min(1, shortfall / eligible-pool GPUs)`,
+  attributed to the buckets overlapping the kill window
+  `[max(boundary − PREEMPTION_LEAD_MINUTES, guarantee_end), boundary]` and
+  combined per bucket as `1 − Π(1 − r)`.  A pod inside its runtime guarantee
+  has exactly zero risk (`state: "guaranteed"`); past it, `"overstay"`
+  (`"mixed"` when the guarantee ends mid-bucket).
+- **Chain-safe eligibility**: guarantees are computed once at the real "now"
+  (`guarantee_end`) and compared against each boundary — never by simulating
+  `now = boundary`, which would sever back-to-back chains exactly at the
+  boundary instants (`_chain_for` keeps members only while `slot_end > now`)
+  and fabricate phantom overstay and phantom demand.
+- **Documented approximations** (the response carries `selection_delegated`
+  so consumers can label the number): with delegation enabled the app picks
+  victims by its own policy — the numeric risk models the local
+  uniform-random fallback, while pool *membership* (at-risk vs safe) is exact
+  either way; boundaries combine as independent chances (conservative — an
+  earlier kill actually frees capacity for later boundaries); running pods
+  are assumed to keep running (free capacity constant across buckets);
+  pending JIT candidates surface per class as `pending_jit_gpus` on the
+  current bucket, informational only, never folded into shortfall (see the
+  JIT caveat above).
+- **`?namespace=`** filters the `pods` list only; bucket/class summaries stay
+  cluster-global (every displayed risk's denominator and demand driver is
+  global).  Unknown namespace ⇒ empty `pods`, 200.
+
 ### Startup behaviour
 
 On startup, the controller performs an initial reservation fetch and then issues
@@ -510,7 +562,7 @@ the claimed set and the grace re-arm path above applies.
 | `RESERVATION_LOOKAHEAD_DAYS` | `7` | Calendar days ahead to fetch reservations |
 | `KUBECONFIG` | *(absent = in-cluster)* | Path to kubeconfig file for out-of-cluster use |
 | `HEALTH_PORT` | `8000` | Port for `GET /health` (also serves `POST /api/reservations/push`) |
-| `INBOUND_API_TOKEN` | *(absent = inbound API disabled)* | Bearer token guarding `POST /api/reservations/push`; mount from a Kubernetes Secret. Unset ⇒ endpoint returns 503 |
+| `INBOUND_API_TOKEN` | *(absent = inbound API disabled)* | Bearer token guarding the inbound APIs (`POST /api/reservations/push` and `GET /api/forecast/preemption-risk`); mount from a Kubernetes Secret. Unset ⇒ both endpoints return 503 |
 | `TZ` | system default | Affects log timestamp display only; no longer required for window arithmetic |
 | `ONDEMAND_PLACEMENT_ENABLED` | `true` | Set to `false` to disable the JIT on-demand lease path entirely (a non-JIT-eligible pod still waits for a matching reservation; an ineligible one is left Pending) |
 | `ONDEMAND_HORIZON_MINUTES` | `30` | JIT routing horizon: a pod is queued for a reservation that opens within this many minutes (with budget) instead of requesting a lease |

@@ -38,6 +38,7 @@ from .controller import (
     ControllerState,
     OnDemandCandidate,
     PodRuntimeView,
+    PreemptionForecast,
     QueueEntry,
     apply_push_to_active,
     build_preemption_plan,
@@ -76,8 +77,13 @@ from .k8s_client import (
 )
 from .reservation_client import ReservationClient
 from .schemas import (
+    ForecastBucket,
+    ForecastClassSummary,
+    ForecastPod,
+    ForecastPodBucket,
     OnDemandReservationRequest,
     PreemptionCandidate,
+    PreemptionRiskForecastResponse,
     PreemptionSelectionRequest,
     ReservationPushRequest,
     ReservationPushResponse,
@@ -1658,11 +1664,11 @@ async def health() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def _require_push_auth(
+def _require_inbound_auth(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> None:
-    """Authenticate an inbound API call (push) via a static bearer token.
+    """Authenticate an inbound API call (push, forecast) via a static bearer token.
 
     - 503 if ``INBOUND_API_TOKEN`` is unset — the inbound API is opt-in and
       disabled by default, so existing deployments are unaffected.
@@ -1689,7 +1695,7 @@ def _require_push_auth(
     "/api/reservations/push",
     tags=["sync"],
     response_model=ReservationPushResponse,
-    dependencies=[Depends(_require_push_auth)],
+    dependencies=[Depends(_require_inbound_auth)],
 )
 async def push_reservations(
     body: ReservationPushRequest, request: Request
@@ -1756,6 +1762,131 @@ async def push_reservations(
         adopted=len(owner_changes),
         total_active=len(state.reservations),
     )
+
+
+# ---------------------------------------------------------------------------
+# Preemption-risk forecast API
+# ---------------------------------------------------------------------------
+
+
+def _forecast_response(
+    forecast: PreemptionForecast,
+    config: Config,
+    namespace: Optional[str],
+) -> PreemptionRiskForecastResponse:
+    """Convert a pure ``PreemptionForecast`` into the API response shape.
+
+    *namespace* filters ``pods`` only — the bucket/class summaries stay
+    cluster-global, because every displayed risk's denominator
+    (``eligible_pool_gpus``) and driver (demand from *other* users' bookings)
+    are global; a scoped summary could not explain the pod numbers beside it.
+    Pure, so it is unit-testable without a TestClient.
+    """
+    buckets = [
+        ForecastBucket(
+            start=b.start,
+            end=b.end,
+            classes={
+                c: ForecastClassSummary(
+                    capacity=b.capacity_by_class.get(c, 0),
+                    free=b.free_by_class.get(c, 0),
+                    demand=b.demand_by_class.get(c, 0),
+                    shortfall=b.shortfall_by_class.get(c, 0),
+                    eligible_pool_gpus=b.eligible_pool_gpus_by_class.get(c, 0),
+                    pending_jit_gpus=b.pending_jit_gpus_by_class.get(c, 0),
+                )
+                # All six summary maps share one key set (see
+                # ForecastBucketSummary), so iterating any one of them is safe.
+                for c in b.capacity_by_class
+            },
+        )
+        for b in forecast.buckets
+    ]
+    pods = [
+        ForecastPod(
+            namespace=pf.view.namespace,
+            name=pf.view.name,
+            uid=pf.view.uid,
+            gpu_class=pf.view.gpu_class,
+            gpu_count=pf.view.gpu_count,
+            reservation_id=pf.view.reservation_id,
+            guarantee_end=pf.guarantee_end,
+            buckets=[
+                ForecastPodBucket(risk=pb.risk, state=pb.state) for pb in pf.buckets
+            ],
+        )
+        for pf in forecast.pods
+        if namespace is None or pf.view.namespace == namespace
+    ]
+    return PreemptionRiskForecastResponse(
+        generated_at=forecast.generated_at,
+        lead_minutes=forecast.lead_minutes,
+        selection_delegated=config.preemption_delegate_selection,
+        buckets=buckets,
+        pods=pods,
+    )
+
+
+@app.get(
+    "/api/forecast/preemption-risk",
+    tags=["forecast"],
+    response_model=PreemptionRiskForecastResponse,
+    dependencies=[Depends(_require_inbound_auth)],
+)
+async def preemption_risk_forecast(
+    request: Request, namespace: Optional[str] = None
+) -> PreemptionRiskForecastResponse:
+    """Per-pod preemption-risk forecast for the current + next two hours.
+
+    Read-only: projects the same demand/free/eligibility arithmetic the
+    preemption sweep runs, across every booking boundary in the horizon.  A
+    pod inside its runtime guarantee has zero risk; an overstayer's risk is
+    the projected GPU shortfall over the eligible overstay pool for each
+    boundary whose kill window (``[boundary − lead, boundary]``) touches the
+    bucket.  ``?namespace=`` filters the ``pods`` list only (unknown
+    namespace ⇒ empty list, 200); summaries stay cluster-global.
+
+    503 when either cluster snapshot fails — the forecast never reports risk
+    based on unknown physical state (same fail-safe rule as the sweep).
+    """
+    state: ControllerState = request.app.state.controller_state
+    config: Config = request.app.state.config
+    now = datetime.now(timezone.utc)
+
+    # Snapshots are awaited OUTSIDE the lock, mirroring the preemption sweep.
+    try:
+        snapshot = await snapshot_tolerated_pods(
+            TOLERATION_KEY, config.required_group_label
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Forecast: failed to snapshot pods: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cluster pod snapshot unavailable; forecast cannot be computed",
+        )
+    try:
+        capacity = await snapshot_node_gpu_capacity(TOLERATION_KEY)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Forecast: failed to snapshot node GPU capacity: %s", exc, exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Node capacity snapshot unavailable; forecast cannot be computed",
+        )
+
+    async with state.reservation_lock:
+        pods = [_pod_view(p) for p in snapshot]
+        pending = list(state.ondemand_candidates.values())
+        forecast = state.forecast_preemption_risk(
+            capacity,
+            pods,
+            pending,
+            now,
+            lead=timedelta(minutes=config.preemption_lead_minutes),
+        )
+
+    return _forecast_response(forecast, config, namespace)
 
 
 def main() -> None:

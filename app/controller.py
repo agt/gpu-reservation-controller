@@ -20,7 +20,7 @@ import logging
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Iterable, Optional
 
 from .schemas import ReservationResponse
 
@@ -265,6 +265,142 @@ def build_preemption_plan(
         victims=victims,
         unmet_by_class=unmet,
     )
+
+
+# ---------------------------------------------------------------------------
+# Preemption-risk forecast (pure planning)
+# ---------------------------------------------------------------------------
+
+# Number of hourly forecast buckets: the remainder of the current wall-clock
+# hour plus the next two full hours.  A module constant, not an environment
+# variable, by design — the forecast surface is fixed so its consumers (the
+# reservation app UI) can rely on the shape.
+FORECAST_BUCKET_COUNT = 3
+
+
+def forecast_buckets(
+    now: datetime, count: int = FORECAST_BUCKET_COUNT
+) -> list[tuple[datetime, datetime]]:
+    """Return *count* calendar-aligned forecast buckets starting at *now*.
+
+    Bucket 0 runs from *now* to the top of the next hour (possibly much
+    shorter than an hour; exactly one hour when *now* is already on the
+    hour); each subsequent bucket is one full wall-clock hour.  Buckets are
+    half-open ``[start, end)``.  Calendar alignment lives only here — the
+    rest of the forecast consumes whatever intervals this returns.
+    """
+    first_end = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    buckets = [(now, first_end)]
+    for i in range(1, count):
+        buckets.append(
+            (first_end + timedelta(hours=i - 1), first_end + timedelta(hours=i))
+        )
+    return buckets
+
+
+def overlapping_bucket_indices(
+    interval_start: datetime,
+    interval_end: datetime,
+    buckets: list[tuple[datetime, datetime]],
+) -> list[int]:
+    """Indices of *buckets* the closed interval [start, end] intersects.
+
+    Buckets are half-open ``[s, e)``, so an interval ending exactly at a
+    bucket's start still counts (a kill landing at instant ``s`` happens
+    inside that bucket) while one starting exactly at a bucket's end does
+    not.
+    """
+    return [
+        i
+        for i, (s, e) in enumerate(buckets)
+        if interval_start < e and interval_end >= s
+    ]
+
+
+def combine_risks(risks: Iterable[float]) -> float:
+    """Combine independent per-boundary risks into one probability.
+
+    ``1 − Π(1 − r)`` — treats each boundary as an independent chance of being
+    preempted.  In reality boundaries share candidate pools and an earlier
+    kill frees capacity for later boundaries, so this errs on the high
+    (conservative) side.  Inputs and result are clamped to [0, 1].
+    """
+    survival = 1.0
+    for r in risks:
+        survival *= 1.0 - min(1.0, max(0.0, r))
+    return min(1.0, max(0.0, 1.0 - survival))
+
+
+@dataclass(frozen=True)
+class ForecastBoundaryNeed:
+    """Projected shortfall and at-risk pool for one *future* boundary.
+
+    The forecast sibling of ``BoundaryPreemptionNeed`` with two deliberate
+    differences: eligibility is evaluated *as of the boundary instant*
+    (``guarantee_end <= boundary``, where the guarantee itself is computed at
+    the real "now" so back-to-back chains stay intact — see
+    ``ControllerState.forecast_boundary_need``), and ``eligible_by_class``
+    covers every class with at least one eligible pod, not only shortfall
+    classes, because bucket summaries want the pool size even at zero
+    shortfall.
+    """
+
+    boundary: datetime
+    demand_by_class: dict[str, int]
+    kills_needed_by_class: dict[str, int]     # max(0, demand − free); only > 0 kept
+    eligible_by_class: dict[str, list[PodRuntimeView]]
+    pool_gpus_by_class: dict[str, int]        # Σ gpu_count over eligible_by_class
+
+
+@dataclass(frozen=True)
+class ForecastBucketSummary:
+    """Per-GPU-class aggregates for one forecast bucket.
+
+    All six maps share one identical, sorted key set (the union of physical
+    capacity classes, admitted-pod classes, boundary-demand classes, and
+    pending-JIT classes) so consumers can iterate any one of them.
+    ``free_by_class`` may be negative (over-committed class).
+    ``pending_jit_gpus_by_class`` is informational pressure only — never
+    folded into ``shortfall_by_class`` (a granted JIT lease has
+    ``kind="on_demand"`` and therefore never creates a preemption boundary
+    under the sweep's ``kind == "booking"`` filters).
+    """
+
+    start: datetime
+    end: datetime
+    capacity_by_class: dict[str, int]
+    free_by_class: dict[str, int]
+    demand_by_class: dict[str, int]
+    shortfall_by_class: dict[str, int]
+    eligible_pool_gpus_by_class: dict[str, int]
+    pending_jit_gpus_by_class: dict[str, int]
+
+
+@dataclass(frozen=True)
+class PodBucketRisk:
+    """One admitted pod's preemption outlook within one forecast bucket."""
+
+    risk: float   # 0.0–1.0; 0 whenever the guarantee covers the whole bucket
+    state: str    # "guaranteed" | "overstay" | "mixed" (guarantee ends mid-bucket)
+
+
+@dataclass(frozen=True)
+class PodForecast:
+    """Per-pod forecast: the pod's view, its live guarantee, per-bucket risk."""
+
+    view: PodRuntimeView
+    guarantee_end: Optional[datetime]  # at the real now; None = unresolvable (overstay)
+    buckets: list[PodBucketRisk]       # index-aligned with the forecast's buckets
+
+
+@dataclass(frozen=True)
+class PreemptionForecast:
+    """Full output of ``ControllerState.forecast_preemption_risk``."""
+
+    generated_at: datetime
+    lead_minutes: int
+    buckets: list[ForecastBucketSummary]
+    pods: list[PodForecast]
 
 
 # ---------------------------------------------------------------------------
@@ -1513,3 +1649,235 @@ class ControllerState:
         stale = [b for b in self.preemption_fired if b <= now - lead]
         for b in stale:
             del self.preemption_fired[b]
+
+    # ------------------------------------------------------------------
+    # Preemption-risk forecast
+    # ------------------------------------------------------------------
+
+    def forecast_boundaries(
+        self, now: datetime, horizon_end: datetime
+    ) -> list[datetime]:
+        """Distinct future booking start times in ``(now, horizon_end]``, ascending.
+
+        The forecast's own boundary enumeration — ``upcoming_boundaries`` only
+        looks ``±lead`` around now.  Boundaries at or before *now* are
+        excluded: their phase A already fired (or phase B fires within one
+        sweep tick), and a fresh pod snapshot already reflects any victims as
+        terminating, so there is nothing left to forecast for them.  No-show
+        reservations are skipped up front (``boundary_demand`` would zero
+        them anyway; this just avoids evaluating dead boundaries).
+        """
+        boundaries = {
+            slot_start(r)
+            for r in self.reservations
+            if r.kind == "booking"
+            and r.id not in self.noshow_reservation_ids
+            and now < slot_start(r) <= horizon_end
+        }
+        return sorted(boundaries)
+
+    def forecast_boundary_need(
+        self,
+        boundary: datetime,
+        free_by_class: dict[str, int],
+        pods: list[PodRuntimeView],
+        now: datetime,
+        guarantee_end_by_uid: dict[str, Optional[datetime]],
+    ) -> ForecastBoundaryNeed:
+        """Project one future boundary's shortfall and at-risk pool.
+
+        Demand is ``boundary_demand(boundary, pods, now)`` with the **real**
+        *now* — never the boundary instant: ``_chain_for`` keeps chain members
+        only while ``slot_end > now``, and boundaries are exactly the instants
+        where chain members end, so evaluating "as of the boundary" would
+        sever back-to-back chains (phantom demand, phantom overstay).  Pod
+        eligibility instead compares each pod's live guarantee (computed once
+        at the real now, chains intact, via *guarantee_end_by_uid*) against
+        the boundary: eligible when ``guarantee_end is None or <= boundary``
+        — the sweep's phase-B outcome for that instant.  Same physical gates
+        as ``plan_boundary_candidates`` (admitted, node-resident, not
+        terminating, at least one GPU).  Pure.
+        """
+        demand = self.boundary_demand(boundary, pods, now)
+        kills_needed = {
+            gpu_class: max(0, need - free_by_class.get(gpu_class, 0))
+            for gpu_class, need in demand.items()
+        }
+        kills_needed = {c: k for c, k in kills_needed.items() if k > 0}
+
+        eligible: dict[str, list[PodRuntimeView]] = {}
+        for p in pods:
+            if (
+                p.reservation_id is None
+                or not p.node_resident
+                or p.terminating
+                or p.gpu_count <= 0
+            ):
+                continue
+            ge = guarantee_end_by_uid.get(p.uid)
+            if ge is not None and ge > boundary:
+                continue  # still within its guarantee at this boundary
+            eligible.setdefault(p.gpu_class, []).append(p)
+
+        return ForecastBoundaryNeed(
+            boundary=boundary,
+            demand_by_class=demand,
+            kills_needed_by_class=kills_needed,
+            eligible_by_class=eligible,
+            pool_gpus_by_class={
+                c: sum(p.gpu_count for p in ps) for c, ps in eligible.items()
+            },
+        )
+
+    def forecast_preemption_risk(
+        self,
+        capacity_by_class: dict[str, int],
+        pods: list[PodRuntimeView],
+        pending: list[OnDemandCandidate],
+        now: datetime,
+        lead: timedelta,
+    ) -> PreemptionForecast:
+        """Forecast per-pod preemption risk for the current + next two hours.
+
+        Pure and synchronous — the caller holds ``reservation_lock`` and
+        passes fresh cluster snapshots (same contract as
+        ``plan_boundary_candidates``).  The model:
+
+        - Enumerate future booking boundaries in ``(now, horizon_end + lead]``
+          — the tail extension mirrors the front lead-time attribution: a
+          boundary just past the last bucket can still land its phase-A kill
+          inside it.
+        - Per boundary/class: ``shortfall = max(0, demand − free)``; every
+          eligible pod's single-boundary risk is
+          ``min(1, shortfall / pool_gpus)`` — the uniform-random local
+          selection model (with delegation enabled the app's policy decides
+          *which* pool member dies; pool membership is exact either way).
+        - A boundary's kill can land anywhere in ``[boundary − lead,
+          boundary]`` (phase A runs early), but never before the pod's own
+          guarantee ends — each contribution is attributed to the buckets
+          overlapping ``[max(boundary − lead, guarantee_end), boundary]``,
+          which makes "guaranteed ⇒ zero risk" hold exactly per bucket.
+        - Per bucket, contributions combine as ``1 − Π(1 − r)``
+          (``combine_risks``; documented conservative).
+        - Free capacity is projected constant (running pods are assumed to
+          keep running — the pessimistic case a risk forecast should show).
+
+        Pending JIT candidates are reported per class on bucket 0 as
+        informational pressure only (see ``ForecastBucketSummary``).
+        """
+        buckets = forecast_buckets(now)
+        horizon_end = buckets[-1][1]
+        free = free_capacity_by_class(capacity_by_class, pods)
+
+        admitted = [
+            p
+            for p in pods
+            if p.reservation_id is not None and p.node_resident and not p.terminating
+        ]
+        # One chain walk per admitted pod, at the real now; reused by every
+        # boundary and by the per-bucket state labels below.
+        guarantee_end_by_uid: dict[str, Optional[datetime]] = {
+            p.uid: self.guarantee_end(p.reservation_id, now=now)
+            for p in pods
+            if p.reservation_id is not None
+        }
+
+        needs = [
+            self.forecast_boundary_need(b, free, pods, now, guarantee_end_by_uid)
+            for b in self.forecast_boundaries(now, horizon_end + lead)
+        ]
+
+        pending_by_class: dict[str, int] = {}
+        for c in pending:
+            pending_by_class[c.gpu_class_label] = (
+                pending_by_class.get(c.gpu_class_label, 0) + c.gpu_requested
+            )
+
+        # ----- bucket summaries -------------------------------------------------
+        class_universe = (
+            set(capacity_by_class)
+            | {p.gpu_class for p in admitted}
+            | set(pending_by_class)
+        )
+        for need in needs:
+            class_universe |= set(need.demand_by_class)
+        classes = sorted(class_universe)
+
+        demand_sums: list[dict[str, int]] = [{} for _ in buckets]
+        shortfall_sums: list[dict[str, int]] = [{} for _ in buckets]
+        pool_maxes: list[dict[str, int]] = [{} for _ in buckets]
+        for need in needs:
+            attributed = overlapping_bucket_indices(
+                need.boundary - lead, need.boundary, buckets
+            )
+            for i in attributed:
+                for c, d in need.demand_by_class.items():
+                    demand_sums[i][c] = demand_sums[i].get(c, 0) + d
+                for c, k in need.kills_needed_by_class.items():
+                    shortfall_sums[i][c] = shortfall_sums[i].get(c, 0) + k
+                for c, g in need.pool_gpus_by_class.items():
+                    pool_maxes[i][c] = max(pool_maxes[i].get(c, 0), g)
+
+        summaries = [
+            ForecastBucketSummary(
+                start=s,
+                end=e,
+                capacity_by_class={c: capacity_by_class.get(c, 0) for c in classes},
+                free_by_class={c: free.get(c, 0) for c in classes},
+                demand_by_class={c: demand_sums[i].get(c, 0) for c in classes},
+                shortfall_by_class={c: shortfall_sums[i].get(c, 0) for c in classes},
+                eligible_pool_gpus_by_class={
+                    c: pool_maxes[i].get(c, 0) for c in classes
+                },
+                pending_jit_gpus_by_class={
+                    c: (pending_by_class.get(c, 0) if i == 0 else 0) for c in classes
+                },
+            )
+            for i, (s, e) in enumerate(buckets)
+        ]
+
+        # ----- per-pod risk -----------------------------------------------------
+        pod_forecasts: list[PodForecast] = []
+        for p in admitted:
+            ge = guarantee_end_by_uid.get(p.uid)
+            risk_parts: list[list[float]] = [[] for _ in buckets]
+            if p.gpu_count > 0:
+                for need in needs:
+                    kills = need.kills_needed_by_class.get(p.gpu_class, 0)
+                    if kills <= 0:
+                        continue
+                    if ge is not None and ge > need.boundary:
+                        continue  # within guarantee at this boundary — no risk from it
+                    pool_gpus = need.pool_gpus_by_class.get(p.gpu_class, 0)
+                    if pool_gpus <= 0:
+                        continue
+                    risk = min(1.0, kills / pool_gpus)
+                    window_start = need.boundary - lead
+                    if ge is not None and ge > window_start:
+                        window_start = ge  # a kill can never precede the guarantee end
+                    for i in overlapping_bucket_indices(
+                        window_start, need.boundary, buckets
+                    ):
+                        risk_parts[i].append(risk)
+
+            bucket_risks = []
+            for i, (s, e) in enumerate(buckets):
+                if ge is None or ge <= s:
+                    state = "overstay"
+                elif ge >= e:
+                    state = "guaranteed"
+                else:
+                    state = "mixed"
+                bucket_risks.append(
+                    PodBucketRisk(risk=combine_risks(risk_parts[i]), state=state)
+                )
+            pod_forecasts.append(
+                PodForecast(view=p, guarantee_end=ge, buckets=bucket_risks)
+            )
+
+        return PreemptionForecast(
+            generated_at=now,
+            lead_minutes=int(lead.total_seconds() // 60),
+            buckets=summaries,
+            pods=pod_forecasts,
+        )

@@ -25,7 +25,9 @@ environment — but you must create it first.
 - Do not add a database, ORM, authentication layer, or frontend.  This is a
   pure daemon with no persistent state.  See CLAUDE.md for the rationale.
 - Do not add `SQLAlchemy`, `argon2-cffi`, `python-jose`, or any web-framework
-  router beyond the single `/health` endpoint already in `app/main.py`.
+  machinery beyond plain routes on the module-global `app` in `app/main.py`
+  (no `APIRouter` objects, no static files).  Current routes: `GET /health`,
+  `POST /api/reservations/push`, `GET /api/forecast/preemption-risk`.
 
 ---
 
