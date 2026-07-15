@@ -63,6 +63,8 @@ spec:
               value: {{ .Values.config.ondemandHorizonMinutes | quote }}
             - name: ONDEMAND_LEASE_BUFFER_MINUTES
               value: {{ .Values.config.ondemandLeaseBufferMinutes | quote }}
+            - name: ONDEMAND_DELEGATE_ADMISSION
+              value: {{ .Values.config.ondemandDelegateAdmission | quote }}
             - name: NOSHOWN_TIMEOUT_MINUTES
               value: {{ .Values.config.noshownTimeoutMinutes | quote }}
             - name: NOSHOWN_GRACE_MINUTES

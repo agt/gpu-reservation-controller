@@ -80,9 +80,13 @@ system is designed to accommodate greater values in the future.)
 │      d. Safety interlock (guard 3): if a reservation │
 │         holder is stuck Pending for a GPU class,     │
 │         hold lease requests for that class            │
-│      e. For each candidate whose retry cooldown has  │
-│         passed: guard 1 (GPU-only-pending), resolve  │
-│         gpu-class → gpu_class_id, then                │
+│      e. Vet every due candidate: guard 1 (GPU-only-  │
+│         pending), resolve gpu-class → gpu_class_id.   │
+│         If ONDEMAND_DELEGATE_ADMISSION, offer the     │
+│         whole batch to the app (LAS prioritization):  │
+│           POST /api/reservations/ondemand-admission   │
+│         → app returns which to admit (else grant all).│
+│         For each granted:                             │
 │           POST /api/reservations (on_demand=true,     │
 │             idempotency_key=pod UID)                  │
 │           Granted → admit under it (same as 3a/3b)    │
@@ -129,17 +133,24 @@ than preempting them.)
    it, same as any reserved-path pod.
 2. Otherwise, if the pod is **JIT-eligible** — `Pending`, carries
    `horae/minimum-runtime-seconds`, and carries the group label when
-   `REQUIRED_GROUP_LABEL` is set — it becomes an on-demand candidate and a
-   lease request is attempted immediately (and again on later pod updates,
-   respecting a retry cooldown).
+   `REQUIRED_GROUP_LABEL` is set — it becomes an on-demand candidate and, when
+   first discovered, kicks an immediate admission batch covering it plus every
+   other waiting candidate.  Later retries ride the queue-processor tick.
 3. Otherwise, if some future reservation matches at all (beyond the horizon,
    or currently over budget), the pod is queued for it anyway — the plain
    wait-for-window behaviour, preserved for a pod that isn't JIT-eligible.
 4. Otherwise the pod is left **Pending** (a pod missing the group label or the
    minimum-runtime annotation is not guessed at).
 
-**Requesting a lease** — the controller resolves the pod's `gpu-class` label
-to a numeric `gpu_class_id`, then calls `POST /api/reservations` with
+**Batch admission** — each attempt gathers all due candidates, vets each
+(re-routing, the guards below, and resolving its `gpu-class` label to a numeric
+`gpu_class_id`), and — when `ONDEMAND_DELEGATE_ADMISSION` is enabled — offers the
+whole eligible set to the app in one call
+(`POST /api/reservations/ondemand-admission`), which returns the subset to admit
+this round.  This is where **LAS (least-attained-service) prioritization** will
+live.  When the flag is off, or the app call fails, the controller grants every
+eligible candidate (its prior greedy behaviour), so the feature ships safely
+dark.  For each granted pod it then calls `POST /api/reservations` with
 `duration_seconds = minimum-runtime + ONDEMAND_LEASE_BUFFER_MINUTES * 60` and
 `on_demand=true` (the app relaxes policy limits — SU, caps, minimum duration
 — never physical calendar capacity).  The request is **idempotent by the
@@ -311,6 +322,7 @@ All settings are supplied via environment variables.
 | `ONDEMAND_PLACEMENT_ENABLED` | no | `true` | Set to `false` to disable the JIT on-demand lease path entirely |
 | `ONDEMAND_HORIZON_MINUTES` | no | `30` | JIT routing horizon: a pod is queued for a reservation opening within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | no | `10` | Minutes added to a pod's `horae/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
+| `ONDEMAND_DELEGATE_ADMISSION` | no | `false` | Delegate on-demand admission selection to the app for LAS prioritization (`POST /api/reservations/ondemand-admission`); `false` (or any app-call failure) grants every eligible candidate. Opt-in — enable once the app implements the endpoint |
 | `NOSHOW_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and cancelling it app-side (legacy alias `NOSHOWN_TIMEOUT_MINUTES` still accepted) |
 | `NOSHOW_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress (legacy alias `NOSHOWN_GRACE_MINUTES` still accepted) |
 | `POD_LIST_TICK_INTERVAL` | no | `300` | Seconds between queue-processor ticks (pod LIST frequency) |

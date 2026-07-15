@@ -14,7 +14,11 @@ import httpx
 
 from app.config import Config
 from app.reservation_client import ReservationClient
-from app.schemas import OnDemandReservationRequest
+from app.schemas import (
+    OnDemandAdmissionCandidate,
+    OnDemandAdmissionRequest,
+    OnDemandReservationRequest,
+)
 
 from tests.conftest import reservation as _reservation
 
@@ -194,6 +198,83 @@ def test_create_ondemand_reservation_timeout_returns_none():
 
     client = _client_with_handler(_config(), handler)
     assert asyncio.run(client.create_ondemand_reservation(_ondemand_request())) is None
+    asyncio.run(client.aclose())
+
+
+# ---------------------------------------------------------------------------
+# select_ondemand_admissions — app-delegated JIT admission selection
+# ---------------------------------------------------------------------------
+
+
+def _admission_request(**overrides) -> OnDemandAdmissionRequest:
+    base = dict(
+        pod_uid="pod-uid-1",
+        username="alice",
+        group_name=None,
+        gpu_class_id=10,
+        gpu_count=1,
+        duration_seconds=1200,
+    )
+    base.update(overrides)
+    return OnDemandAdmissionRequest(
+        candidates=[
+            OnDemandAdmissionCandidate(**base),
+            OnDemandAdmissionCandidate(
+                pod_uid="pod-uid-2", username="bob", gpu_class_id=10,
+                gpu_count=2, duration_seconds=600,
+            ),
+        ]
+    )
+
+
+def test_select_ondemand_admissions_200_returns_granted_uids():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/reservations/ondemand-admission"
+        body = json.loads(request.content)
+        assert [c["pod_uid"] for c in body["candidates"]] == ["pod-uid-1", "pod-uid-2"]
+        return httpx.Response(200, json={"granted_pod_uids": ["pod-uid-2"]})
+
+    client = _client_with_handler(_config(), handler)
+    result = asyncio.run(client.select_ondemand_admissions(_admission_request()))
+    assert result == ["pod-uid-2"]
+    asyncio.run(client.aclose())
+
+
+def test_select_ondemand_admissions_empty_list_is_respected():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"granted_pod_uids": []})
+
+    client = _client_with_handler(_config(), handler)
+    # Empty (grant none) is a valid decision — distinct from None (fall back).
+    assert asyncio.run(client.select_ondemand_admissions(_admission_request())) == []
+    asyncio.run(client.aclose())
+
+
+def test_select_ondemand_admissions_404_returns_none():
+    """A missing endpoint (older app) degrades to None → caller grants all."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"detail": "not found"})
+
+    client = _client_with_handler(_config(), handler)
+    assert asyncio.run(client.select_ondemand_admissions(_admission_request())) is None
+    asyncio.run(client.aclose())
+
+
+def test_select_ondemand_admissions_timeout_returns_none():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("timed out", request=request)
+
+    client = _client_with_handler(_config(), handler)
+    assert asyncio.run(client.select_ondemand_admissions(_admission_request())) is None
+    asyncio.run(client.aclose())
+
+
+def test_select_ondemand_admissions_bad_body_returns_none():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"unexpected": "shape"})
+
+    client = _client_with_handler(_config(), handler)
+    assert asyncio.run(client.select_ondemand_admissions(_admission_request())) is None
     asyncio.run(client.aclose())
 
 

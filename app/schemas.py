@@ -161,6 +161,51 @@ class PreemptionSelectionResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# On-demand admission selection (POST /api/reservations/ondemand-admission)
+# ---------------------------------------------------------------------------
+
+
+class OnDemandAdmissionCandidate(BaseModel):
+    """One pending pod seeking JIT on-demand admission, offered to the app.
+
+    Each candidate is the exact "ask" the controller would otherwise send to
+    ``POST /api/reservations`` — so the app can weigh it against LAS priority and
+    the same feasibility analysis a create would perform.  ``pod_uid`` is opaque
+    to the app (it equals the create's ``idempotency_key``): it is echoed back in
+    the response so the controller can map the choice to a pod to admit.
+    """
+
+    pod_uid: str
+    username: str
+    group_name: Optional[str] = None
+    gpu_class_id: int
+    gpu_count: int
+    duration_seconds: int
+
+
+class OnDemandAdmissionRequest(BaseModel):
+    """Body of ``POST /api/reservations/ondemand-admission``.
+
+    ``candidates`` is the full set of pending pods due for an admission attempt
+    this round.  The app returns the subset it grants; the controller then
+    creates a real lease (``POST /api/reservations``) for each granted pod, and
+    only ones it offered.
+    """
+
+    candidates: list[OnDemandAdmissionCandidate]
+
+
+class OnDemandAdmissionResponse(BaseModel):
+    """Pods the app grants on-demand admission this round, as offered ``pod_uid``s.
+
+    An empty list is a deliberate "grant none" decision and is respected; the
+    controller ignores any uid it did not offer.
+    """
+
+    granted_pod_uids: list[str]
+
+
+# ---------------------------------------------------------------------------
 # Preemption-risk forecast (GET /api/forecast/preemption-risk)
 # ---------------------------------------------------------------------------
 

@@ -345,9 +345,13 @@ without the toleration,
 2. Otherwise, if the pod is **JIT-eligible** — `ONDEMAND_PLACEMENT_ENABLED`,
    `Pending`, carries `horae/minimum-runtime-seconds`, and carries the group
    label when `REQUIRED_GROUP_LABEL` is set — it becomes an
-   `OnDemandCandidate` and `main._try_request_lease` is attempted immediately
-   (and again on later `MODIFIED` events, respecting its retry cooldown, so a
-   guard-1 "not yet scheduled" short retry resolves quickly).
+   `OnDemandCandidate` and, on the **ADDED** event, kicks an immediate
+   admission batch (`main._run_ondemand_admission`) covering it plus every
+   other due waiter.  `MODIFIED` events do **not** re-trigger a batch — denial
+   and guard short-retries ride the queue-processor tick — so a burst of
+   reconcile `MODIFIED`s cannot hammer the app (the trade-off: a pod whose
+   `PodScheduled` condition is not yet set at ADDED time waits for the next
+   tick instead of resolving in ~30 s).
 3. Otherwise, if `find_best_reservation` finds *any* future match (beyond the
    horizon, or over budget), the pod is queued for it anyway — this preserves
    the plain wait-for-window behaviour for a pod that isn't JIT-eligible.
@@ -355,33 +359,48 @@ without the toleration,
    minimum-runtime annotation is deliberately not guessed at; that is left
    for a future "born overstay" design).
 
-**Requesting a lease** (`main._try_request_lease`): re-reads the pod (drops it
-if gone/terminal/Unknown), re-runs step 1 above (a matching reservation may
-have appeared since the candidate was queued), applies guard 1
-(`is_gpu_only_pending`) and guard 3 (`stuck_holder_gpu_classes`), resolves the
-pod's `gpu-class` label to a numeric id via `ControllerState.gpu_class_ids`,
-then calls `POST /api/reservations` with
-`duration_seconds = minimum-runtime + ONDEMAND_LEASE_BUFFER_MINUTES * 60` (default
-buffer 10 min) and `on_demand=True` (the app relaxes policy limits — SU,
-caps, minimum duration — never physical calendar capacity).  The request is
-**idempotent by the pod's UID** (`idempotency_key`): a retry after a prior
-grant returns the same reservation rather than creating a duplicate.
+**Batch admission** (`main._run_ondemand_admission`, the single entry point for
+both the ADDED trigger and the queue-processor tick): gathers every **due**
+candidate (`now >= next_attempt_at`) in FIFO order and runs each through a
+two-step **preflight → delegate → grant** pipeline.
 
-- **Denied** (409 / error → `None`): the candidate cools down 2–5 min and
-  retries — no different from a reserved-path pod retrying a budget-full window.
-- **Granted**: the lease is upserted into `state.reservations`
-  (`apply_push_to_active`) and the pod is admitted under it immediately
+- **Preflight** (`_preflight_ondemand_candidate`): re-reads the pod (drops it
+  if gone/terminal/Unknown), re-runs step 1 above (a matching reservation may
+  have appeared since the candidate was queued), applies guard 1
+  (`is_gpu_only_pending`) and guard 3 (`stuck_holder_gpu_classes`), and resolves
+  the pod's `gpu-class` label to a numeric id via `ControllerState.gpu_class_ids`.
+  Survivors become an `OnDemandAdmissionCandidate` — the exact "ask" (username,
+  group, class id, gpu count, and `duration_seconds = minimum-runtime +
+  ONDEMAND_LEASE_BUFFER_MINUTES * 60`, default buffer 10 min).
+- **Delegate** (only when `ONDEMAND_DELEGATE_ADMISSION` is on): the whole
+  survivor set is offered to the app in one call
+  (`POST /api/reservations/ondemand-admission`,
+  `ReservationClient.select_ondemand_admissions`), which returns the subset of
+  `pod_uid`s to admit this round — the delegation point for **future LAS
+  prioritization**.  Mirrors the preemption-victims pattern: only offered uids
+  are honoured (`_map_granted_uids` drops unknowns), an **empty** answer is
+  respected (grant none), and a **call failure or the flag being off** falls
+  back to granting *every* survivor — the prior greedy per-pod behaviour, so the
+  change ships safely dark.
+- **Grant** (`_grant_and_admit`, per granted pod): calls `POST /api/reservations`
+  with `on_demand=True` (the app relaxes policy limits — SU, caps, minimum
+  duration — never physical calendar capacity), **idempotent by the pod's UID**
+  (`idempotency_key`).  A **denial** (409 / error → `None`) cools the candidate
+  down 2–5 min.  On **grant** the lease is upserted into `state.reservations`
+  (`apply_push_to_active`) and the pod is admitted immediately
   (`_try_apply_toleration`) — the existing admission path, so it stamps
-  `res-<id>`, records the guarantee, and emits `RuntimeGuaranteed` exactly like
-  any other reservation.  **If admission does not succeed** (budget race, a
-  transient patch error, or the pod having gone terminal in the interim), the
-  controller issues a compensating cancel
+  `res-<id>`, records the guarantee, and emits `RuntimeGuaranteed`.  **If
+  admission does not succeed** (budget race, transient patch error, or the pod
+  having gone terminal), the controller issues a compensating cancel
   (`POST /api/reservations/{id}/cancel`, `reason="controller-revoked"`) so the
-  grant is never left dangling, and removes the lease from `state.reservations`.
+  grant is never left dangling.  A **non-granted** survivor cools down like a
+  denial and is re-offered on a later tick.
 
-The queue-processor tick retries any still-pending candidate in FIFO order
-the same way; there is no separate on-demand admission function — both call
-sites share `_try_request_lease`.
+The batch is coalesced by `ControllerState.ondemand_admission_lock`: only one
+runs at a time, and a trigger arriving mid-batch sets `ondemand_rerun_requested`
+so exactly one trailing pass follows — an ADDED burst collapses into at most one
+in-flight + one trailing batch.  The single-pod `_try_request_lease` remains as a
+thin `preflight → grant` wrapper (the non-delegated path and the unit-test seam).
 
 **Surviving the fetch that hasn't seen the grant yet.**  The grant upserts the
 lease locally, but the periodic `reservation_fetch_loop` takes its
@@ -567,6 +586,7 @@ the claimed set and the grace re-arm path above applies.
 | `ONDEMAND_PLACEMENT_ENABLED` | `true` | Set to `false` to disable the JIT on-demand lease path entirely (a non-JIT-eligible pod still waits for a matching reservation; an ineligible one is left Pending) |
 | `ONDEMAND_HORIZON_MINUTES` | `30` | JIT routing horizon: a pod is queued for a reservation that opens within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | `10` | Minutes added to a pod's `horae/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
+| `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch (`POST /api/reservations/ondemand-admission`) for LAS prioritization; `false` (or any app-call failure) grants every eligible candidate — the prior greedy per-pod behaviour. Opt-in: enable once the app implements the endpoint |
 | `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show (legacy alias `NOSHOWN_TIMEOUT_MINUTES` still honored) |
 | `NOSHOW_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared (legacy alias `NOSHOWN_GRACE_MINUTES` still honored) |
 | `POD_LIST_TICK_INTERVAL` | `300` | Seconds between queue-processor ticks (pod LIST frequency) |

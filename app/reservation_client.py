@@ -5,6 +5,8 @@ Implements only the endpoints the controller needs:
   - GET /api/gpu-classes/{id}  — per-class detail including label_value
   - GET /api/gpu-classes  — full class list (JIT label → id resolution)
   - POST /api/reservations  — create a JIT on-demand booking
+  - POST /api/reservations/ondemand-admission  — ask the app which pending pods to admit
+  - POST /api/reservations/preemption-victims  — ask the app which overstay pods to preempt
   - POST /api/reservations/{id}/cancel  — cancel a reservation (no-show / revoke)
 """
 
@@ -20,6 +22,8 @@ from pydantic import ValidationError
 from .config import Config
 from .schemas import (
     GpuClassDetail,
+    OnDemandAdmissionRequest,
+    OnDemandAdmissionResponse,
     OnDemandReservationRequest,
     PreemptionSelectionRequest,
     PreemptionSelectionResponse,
@@ -215,6 +219,42 @@ class ReservationClient:
         except (ValidationError, ValueError) as exc:
             log.warning(
                 "Could not parse preemption victim selection response: %s", exc
+            )
+            return None
+
+    async def select_ondemand_admissions(
+        self, req: OnDemandAdmissionRequest
+    ) -> Optional[list[str]]:
+        """Ask the app which pending pods to grant JIT on-demand admission.
+
+        Returns the granted pod UIDs (possibly empty — the app may deliberately
+        grant none), or ``None`` on any failure (endpoint missing on an older
+        app, network error, non-2xx, unparseable body).  A ``None`` return tells
+        the caller to fall back to granting every offered candidate (today's
+        greedy per-pod behaviour); an empty list is a deliberate app decision and
+        is respected.  Degrades like the other client calls so a transient
+        failure never strands the admission batch.
+        """
+        try:
+            resp = await self._client.post(
+                "/api/reservations/ondemand-admission",
+                json=req.model_dump(mode="json"),
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            return OnDemandAdmissionResponse.model_validate(resp.json()).granted_pod_uids
+        except httpx.HTTPStatusError as exc:
+            log.warning(
+                "On-demand admission selection request failed: HTTP %s",
+                exc.response.status_code,
+            )
+            return None
+        except httpx.RequestError as exc:
+            log.warning("On-demand admission selection request failed: %s", exc)
+            return None
+        except (ValidationError, ValueError) as exc:
+            log.warning(
+                "Could not parse on-demand admission selection response: %s", exc
             )
             return None
 
