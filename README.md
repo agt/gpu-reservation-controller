@@ -317,6 +317,7 @@ All settings are supplied via environment variables.
 | `PREEMPTION_LEAD_MINUTES` | no | `15` | Minutes before a reservation slot boundary that phase-A preemption runs, proactively freeing capacity from overstaying pods |
 | `PREEMPTION_CHECK_INTERVAL` | no | `60` | Seconds between preemption sweeps |
 | `POD_ADOPTION_ENABLED` | no | `true` | Re-link an overstay pod to a reservation its user has since booked. Set to `false` to disable |
+| `CANCEL_VACATED_RESERVATIONS` | no | `true` | Cancel a reservation once its workload terminates and no pods remain — a JIT lease whose only pod exits (even mid-window), or an overstay booking whose last pod has gone. A booking still inside its window is never cancelled. Set to `false` to disable |
 | `REQUIRED_GROUP_LABEL` | no | *(absent)* | Pod label naming the usage group a pod belongs to (e.g. `dsmlp/course`). When set, the pod's value for this label must equal the reservation's group name — an additional match constraint alongside `gpu-class` — before the controller admits it, adopts it, or chain-extends its guarantee; a pod without the label is also never JIT-eligible. Unset disables the group constraint |
 | `LOG_LEVEL` | no | `INFO` | Python logging level for the controller |
 

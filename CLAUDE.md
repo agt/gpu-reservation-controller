@@ -380,6 +380,44 @@ sites share `_try_request_lease`.
 existing pod-patch path); `ONDEMAND_HORIZON_MINUTES` and
 `ONDEMAND_LEASE_BUFFER_MINUTES` tune the routing horizon and lease sizing.
 
+### Releasing a reservation when its workload terminates
+
+A JIT lease is sized for one pod; a booking's window is only useful while the
+holder is actually running pods.  When a pod **terminates** — `DELETED`, or an
+`ADDED`/`MODIFIED` event with a terminal phase (`Succeeded`/`Failed`) —
+`pod_watch_loop` releases its occupancy (as before) and then, if
+`CANCEL_VACATED_RESERVATIONS` is on (default), calls
+`main._cancel_vacated_reservation`, which asks
+`ControllerState.classify_vacated_reservation` whether the reservation the pod
+was admitted under (its `horae/booking-reference` id) should now be cancelled.
+It is — with the app-side reason **`controller-revoked`** (the only API reason
+for "controller released the lease / job finished early"; see
+docs/RESERVATION-API.md) — when **no live pod remains** under that id *and* it
+is either:
+
+- a **JIT on-demand lease** — tracked in
+  `ControllerState.ondemand_reservation_ids` (populated on grant in
+  `_try_request_lease`, pruned wherever `reservations` is replaced via
+  `prune_ondemand_ids`).  A lease is modelled locally as an ordinary
+  `kind="booking"` reservation, so this id set is the controller's *only* way
+  to tell its own lease apart from a user booking.  There is only ever one pod
+  per lease, so a clean exit — even inside the lease window — releases it; or
+- a regular booking now **past its runtime guarantee** (`guarantee_end` is
+  `None` or `<= now`) — an overstay whose *last* pod has gone, so the window is
+  genuinely finished.
+
+A regular booking still **inside its window** is never cancelled on pod exit:
+the holder may launch another pod, so the reservation is left for them.  The
+cancel is serialised on `reservation_lock` (like every other reservation
+mutation) and is best-effort — a failed cancel is left for a later fetch to
+reconcile, and nothing here rolls back the pod cleanup that already happened.
+The lease-id set is **in-memory only**: after a restart the controller no
+longer knows which active reservations were its own leases, so a lease whose
+pod exits post-restart simply runs to its natural end (the pre-feature
+behaviour) rather than being cancelled early.  No new RBAC (cancel reuses the
+existing `read_write` service-key call, same as the no-show and
+compensating-cancel paths).
+
 ### Inbound push API
 
 `POST /api/reservations/push` lets the reservation app push **one or more
@@ -489,6 +527,7 @@ the claimed set and the grace re-arm path above applies.
 | `PREEMPTION_CHECK_INTERVAL` | `60` | Seconds between preemption sweeps |
 | `PREEMPTION_DELEGATE_SELECTION` | `true` | Ask the app to choose preemption victims from the eligible pool (`POST /api/reservations/preemption-victims`); `false` (or any app-call failure) falls back to local uniform-random selection |
 | `POD_ADOPTION_ENABLED` | `true` | Re-link an overstay pod to a reservation its user has since booked (see **Adopting overstay pods into a re-booked reservation**); `false` disables |
+| `CANCEL_VACATED_RESERVATIONS` | `true` | Cancel a reservation once its workload terminates and no pods remain — a JIT lease whose only pod exits (even mid-window), or an overstay booking whose last pod has gone (see **Releasing a reservation when its workload terminates**); `false` disables |
 | `LOG_LEVEL` | `INFO` | Root Python logging level (parsed by `config.py`) |
 
 ---

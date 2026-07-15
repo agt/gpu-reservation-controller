@@ -109,6 +109,13 @@ config:
   # for preemption.  Set to false to disable.
   podAdoptionEnabled: true
 
+  # Cancel a reservation once its workload terminates and no pods remain under
+  # it: a JIT on-demand lease whose only pod exits (even mid-window), or an
+  # overstay booking whose last pod has gone.  A booking still inside its window
+  # is never cancelled (the holder may launch another pod).  Set to false to
+  # leave such reservations to expire on their own schedule.
+  cancelVacatedReservations: true
+
 # ---------------------------------------------------------------------------
 # ServiceAccount and RBAC
 # ---------------------------------------------------------------------------

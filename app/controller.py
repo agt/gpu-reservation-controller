@@ -323,6 +323,18 @@ class ControllerState:
         # horae/booking-reference, so no separate annotation is needed.
         self.occupancy: dict[int, dict[str, int]] = {}
 
+        # Reservation ids the controller itself created as JIT on-demand leases
+        # (main._try_request_lease).  A lease is modelled locally as an ordinary
+        # kind="booking" reservation (see CLAUDE.md), so this set is the only way
+        # the controller can later tell one of its own leases apart from a user
+        # booking — needed to cancel a lease when its single pod terminates, even
+        # mid-window (see classify_vacated_reservation).  In-memory only: after a
+        # restart the controller no longer knows which active reservations were
+        # its leases, so a lease whose pod exits post-restart simply runs to its
+        # natural end rather than being cancelled early.  Pruned wherever
+        # reservations is replaced (prune_ondemand_ids).
+        self.ondemand_reservation_ids: set[int] = set()
+
         # Safety interlock (guard 3): set of GPU class labels that currently
         # have at least one reservation-holder pod stuck Pending.  Updated each
         # queue_processor_loop tick.  On-demand placement is held for any class
@@ -1132,6 +1144,62 @@ class ControllerState:
             if r.id == reservation_id:
                 return r.gpu_count
         return 0
+
+    # ------------------------------------------------------------------
+    # JIT lease tracking and vacated-reservation cancellation
+    # ------------------------------------------------------------------
+
+    def prune_ondemand_ids(self) -> None:
+        """Drop lease ids no longer present in the active reservation set.
+
+        Called wherever ``reservations`` is replaced (the reconcile tail after a
+        fetch or push): once a lease leaves the active set — its window ended, it
+        was cancelled, or the app removed it — its id is no longer needed and is
+        forgotten so the set cannot grow without bound.
+        """
+        active_ids = {r.id for r in self.reservations}
+        self.ondemand_reservation_ids &= active_ids
+
+    def classify_vacated_reservation(
+        self, reservation_id: Optional[int], now: datetime
+    ) -> Optional[str]:
+        """Decide whether a reservation should be cancelled now that a pod under
+        it has terminated, returning a short human-readable cause or ``None``.
+
+        Must be called *after* the terminated pod's occupancy has been released,
+        so ``occupancy`` reflects only the pods that remain.  Returns a cause
+        string (for the caller's log line) when **no live pod remains** under
+        *reservation_id* and it is either:
+
+        - a **JIT on-demand lease** (``ondemand_reservation_ids``) — it exists
+          solely for its one pod, so even a clean exit inside its window should
+          release it (only ever one pod per lease, so "no pod remains" is the
+          pod that just terminated); or
+        - a regular booking now **past its runtime guarantee**
+          (``guarantee_end`` is ``None`` — window no longer active — or ``<=
+          now``) — an overstay whose last pod has gone, so the window is
+          genuinely finished.
+
+        Returns ``None`` (keep the reservation) when *reservation_id* is unknown
+        / already gone from the active set, still has a live pod, or is a regular
+        booking **still within its window** — the holder may launch another pod,
+        so a live booking is never cancelled out from under them.  The app-side
+        cancel reason is always ``"controller-revoked"`` (the only API reason for
+        "controller released the lease / job finished early", see
+        RESERVATION-API.md); this cause string feeds the controller's log only.
+        """
+        if reservation_id is None:
+            return None
+        if reservation_id not in {r.id for r in self.reservations}:
+            return None  # already gone from the active set — nothing to cancel
+        if self.occupancy.get(reservation_id):
+            return None  # a live pod still holds this reservation
+        if reservation_id in self.ondemand_reservation_ids:
+            return "on-demand lease released (pod terminated)"
+        end = self.guarantee_end(reservation_id, now=now)
+        if end is None or end <= now:
+            return "overstay booking vacated (last pod terminated past guarantee)"
+        return None  # regular booking still within its window — keep it
 
     # ------------------------------------------------------------------
     # Cancellation and owner-change detection

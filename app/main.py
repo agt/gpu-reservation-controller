@@ -180,6 +180,9 @@ async def _reconcile_after_reservation_change(
     state.reservations = active_reservations
     state.gpu_class_labels = new_labels
     state.gpu_class_ids = new_ids
+    # Forget lease ids that dropped out of the active set (window ended /
+    # cancelled), so the JIT-lease bookkeeping tracks only live leases.
+    state.prune_ondemand_ids()
 
     # Drop / re-match queue entries whose reservation was cancelled.
     state.reconcile_queue()
@@ -351,6 +354,54 @@ async def _handle_owner_changes(
                     pod_info.name,
                     exc,
                 )
+
+
+async def _cancel_vacated_reservation(
+    state: ControllerState,
+    client: ReservationClient,
+    config: Config,
+    reservation_id: Optional[int],
+    now: datetime,
+) -> None:
+    """Cancel a reservation whose workload has just terminated, when appropriate.
+
+    Called from ``pod_watch_loop`` after a terminated / deleted pod's occupancy
+    has been released.  ``classify_vacated_reservation`` decides whether the
+    reservation should be released — a JIT lease whose only pod exited (even
+    mid-window), or an overstay booking whose last pod has gone — and returns a
+    human-readable cause for the log line; the app-side reason is always
+    ``"controller-revoked"`` (the only reason the API defines for "the controller
+    released the lease / job finished early", RESERVATION-API.md).
+
+    Serialised on ``reservation_lock`` like the other reservation-mutating paths
+    so a concurrent fetch/push cannot race the active-set edit.  Best-effort: a
+    failed cancel is left for a later fetch to reconcile — nothing here can block
+    or roll back the pod cleanup that already happened.  A no-op when the feature
+    is disabled or there is no booking-reference to act on.
+    """
+    if not config.cancel_vacated_reservations or reservation_id is None:
+        return
+    async with state.reservation_lock:
+        cause = state.classify_vacated_reservation(reservation_id, now)
+        if cause is None:
+            return
+        if await client.cancel_reservation(reservation_id, "controller-revoked"):
+            state.reservations = [
+                r for r in state.reservations if r.id != reservation_id
+            ]
+            state.ondemand_reservation_ids.discard(reservation_id)
+            log.info(
+                "Reservation #%d cancelled (controller-revoked): %s",
+                reservation_id,
+                cause,
+            )
+        else:
+            log.warning(
+                "Failed to cancel vacated reservation #%d (%s); "
+                "will reconcile on a later fetch",
+                reservation_id,
+                cause,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -687,6 +738,9 @@ async def _try_request_lease(
 
     async with state.reservation_lock:
         state.reservations = apply_push_to_active(state.reservations, [lease])
+        # Remember this is one of our own leases so a later pod termination can
+        # release it even mid-window (classify_vacated_reservation).
+        state.ondemand_reservation_ids.add(lease.id)
         entry = QueueEntry(
             pod_uid=uid,
             pod_name=candidate.pod_name,
@@ -709,6 +763,7 @@ async def _try_request_lease(
             )
             await client.cancel_reservation(lease.id, "controller-revoked")
             state.reservations = [r for r in state.reservations if r.id != lease.id]
+            state.ondemand_reservation_ids.discard(lease.id)
 
     if admitted_queue:
         # Either admitted successfully, or the pod went terminal while we were
@@ -811,6 +866,10 @@ async def pod_watch_loop(
         )
 
         if event_type == "DELETED":
+            # Capture the reservation this pod was admitted under before we drop
+            # our record of it, so a vacated JIT lease / overstay booking can be
+            # cancelled once its occupancy is released below.
+            booking_id = parse_booking_reference(get_pod_booking_reference(pod))
             # --- reserved path cleanup ---
             state.dequeue_pod(uid)
             # --- JIT candidate cleanup ---
@@ -837,6 +896,11 @@ async def pod_watch_loop(
             # placement being enabled (otherwise reserved-path budget leaks until
             # the next reconcile).
             state.release_pod(uid)
+            # With its capacity freed, release the reservation too if the pod
+            # leaving it means no workload remains (JIT lease / overstay booking).
+            await _cancel_vacated_reservation(
+                state, client, config, booking_id, datetime.now(timezone.utc)
+            )
 
         elif event_type in ("ADDED", "MODIFIED"):
             phase = get_pod_phase(pod)
@@ -848,8 +912,12 @@ async def pod_watch_loop(
             # keeps a terminal pod out of the has_tol keep-warm below, which would
             # otherwise re-add it to occupancy on every MODIFIED event.
             if phase in TERMINAL_PHASES:
+                booking_id = parse_booking_reference(get_pod_booking_reference(pod))
                 state.remove_ondemand_candidate(uid)
                 state.release_pod(uid)
+                await _cancel_vacated_reservation(
+                    state, client, config, booking_id, datetime.now(timezone.utc)
+                )
                 continue
 
             if has_tol:

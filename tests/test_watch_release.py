@@ -49,7 +49,7 @@ def _pod(uid: str) -> SimpleNamespace:
     return SimpleNamespace(
         metadata=SimpleNamespace(
             uid=uid, name="pod-" + uid, namespace="alice",
-            labels={"gpu-class": "h100"},
+            labels={"gpu-class": "h100"}, annotations=None,
         )
     )
 

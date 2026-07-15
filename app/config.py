@@ -25,6 +25,7 @@ class Config:
     preemption_check_interval: int  # seconds between preemption sweeps
     pod_adoption_enabled: bool = True  # re-link overstay pods to a user's new booking
     preemption_delegate_selection: bool = True  # ask the app to choose victims; local random fallback
+    cancel_vacated_reservations: bool = True  # cancel a JIT lease / overstay booking once its last pod terminates
     required_group_label: Optional[str] = None  # pod label naming the usage group to match; None = disabled
     ondemand_horizon_minutes: int = 30    # JIT trigger: reserved-match horizon before requesting a lease
     ondemand_lease_buffer_minutes: int = 10  # added to a pod's minimum-runtime when sizing a JIT lease
@@ -87,6 +88,10 @@ class Config:
             not in ("false", "0", "no"),
             preemption_delegate_selection=os.environ.get(
                 "PREEMPTION_DELEGATE_SELECTION", "true"
+            ).lower()
+            not in ("false", "0", "no"),
+            cancel_vacated_reservations=os.environ.get(
+                "CANCEL_VACATED_RESERVATIONS", "true"
             ).lower()
             not in ("false", "0", "no"),
             ondemand_horizon_minutes=int(
