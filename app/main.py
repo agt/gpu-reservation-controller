@@ -776,6 +776,48 @@ async def reservation_fetch_loop(
 # ---------------------------------------------------------------------------
 
 
+async def _teardown_ondemand_lease(
+    state: ControllerState, client: ReservationClient, pod
+) -> None:
+    """Cancel the JIT on-demand lease backing *pod* when the pod has gone away.
+
+    A JIT lease exists solely to cover one pod (its ``idempotency_key`` is the
+    pod's UID), so once that pod terminates (clean exit / crash), is deleted, or
+    is preempted, the lease is no longer needed and should be released back to
+    the app — otherwise it keeps holding capacity and accruing SU until it
+    naturally expires.
+
+    The on-demand-vs-booking distinction is read live off the reservation's
+    ``kind`` field (the app returns leases as ``kind="on_demand"`` and the pull
+    keeps them in ``state.reservations``), so nothing about which reservations
+    are leases is tracked in memory — the pod's ``horae/booking-reference``
+    annotation resolves to the lease id, and its ``kind`` is looked up there.
+
+    Best-effort: only ``kind == "on_demand"`` rows are ever touched (a user
+    booking's pod ending never cancels anything), the cancel is idempotent
+    (already-cancelled / gone ids are a harmless no-op), and a failure just logs
+    — the next app poll reconciles.  Occupancy is released separately by the
+    caller, independent of this cancel succeeding.
+    """
+    booking_id = parse_booking_reference(get_pod_booking_reference(pod))
+    if booking_id is None:
+        return
+    # Hold the lock across the cancel + list edit, mirroring the compensating
+    # cancel in _try_request_lease, so a concurrent fetch can't replace
+    # state.reservations mid-operation.
+    async with state.reservation_lock:
+        res = next((r for r in state.reservations if r.id == booking_id), None)
+        if res is None or res.status != "active" or res.kind != "on_demand":
+            return
+        log.info(
+            "On-demand pod gone; cancelling lease #%d (%s)",
+            booking_id,
+            res.gpu_class.name,
+        )
+        if await client.cancel_reservation(booking_id, "pod-terminated"):
+            state.reservations = [r for r in state.reservations if r.id != booking_id]
+
+
 async def pod_watch_loop(
     state: ControllerState, client: ReservationClient, config: Config
 ) -> None:
@@ -795,7 +837,9 @@ async def pod_watch_loop(
       attempt a lease request immediately
     - MODIFIED for a tracked candidate (respecting its retry cooldown) →
       attempt again, so a guard-1 short retry resolves quickly
-    - DELETED or terminal (Succeeded/Failed) → release any held slot
+    - DELETED or terminal (Succeeded/Failed) → release any held slot, and if the
+      pod was admitted under a JIT on-demand lease, cancel that lease too
+      (``_teardown_ondemand_lease`` — a lease covers only its one pod)
     - MODIFIED with toleration present → dequeue from candidates (already placed)
 
     A pod matching neither path (no admittable/future reservation, and not
@@ -851,6 +895,9 @@ async def pod_watch_loop(
             # placement being enabled (otherwise reserved-path budget leaks until
             # the next reconcile).
             state.release_pod(uid)
+            # If this pod was admitted under a JIT on-demand lease, release the
+            # lease too — it exists only to cover this pod (no-op for bookings).
+            await _teardown_ondemand_lease(state, client, pod)
 
         elif event_type in ("ADDED", "MODIFIED"):
             phase = get_pod_phase(pod)
@@ -864,6 +911,9 @@ async def pod_watch_loop(
             if phase in TERMINAL_PHASES:
                 state.remove_ondemand_candidate(uid)
                 state.release_pod(uid)
+                # A pod that finished on its own no longer needs its JIT lease;
+                # cancel it if that's what admitted this pod (no-op otherwise).
+                await _teardown_ondemand_lease(state, client, pod)
                 continue
 
             if has_tol:

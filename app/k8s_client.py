@@ -140,7 +140,7 @@ def get_pod_gpu_count(pod) -> int:
 
 def get_pod_booking_reference(pod) -> Optional[str]:
     """Return the ``horae/booking-reference`` annotation value, or ``None``."""
-    annotations: dict = pod.metadata.annotations or {}
+    annotations: dict = getattr(pod.metadata, "annotations", None) or {}
     return annotations.get("horae/booking-reference")
 
 

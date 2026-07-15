@@ -377,7 +377,8 @@ reason. Requires a `read_write` service key (or an admin JWT).
 | `reason` | Meaning |
 |----------|---------|
 | `"no-show"` | The reservation holder never ran pods (applies to leases and to already-started bookings) |
-| `"controller-revoked"` | The controller released the lease (job finished early, controller shutdown, …) |
+| `"controller-revoked"` | The controller released a lease grant it never admitted a pod under (e.g. a budget race, or controller shutdown) |
+| `"pod-terminated"` | The lease's pod finished, crashed, or was removed, so the controller released the now-unneeded lease |
 
 Scope:
 
@@ -982,7 +983,7 @@ Returned by `GET /api/groups/{group_id}/members`.
 | `updated_at` | datetime (UTC, `Z`) | |
 | `cancelled_at` | datetime \| null (UTC, `Z`) | |
 | `cancelled_by_id` | integer \| null | User ID of whoever cancelled; `null` for a controller (service-key) cancellation |
-| `cancel_reason` | `"no-show"` \| `"controller-revoked"` \| null | Machine-readable reason recorded by `POST /api/reservations/{id}/cancel`; `null` for human cancellations |
+| `cancel_reason` | `"no-show"` \| `"controller-revoked"` \| `"pod-terminated"` \| null | Machine-readable reason recorded by `POST /api/reservations/{id}/cancel`; `null` for human cancellations |
 
 ---
 

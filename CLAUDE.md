@@ -59,7 +59,7 @@ app/
 | Task | Cadence | Responsibility |
 |------|---------|----------------|
 | `reservation_fetch_loop` | every `RESERVATION_FETCH_INTERVAL` s (default 300) | Re-fetches active reservations; refreshes `gpu_class_id ↔ label_value` maps; reconciles stale queue entries |
-| `pod_watch_loop` | continuous (LIST + WATCH) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods; **fast-path**: applies toleration immediately when a new pod arrives inside an open window |
+| `pod_watch_loop` | continuous (LIST + WATCH) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease; **fast-path**: applies toleration immediately when a new pod arrives inside an open window |
 | `queue_processor_loop` | every `POD_LIST_TICK_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
 | `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee, only when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**) |
 
@@ -394,6 +394,22 @@ including the controller's own compensating cancel, still wins and its pod is
 released.  Only replication lag (grant not yet surfaced) is bridged; the push path
 is unaffected because it merges deltas (`apply_push_to_active`) instead of
 replacing.
+
+**Lease teardown when the pod goes away** (`main._teardown_ondemand_lease`): a
+JIT lease exists solely to cover one pod (its `idempotency_key` is the pod's
+UID), so once that pod terminates on its own (Succeeded/Failed), is deleted, or
+is preempted, the lease is no longer needed and the controller cancels it
+(`POST /api/reservations/{id}/cancel`, `reason="pod-terminated"`), releasing the
+capacity and stopping SU accrual instead of letting the lease linger until it
+expires.  `pod_watch_loop` calls this from both its DELETED and terminal-phase
+branches, right after `release_pod`.  **No on-demand-vs-booking state is tracked
+in memory**: the pod's `horae/booking-reference` annotation resolves to the
+reservation id, and the reservation's own `kind` field — the app returns leases
+as `kind="on_demand"` and the pull keeps them in `state.reservations` — is read
+live to decide.  Only `kind == "on_demand"` rows are touched (a booking's pod
+ending never cancels anything); the cancel is idempotent and best-effort (a
+failure just logs — the next poll reconciles), and occupancy is released
+independently.
 
 **RBAC / config**: no new Kubernetes permissions (admission reuses the
 existing pod-patch path); `ONDEMAND_HORIZON_MINUTES` and
