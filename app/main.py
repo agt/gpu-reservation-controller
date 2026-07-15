@@ -133,6 +133,7 @@ def _short_retry_at(now: datetime) -> datetime:
 async def _reconcile_after_reservation_change(
     state: ControllerState,
     client: ReservationClient,
+    config: Config,
     active_reservations: list[ReservationResponse],
     cancelled_in_window: list[ReservationResponse],
     owner_changes: list[tuple[ReservationResponse, str]],
@@ -194,9 +195,10 @@ async def _reconcile_after_reservation_change(
     # Occupancy is rebuilt from a live cluster snapshot each queue-processor
     # tick (reconcile_occupancy), so no reservation-driven prune is needed here.
 
-    # Handle mid-window cancellations: evict pods and reclaim capacity.
+    # Handle mid-window cancellations: rescue a continued pod onto its new
+    # guarantee where possible, otherwise evict and reclaim capacity.
     if cancelled_in_window:
-        await _handle_cancelled_reservations(state, cancelled_in_window)
+        await _handle_cancelled_reservations(state, config, cancelled_in_window, now)
 
     # Handle owner changes (adoption): evict the prior owner's admitted pod so
     # the new owner can claim the still-active reservation.
@@ -239,6 +241,7 @@ async def _refresh_reservations(
         await _reconcile_after_reservation_change(
             state,
             client,
+            config,
             active_reservations + preserved,
             cancelled_in_window,
             owner_changes,
@@ -253,14 +256,23 @@ async def _refresh_reservations(
 
 async def _handle_cancelled_reservations(
     state: ControllerState,
+    config: Config,
     cancelled_in_window: list[ReservationResponse],
+    now: datetime,
 ) -> None:
-    """Evict pods admitted under cancelled reservations and reclaim capacity.
+    """Rescue continued pods, then evict the rest, for cancelled reservations.
 
     For each in-window cancelled reservation (already carrying ``cancelled_by``
     info from the ``status=all`` fetch):
     1. Snapshot live tolerated pods and filter those admitted under this reservation.
-    2. Emit a ReservationCancelled event on each pod, then delete it.
+    2. **Continue-rescue:** when pod adoption is enabled and the pod's owner has
+       since booked a fresh open guaranteed window (the reservation app's
+       ``/continue`` supersedes a still-running lease/booking with a new booking),
+       re-link the pod onto that window instead of evicting — the job keeps
+       running with no relaunch. This is what makes continuing an *in-progress*
+       job (an on-demand lease during its window, or an in-progress booking)
+       seamless: the app cancels the source, but its pod is carried forward.
+    3. Otherwise emit a ReservationCancelled event on the pod and delete it.
     """
     # One pod snapshot serves the whole batch.
     pod_snapshot = []
@@ -269,18 +281,53 @@ async def _handle_cancelled_reservations(
     except Exception as exc:  # noqa: BLE001
         log.warning("Could not snapshot pods for cancellation eviction: %s", exc)
 
+    cancelled_ids = {r.id for r in cancelled_in_window}
     for cancelled_res in cancelled_in_window:
         cancelled_by_desc = canceller_description(cancelled_res)
 
         pods_for_res = [p for p in pod_snapshot if p.reservation_id == cancelled_res.id]
         if pods_for_res:
             log.info(
-                "Evicting %d pod(s) for cancelled reservation #%d (%s)",
+                "Handling %d pod(s) for cancelled reservation #%d (%s)",
                 len(pods_for_res),
                 cancelled_res.id,
                 cancelled_by_desc,
             )
         for pod_info in pods_for_res:
+            # Continue-rescue: re-link onto a fresh open booking the same user
+            # holds (a /continue supersede) rather than killing the running job.
+            if config.pod_adoption_enabled:
+                res_new = state.find_open_booking_for(
+                    pod_info.namespace,
+                    pod_info.gpu_class,
+                    now,
+                    pod_info.gpu_count,
+                    group_label=pod_info.group_label,
+                )
+                if (
+                    res_new is not None
+                    and res_new.id not in cancelled_ids
+                    and await _relink_pod_to_reservation(
+                        state,
+                        name=pod_info.name,
+                        namespace=pod_info.namespace,
+                        uid=pod_info.uid,
+                        gpu_class=pod_info.gpu_class,
+                        gpu_count=pod_info.gpu_count,
+                        res_new=res_new,
+                        now=now,
+                    )
+                ):
+                    log.info(
+                        "Rescued pod %s/%s from cancelled reservation #%d onto "
+                        "continued reservation #%d",
+                        pod_info.namespace,
+                        pod_info.name,
+                        cancelled_res.id,
+                        res_new.id,
+                    )
+                    continue  # carried forward — do not evict
+
             # Emit event before deletion so the event record survives.
             try:
                 pod_obj = await read_pod(pod_info.name, pod_info.namespace)
@@ -1477,57 +1524,88 @@ async def _adopt_pods(
     if not config.pod_adoption_enabled:
         return
     for view, res_new in state.plan_pod_adoptions(pods, now):
-        booking_reference = make_booking_reference(res_new.id)
-        try:
-            fresh_pod = await read_pod(view.name, view.namespace)
-            if is_terminal_phase(fresh_pod):
-                continue
-            await apply_toleration(
-                view.name,
-                view.namespace,
-                fresh_pod,
-                TOLERATION_KEY,
-                view.gpu_class,
-                booking_reference,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Failed to re-link overstay pod %s/%s to reservation #%d: %s",
-                view.namespace,
-                view.name,
-                res_new.id,
-                exc,
-            )
-            continue
+        if await _relink_pod_to_reservation(
+            state,
+            name=view.name,
+            namespace=view.namespace,
+            uid=view.uid,
+            gpu_class=view.gpu_class,
+            gpu_count=view.gpu_count,
+            res_new=res_new,
+            now=now,
+        ):
+            # Patch landed: refresh the in-memory view so the adopted pod
+            # contributes zero demand and is no longer past-guarantee.
+            idx = pods.index(view)
+            pods[idx] = replace(view, reservation_id=res_new.id)
 
-        # Patch landed: re-home occupancy and refresh the in-memory view so the
-        # adopted pod contributes zero demand and is no longer past-guarantee.
-        state.relink_occupancy(view.uid, res_new.id, view.gpu_count)
-        idx = pods.index(view)
-        pods[idx] = replace(view, reservation_id=res_new.id)
 
-        guaranteed_until = state.compute_guaranteed_until(now, res_new)
-        log.info(
-            "Re-linked overstay pod %s/%s to reservation #%d (guaranteed until %s)",
-            view.namespace,
-            view.name,
+async def _relink_pod_to_reservation(
+    state: ControllerState,
+    *,
+    name: str,
+    namespace: str,
+    uid: str,
+    gpu_class: str,
+    gpu_count: int,
+    res_new: ReservationResponse,
+    now: datetime,
+) -> bool:
+    """Best-effort re-link of one live pod onto *res_new* (annotation + occupancy).
+
+    Reads the pod fresh, skips a terminal one, rewrites its booking-reference
+    annotation to *res_new* (the toleration is already present), and — only on
+    patch success — re-homes its occupancy so budget accounting and
+    ``guarantee_end`` reflect the new binding, records the refreshed guarantee,
+    and emits an ``OverstayRelinked`` event.  Returns True when the pod was
+    re-linked.  Shared by the periodic overstay-adoption sweep (``_adopt_pods``)
+    and the cancellation handler's continue-rescue
+    (``_handle_cancelled_reservations``), so both re-link identically.
+    """
+    try:
+        fresh_pod = await read_pod(name, namespace)
+        if is_terminal_phase(fresh_pod):
+            return False
+        await apply_toleration(
+            name,
+            namespace,
+            fresh_pod,
+            TOLERATION_KEY,
+            gpu_class,
+            make_booking_reference(res_new.id),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Failed to re-link pod %s/%s to reservation #%d: %s",
+            namespace,
+            name,
             res_new.id,
-            guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            exc,
         )
-        await _record_guarantee(
-            view.name, view.namespace, fresh_pod, guaranteed_until, now
+        return False
+
+    state.relink_occupancy(uid, res_new.id, gpu_count)
+    guaranteed_until = state.compute_guaranteed_until(now, res_new)
+    log.info(
+        "Re-linked pod %s/%s to reservation #%d (guaranteed until %s)",
+        namespace,
+        name,
+        res_new.id,
+        guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    await _record_guarantee(name, namespace, fresh_pod, guaranteed_until, now)
+    try:
+        await emit_overstay_relinked_event(
+            fresh_pod, name, namespace, res_new.id, guaranteed_until
         )
-        try:
-            await emit_overstay_relinked_event(
-                fresh_pod, view.name, view.namespace, res_new.id, guaranteed_until
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Could not emit OverstayRelinked event for pod %s/%s: %s",
-                view.namespace,
-                view.name,
-                exc,
-            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Could not emit OverstayRelinked event for pod %s/%s: %s",
+            namespace,
+            name,
+            exc,
+        )
+    return True
 
 
 def _build_selection_request(need: BoundaryPreemptionNeed) -> PreemptionSelectionRequest:
@@ -1900,6 +1978,7 @@ async def push_reservations(
         await _reconcile_after_reservation_change(
             state,
             client,
+            config,
             merged_active,
             cancelled_in_window,
             owner_changes,

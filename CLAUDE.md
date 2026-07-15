@@ -270,18 +270,33 @@ currently-open booking the same user holds that has spare budget
 admitted pod is already tied to a real reservation (JIT or otherwise), so
 there is nothing to "upgrade" — only overstay pods are ever rescued.
 
-`_adopt_pods` in `main.py` then re-annotates the pod's `horae/booking-reference`
-to `res-<new id>` (the toleration is already present, so this patch only
-rewrites the annotation) and, **only on patch success**, re-homes occupancy
-(`relink_occupancy`) and refreshes the in-memory `PodRuntimeView`.  It emits an
-`OverstayRelinked` event and re-records the runtime guarantee.
+The shared `_relink_pod_to_reservation` helper in `main.py` re-annotates the
+pod's `horae/booking-reference` to `res-<new id>` (the toleration is already
+present, so this patch only rewrites the annotation) and, **only on patch
+success**, re-homes occupancy (`relink_occupancy`), re-records the runtime
+guarantee, and emits an `OverstayRelinked` event. `_adopt_pods` calls it for each
+pair `plan_pod_adoptions` returns and refreshes the in-memory `PodRuntimeView`.
 
-Adoption runs in two places, both under `reservation_lock`: inside
+Adoption runs in **three** places, all under `reservation_lock`: inside
 `_run_preemption_sweep` **before** victims are planned — so a pod the user has
 just re-booked is re-homed (zeroing that boundary's demand) and can never be
-selected as a victim — and once per **queue-processor tick** as a lazy tidy-up
-that re-links pods even when no boundary is near.  A pod with no open booking to
-adopt is left untouched (legitimately overstay).
+selected as a victim — once per **queue-processor tick** as a lazy tidy-up that
+re-links pods even when no boundary is near, and in **`_handle_cancelled_reservations`**
+(see below). A pod with no open booking to adopt is left untouched (legitimately
+overstay).
+
+**Continue-rescue on cancellation.** The reservation app's
+`POST /api/reservations/{id}/continue` (see RESERVATION-API.md) lets a user carry
+a still-running job onto a fresh guaranteed booking: it mints the new
+`kind='booking'` window (anchored at "now", off the hour grid) and **supersedes**
+the source by cancelling it (`cancel_reason='superseded'`), pushing both. Since a
+cancelled-in-window reservation would otherwise have its pod evicted,
+`_handle_cancelled_reservations` first tries `find_open_booking_for` on each pod
+about to be evicted and, when the same user now holds a matching open booking (the
+continued window), calls `_relink_pod_to_reservation` to carry the pod forward
+**instead of** deleting it (gated by `POD_ADOPTION_ENABLED`; falls back to eviction
+when disabled). This is what makes continuing an *in-progress* job — including an
+on-demand lease *during* its window — seamless.
 
 Separately, a still-*pending* JIT candidate's own routing is re-checked on
 every attempt (`main._try_request_lease`, step 2): if a reservation has since

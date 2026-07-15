@@ -293,7 +293,7 @@ Every reservation has a `kind` field:
 
 | `kind` | Created by | Time grid | Attribution |
 |--------|-----------|-----------|-------------|
-| `"booking"` | A user through the web UI (or an admin/manager on a user's behalf) | Whole hours | `user_id` + `group_id` always set |
+| `"booking"` | A user through the web UI (or an admin/manager on a user's behalf) | Whole hours — **except** a booking minted by `POST /api/reservations/{id}/continue`, which is anchored at "now" with an arbitrary second-granularity window (`continued_from_id` set) | `user_id` + `group_id` always set |
 | `"on_demand"` | The Kubernetes controller via §"Creating on-demand reservations" | Arbitrary timestamps, anchored at creation time | `user_id` + `group_id` always set |
 
 Both kinds are returned by `GET /api/reservations` under every `status` filter —
@@ -402,6 +402,65 @@ full, plus the fraction-of-cost penalty on the unused remainder inside the next
 | 403 | Read-only key / non-admin JWT, or a not-yet-started `booking` |
 | 404 | Reservation not found |
 | 422 | Unknown `reason` |
+
+### `POST /api/reservations/{id}/continue`
+
+Continue a **still-running job** under a fresh guaranteed reservation. Mints a
+new `kind="booking"` reservation for the source's user/group/GPU class, anchored
+at the app's own "now" with an arbitrary second-granularity `duration_seconds`
+(so it can cover a job that never aligned to the whole-hour grid), then returns
+it. The sibling controller re-links (adopts) the running pod onto the new
+reservation, so the job keeps running with no relaunch. Callable by the source's
+**owner** (JWT), an admin, or a manager of its group — **not** service keys.
+
+```json
+{ "duration_seconds": 7200, "gpu_count": 2, "notes": "extending training run" }
+```
+
+| Field | Meaning |
+|-------|---------|
+| `duration_seconds` | Length of the new guaranteed window from now (60 … 604 800). Required. |
+| `gpu_count` | GPUs for the new reservation; defaults to the source's count. Optional. |
+| `notes` | Stored on the new reservation; defaults to the source's notes. Optional. |
+
+Eligible sources (must be `status="active"`):
+
+- a `kind="on_demand"` lease — **during** its window or **after** it lapses (an
+  overstaying pod); and
+- a `kind="booking"` that is **in progress** (started, not yet ended) — a cleaner
+  path than re-running the booking wizard. A not-yet-started or already-ended
+  booking is rejected.
+
+Semantics:
+
+- **Off-grid, anchored at "now"** — like an on-demand lease, `start_dt` is the
+  app's `local_now()` and `end_dt = start + duration_seconds`; whole-hour
+  alignment and the 15-minute lead do **not** apply. The resulting
+  `kind="booking"` row may therefore be off the hourly grid.
+- **Supersede** — when the source still holds future time (`end_dt > now`) it is
+  cancelled with the standard unwaived cancellation penalty (charging only the
+  time already consumed and freeing its remaining capacity), then set
+  `cancel_reason="superseded"`, so the new reservation is admitted against freed
+  resources and the two never double-count. An already-ended on-demand overstay
+  is left untouched. The controller **re-links the pod instead of evicting it**
+  when it observes the `superseded` cancellation alongside the new open booking
+  (requires `POD_ADOPTION_ENABLED`).
+- **Same admission analysis as a booking** — the three capacity tiers (+
+  borrowing), the per-member/team SU budget and group SU pool, and
+  `max_gpus_per_reservation`, with privilege judged **as-if-self-booked**.
+- The new row records `continued_from_id` (the source reservation's id). No
+  confirmation email is sent. Both the new booking and any superseded source are
+  pushed to the controller (best-effort) so the pod is carried forward promptly.
+
+**Responses**
+
+| Code | Condition |
+|------|-----------|
+| 201 | Created — the new [ReservationResponse](#reservationresponse), `kind="booking"`, `continued_from_id` set |
+| 400 | Source not active / not an eligible kind or phase, or the window can't be admitted on budget |
+| 403 | Caller is not the owner, an admin, or a manager of the group |
+| 404 | Reservation, group, or GPU class not found / inactive |
+| 409 | Capacity would be exceeded |
 
 ### `POST /api/reservations/preemption-victims`
 
@@ -1049,7 +1108,8 @@ Returned by `GET /api/groups/{group_id}/members`.
 | `updated_at` | datetime (UTC, `Z`) | |
 | `cancelled_at` | datetime \| null (UTC, `Z`) | |
 | `cancelled_by_id` | integer \| null | User ID of whoever cancelled; `null` for a controller (service-key) cancellation |
-| `cancel_reason` | `"no-show"` \| `"controller-revoked"` \| `"pod-terminated"` \| null | Machine-readable reason recorded by `POST /api/reservations/{id}/cancel`; `null` for human cancellations |
+| `cancel_reason` | `"no-show"` \| `"controller-revoked"` \| `"pod-terminated"` \| `"superseded"` \| null | Machine-readable reason recorded by `POST /api/reservations/{id}/cancel` (or `"superseded"` when a source was continued via `POST /api/reservations/{id}/continue`); `null` for human cancellations |
+| `continued_from_id` | integer \| null | Set on a booking minted via `POST /api/reservations/{id}/continue`: the id of the superseded source reservation whose pod it carries forward; `null` otherwise |
 
 ---
 

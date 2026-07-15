@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient
 
 from app.controller import apply_push_to_active
 from app.k8s_client import ToleratedPodInfo
-from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, USERNAME, block
+from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, USERNAME, block, reservation
 
 
 def _res(res_id: int, *, status: str = "active", **kw):
@@ -181,10 +181,132 @@ def test_push_cancellation_evicts_admitted_pod(monkeypatch):
         assert [r.id for r in state.reservations] == [] # dropped from active set
 
 
+def _continue_target(res_id, *, gpu_count=2):
+    """The fresh open guaranteed booking the app mints on /continue (off-grid)."""
+    now = datetime.now(timezone.utc)
+    return reservation(
+        res_id,
+        start_utc=now - timedelta(seconds=7),      # anchored at "now", off the hour grid
+        end_utc=now + timedelta(hours=2),
+        kind="booking",
+        user_id=1,
+        username=USERNAME,
+        gpu_count=gpu_count,
+        gpu_class_label=GPU_CLASS_LABEL,
+    )
+
+
+def test_push_cancellation_rescues_continued_pod(monkeypatch):
+    """The /continue flow supersedes a running source (pushed as cancelled) and
+    pushes the user's new open booking alongside it. The pod is re-linked onto
+    the new booking instead of being evicted — the job keeps running."""
+    main = _patched_main(monkeypatch, token="secret")
+
+    pod = ToleratedPodInfo(
+        namespace=USERNAME, name="pod-1", uid="uid-1", gpu_class=GPU_CLASS_LABEL,
+        booking_reference="res-1", reservation_id=1, gpu_count=2,
+        phase="Running", scheduled_false=False,
+    )
+    deleted: list[tuple[str, str]] = []
+    relinked: list[tuple[str, str, str]] = []
+
+    async def _snapshot(_key):
+        return [pod]
+
+    async def _delete(name, ns):
+        deleted.append((name, ns))
+
+    async def _read(name, ns):
+        return SimpleNamespace()
+
+    async def _apply_tol(name, ns, pod_obj, key, gpu_class, booking_ref):
+        relinked.append((name, ns, booking_ref))
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(main, "snapshot_tolerated_pods", _snapshot)
+    monkeypatch.setattr(main, "delete_pod", _delete)
+    monkeypatch.setattr(main, "read_pod", _read)
+    monkeypatch.setattr(main, "apply_toleration", _apply_tol)
+    monkeypatch.setattr(main, "is_terminal_phase", lambda pod_obj: False)
+    monkeypatch.setattr(main, "_record_guarantee", _noop)
+    monkeypatch.setattr(main, "emit_overstay_relinked_event", _noop)
+    monkeypatch.setattr(main, "emit_reservation_cancelled_event", _noop)
+
+    with TestClient(main.app) as client:
+        state = main.app.state.controller_state
+        state.reservations = [_res(1, gpu_count=2)]        # the source, still active
+        state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
+        state.record_placement(1, "uid-1", 2)             # pod occupies the source
+
+        resp = client.post(
+            "/api/reservations/push",
+            json=_json(_res(1, status="cancelled"), _continue_target(2)),
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"applied": 1, "cancelled": 1, "adopted": 0, "total_active": 1}
+
+        assert deleted == []                               # NOT evicted — carried over
+        assert relinked == [("pod-1", USERNAME, "res-2")]  # re-linked to the new booking
+        assert state.occupancy.get(1, {}) == {}            # freed from the source
+        assert state.occupancy.get(2) == {"uid-1": 2}      # now held under the new booking
+
+
+def test_push_cancellation_evicts_when_adoption_disabled(monkeypatch):
+    """With pod adoption disabled, a cancelled source's pod is evicted even when
+    a matching open booking exists (no continue-rescue)."""
+    import dataclasses as _dc
+
+    main = _patched_main(monkeypatch, token="secret")
+    monkeypatch.setattr(
+        main.app.state, "config",
+        _dc.replace(main.app.state.config, pod_adoption_enabled=False),
+    )
+
+    pod = ToleratedPodInfo(
+        namespace=USERNAME, name="pod-1", uid="uid-1", gpu_class=GPU_CLASS_LABEL,
+        booking_reference="res-1", reservation_id=1, gpu_count=2,
+        phase="Running", scheduled_false=False,
+    )
+    deleted: list[tuple[str, str]] = []
+
+    async def _snapshot(_key):
+        return [pod]
+
+    async def _delete(name, ns):
+        deleted.append((name, ns))
+
+    async def _read(name, ns):
+        return SimpleNamespace()
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(main, "snapshot_tolerated_pods", _snapshot)
+    monkeypatch.setattr(main, "delete_pod", _delete)
+    monkeypatch.setattr(main, "read_pod", _read)
+    monkeypatch.setattr(main, "emit_reservation_cancelled_event", _noop)
+
+    with TestClient(main.app) as client:
+        state = main.app.state.controller_state
+        state.reservations = [_res(1, gpu_count=2)]
+        state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
+        state.record_placement(1, "uid-1", 2)
+
+        resp = client.post(
+            "/api/reservations/push",
+            json=_json(_res(1, status="cancelled"), _continue_target(2)),
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert resp.status_code == 200
+        assert deleted == [("pod-1", USERNAME)]            # evicted (no rescue)
+        assert state.occupancy.get(1, {}) == {}
+
+
 def _booking(res_id, *, user_id, username, status="active"):
     """An open (now-1h … now+1h) booking reservation with an explicit owner."""
-    from tests.conftest import reservation
-
     now = datetime.now(timezone.utc)
     return reservation(
         res_id,
