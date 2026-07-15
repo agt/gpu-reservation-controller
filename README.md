@@ -115,9 +115,11 @@ The reservation app schedules only real bookings — there is no ad-hoc
 capacity-hold type.  A pod with no reservation open now or opening soon does
 not wait indefinitely and is not placed onto ad-hoc spare capacity: the
 controller requests a **real reservation** on its behalf, just-in-time.
-On-demand jobs are therefore ordinary reservations — charged SU, protected by
-the same runtime guarantee as any booking, and able to displace overstayers
-via the existing boundary preemption.
+On-demand jobs are therefore ordinary reservations — charged SU and protected
+by the same runtime guarantee as any booking.  (One asymmetry: the preemption
+sweep plans only for `kind="booking"` boundaries, so a granted lease does not
+itself displace overstayers — a JIT pod landing on squatted GPUs waits rather
+than preempting them.)
 
 **Routing** (re-evaluated on every attempt, in `pod_watch_loop`):
 
@@ -313,7 +315,7 @@ All settings are supplied via environment variables.
 | `NOSHOW_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress (legacy alias `NOSHOWN_GRACE_MINUTES` still accepted) |
 | `POD_LIST_TICK_INTERVAL` | no | `300` | Seconds between queue-processor ticks (pod LIST frequency) |
 | `POD_SCHEDULING_GATE_NAME` | no | *(absent)* | Name of a SchedulingGate to remove from a pod after admitting it; unset disables scheduling-gate removal |
-| `INBOUND_API_TOKEN` | no | *(absent)* | Bearer token for the inbound push API (`POST /api/reservations/push`); mount from a Kubernetes Secret. Unset leaves the endpoint **disabled** (returns 503) |
+| `INBOUND_API_TOKEN` | no | *(absent)* | Bearer token for the inbound APIs (`POST /api/reservations/push` and `GET /api/forecast/preemption-risk`); mount from a Kubernetes Secret. Unset leaves both endpoints **disabled** (returns 503) |
 | `PREEMPTION_LEAD_MINUTES` | no | `15` | Minutes before a reservation slot boundary that phase-A preemption runs, proactively freeing capacity from overstaying pods |
 | `PREEMPTION_CHECK_INTERVAL` | no | `60` | Seconds between preemption sweeps |
 | `POD_ADOPTION_ENABLED` | no | `true` | Re-link an overstay pod to a reservation its user has since booked. Set to `false` to disable |
@@ -388,6 +390,72 @@ To enable it under Helm, point `inboundApiTokenSecret.name` at a Secret holding
 the token (see below). No additional RBAC is required.
 
 ---
+
+## Preemption-risk forecast API
+
+Answers, per controller-admitted pod, "how likely is this job to be preempted
+during the remainder of the current hour and the next two full hours?" —
+intended for the reservation app to poll and render to users.
+
+```
+GET /api/forecast/preemption-risk[?namespace=<username>]
+Authorization: Bearer <INBOUND_API_TOKEN>
+```
+
+The forecast projects the same arithmetic the preemption sweep runs — booking
+demand vs free GPUs at every upcoming reservation boundary — over three
+calendar-aligned hourly buckets:
+
+- A pod **within its runtime guarantee** has exactly **zero risk**
+  (`state: "guaranteed"`); back-to-back chains are honoured.
+- An **overstaying** pod's risk per boundary is
+  `min(1, shortfall / eligible-pool GPUs)` — 0 whenever free capacity covers
+  the demand, 1.0 when every eligible overstayer must be reclaimed — placed in
+  the buckets its kill window (`boundary − PREEMPTION_LEAD_MINUTES …
+  boundary`) touches and combined per bucket.
+
+Trimmed example response:
+
+```json
+{
+  "generated_at": "2026-07-15T14:20:00Z",
+  "lead_minutes": 15,
+  "selection_delegated": true,
+  "buckets": [
+    {"start": "…14:20Z", "end": "…15:00Z",
+     "classes": {"h100": {"capacity": 8, "free": 1, "demand": 4,
+                           "shortfall": 3, "eligible_pool_gpus": 5,
+                           "pending_jit_gpus": 0}}},
+    …
+  ],
+  "pods": [
+    {"namespace": "alice", "name": "notebook-1", "uid": "…",
+     "gpu_class": "h100", "gpu_count": 1, "reservation_id": 42,
+     "guarantee_end": "2026-07-15T15:00:00Z",
+     "buckets": [{"risk": 0.0, "state": "guaranteed"},
+                  {"risk": 0.6, "state": "overstay"},
+                  {"risk": 0.6, "state": "overstay"}]}
+  ]
+}
+```
+
+- Statuses: `200`; `401` (missing/invalid bearer); `503` either because
+  `INBOUND_API_TOKEN` is unset **or** because a cluster snapshot (pods, node
+  capacity) failed — the forecast never reports risk from unknown physical
+  state, mirroring the sweep's fail-safe rule.
+- `?namespace=` filters the `pods` list only (unknown namespace ⇒ empty list);
+  the per-class bucket summaries stay cluster-global, since the risk
+  denominators and demand drivers are global.
+- Caveats: with victim selection delegated to the reservation app
+  (`selection_delegated: true`), the numeric risk models the controller's
+  uniform-random fallback — which pods are *at risk at all* is exact, the
+  probability is an approximation.  Free capacity assumes running pods keep
+  running, and multiple boundaries in one bucket combine as independent
+  chances — both conservative.  `pending_jit_gpus` is informational pressure
+  from pods awaiting a JIT lease; it is never folded into `shortfall`.
+
+It shares the `HEALTH_PORT` listener and the push API's bearer token — no
+extra port, Service, or RBAC.
 
 ---
 

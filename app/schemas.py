@@ -6,7 +6,7 @@ Mirrors the shapes documented in RESERVATION-API.md §6.
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel
 
@@ -158,3 +158,68 @@ class PreemptionSelectionResponse(BaseModel):
     """Victims the app chose to preempt, as the ``pod_uid``s it was offered."""
 
     victim_pod_uids: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Preemption-risk forecast (GET /api/forecast/preemption-risk)
+# ---------------------------------------------------------------------------
+
+
+class ForecastClassSummary(BaseModel):
+    """One GPU class's capacity/demand outlook within one forecast bucket."""
+
+    capacity: int            # physical GPUs (node snapshot); 0 = class unknown to nodes
+    free: int                # capacity − node-resident use; may be NEGATIVE (overcommit)
+    demand: int              # booking demand attributed to this bucket
+    shortfall: int           # GPUs the sweep would have to reclaim (demand − free, ≥ 0)
+    eligible_pool_gpus: int  # Σ gpu_count of past-guarantee pods the shortfall draws from
+    pending_jit_gpus: int = 0  # pods awaiting a JIT lease; informational pressure only —
+                               # a granted lease cannot trigger boundary preemption today,
+                               # so this is never folded into ``shortfall``
+
+
+class ForecastBucket(BaseModel):
+    """One forecast bucket: a half-open ``[start, end)`` wall-clock interval."""
+
+    start: datetime
+    end: datetime
+    classes: dict[str, ForecastClassSummary]  # keyed by gpu-class label (e.g. "h100")
+
+
+class ForecastPodBucket(BaseModel):
+    """One admitted pod's outlook within one bucket (index-aligned with buckets)."""
+
+    risk: float  # 0.0–1.0 preemption likelihood; exactly 0 while guaranteed
+    state: Literal["guaranteed", "overstay", "mixed"]
+
+
+class ForecastPod(BaseModel):
+    """Per-pod forecast entry.  Only controller-admitted pods appear — a pod
+    without a booking-reference can never be preempted by this controller."""
+
+    namespace: str
+    name: str
+    uid: str
+    gpu_class: str
+    gpu_count: int
+    reservation_id: int
+    guarantee_end: Optional[datetime]  # live chain-aware instant; None = already unresolvable
+    buckets: list[ForecastPodBucket]
+
+
+class PreemptionRiskForecastResponse(BaseModel):
+    """Response of ``GET /api/forecast/preemption-risk``.
+
+    Covers the remainder of the current wall-clock hour plus the next two
+    full hours.  ``selection_delegated`` is the honesty flag for the numeric
+    risk: when true (``PREEMPTION_DELEGATE_SELECTION``, the default), the
+    reservation app chooses victims by its own policy and the number models
+    the controller's uniform-random local fallback — pool *membership*
+    (at-risk vs safe) is exact either way.
+    """
+
+    generated_at: datetime
+    lead_minutes: int          # PREEMPTION_LEAD_MINUTES — how early a kill can land
+    selection_delegated: bool
+    buckets: list[ForecastBucket]
+    pods: list[ForecastPod]
