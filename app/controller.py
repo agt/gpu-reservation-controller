@@ -1210,6 +1210,53 @@ class ControllerState:
             changes.append((r, prior.user.username))
         return changes
 
+    def preserve_local_ondemand_leases(
+        self,
+        fetched: list[ReservationResponse],
+        now: datetime,
+    ) -> list[ReservationResponse]:
+        """Return locally-granted on-demand leases this fetch snapshot omits.
+
+        The JIT lease path upserts a freshly-granted lease into
+        ``self.reservations`` and admits its pod the same instant
+        (``main._try_request_lease``).  But a periodic fetch issues its
+        ``GET /api/reservations`` *before* taking ``reservation_lock``; if a lease
+        is granted in the gap between that snapshot and the wholesale
+        ``state.reservations = …`` replace, the snapshot predates the lease and the
+        replace would drop it — even though its pod is live and well within its
+        guarantee.  With the lease gone, ``guarantee_end`` resolves to ``None`` and
+        the pod is wrongly treated as past-guarantee, making it eligible for
+        boundary preemption until the next fetch re-includes it (a window bounded
+        by ``RESERVATION_FETCH_INTERVAL``).
+
+        This returns the leases the caller must re-add to the incoming active set.
+        A lease is preserved only when **all** hold:
+        - it is one of ours: ``kind == "on_demand"`` and still ``status ==
+          "active"`` in local state, AND
+        - its window has not yet closed (``slot_end > now``) — an ended lease is
+          legitimately past guarantee, so there is nothing left to protect, AND
+        - *fetched* does not mention its id at all.  This checks *fetched* (the full
+          ``status=all`` response), not just its active subset: a lease the app
+          reports as **cancelled** carries its id in *fetched* and is therefore
+          **not** preserved, so a genuine server-side cancellation (including the
+          controller's own compensating cancel) is respected and the pod released.
+          Only a lease the app has simply not surfaced yet (replication lag between
+          grant and snapshot) is bridged.
+
+        Must be called *before* ``state.reservations`` is replaced (it reads the
+        current local set), mirroring the other fetch-time detectors.  Pure — no
+        I/O, no state mutation.
+        """
+        fetched_ids = {r.id for r in fetched}
+        return [
+            r
+            for r in self.reservations
+            if r.kind == "on_demand"
+            and r.status == "active"
+            and r.id not in fetched_ids
+            and slot_end(r) > now
+        ]
+
     def reconcile_occupancy(self, placements: list[tuple[int, str, int]]) -> None:
         """Rebuild the occupancy map from a live cluster snapshot.
 

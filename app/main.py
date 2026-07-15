@@ -214,10 +214,24 @@ async def _refresh_reservations(
         # before overwriting the state (both compare against the old owner set).
         cancelled_in_window = state.detect_cancelled_in_window(all_reservations, now)
         owner_changes = state.detect_owner_changed_in_window(all_reservations, now)
+        # Bridge the grant-vs-snapshot race: keep our own recently-granted
+        # on-demand leases the app has not surfaced in this snapshot yet, so a
+        # live lease's pod is not dropped to guarantee_end=None and wrongly
+        # preempted (see ControllerState.preserve_local_ondemand_leases).  These
+        # ids are absent from the fetch, so they never collide with the active
+        # subset, the cancellation detector, or the owner-change detector.
+        preserved = state.preserve_local_ondemand_leases(all_reservations, now)
+        if preserved:
+            log.info(
+                "Preserving %d locally-granted on-demand lease(s) absent from "
+                "this fetch snapshot: %s",
+                len(preserved),
+                ", ".join(f"#{r.id}" for r in preserved),
+            )
         await _reconcile_after_reservation_change(
             state,
             client,
-            active_reservations,
+            active_reservations + preserved,
             cancelled_in_window,
             owner_changes,
             now,
