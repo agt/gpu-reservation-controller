@@ -1,7 +1,7 @@
 """Regression test for CODE-REVIEW-2026-07 B1.
 
 Occupancy is the unified budget map for all admission paths, so releasing a
-deleted pod must not be gated on ONDEMAND_PLACEMENT_ENABLED.  With the flag
+deleted pod must not be gated on ONDEMAND_LEASE_ENABLED.  With the flag
 false a deleted reserved-path pod used to keep consuming budget until the next
 reconcile.
 """
@@ -22,11 +22,11 @@ def _config(**overrides) -> Config:
         reservation_fetch_interval=300,
         reservation_lookahead_days=7,
         kubeconfig_path=None,
-        health_port=8000,
-        ondemand_placement_enabled=False,  # the configuration that exposed B1
-        noshown_timeout_minutes=15,
-        noshown_grace_minutes=30,
-        pod_list_tick_interval=300,
+        http_port=8000,
+        ondemand_lease_enabled=False,  # the configuration that exposed B1
+        noshow_timeout_minutes=15,
+        noshow_grace_minutes=30,
+        queue_processor_interval=300,
         scheduling_gate_name=None,
         inbound_api_token=None,
         preemption_lead_minutes=15,

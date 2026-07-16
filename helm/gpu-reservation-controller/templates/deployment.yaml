@@ -36,7 +36,7 @@ spec:
           {{- end }}
           ports:
             - name: http
-              containerPort: {{ .Values.config.healthPort }}
+              containerPort: {{ .Values.config.httpPort }}
               protocol: TCP
           env:
             # --- Required ---
@@ -51,14 +51,14 @@ spec:
             # --- Optional tuning ---
             - name: RESERVATION_FETCH_INTERVAL
               value: {{ .Values.config.reservationFetchInterval | quote }}
-            - name: POD_LIST_TICK_INTERVAL
-              value: {{ .Values.config.podListTickInterval | quote }}
+            - name: QUEUE_PROCESSOR_INTERVAL
+              value: {{ .Values.config.queueProcessorInterval | quote }}
             - name: RESERVATION_LOOKAHEAD_DAYS
               value: {{ .Values.config.reservationLookaheadDays | quote }}
-            - name: HEALTH_PORT
-              value: {{ .Values.config.healthPort | quote }}
-            - name: ONDEMAND_PLACEMENT_ENABLED
-              value: {{ .Values.config.ondemandPlacementEnabled | quote }}
+            - name: HTTP_PORT
+              value: {{ .Values.config.httpPort | quote }}
+            - name: ONDEMAND_LEASE_ENABLED
+              value: {{ .Values.config.ondemandLeaseEnabled | quote }}
             - name: ONDEMAND_HORIZON_MINUTES
               value: {{ .Values.config.ondemandHorizonMinutes | quote }}
             - name: ONDEMAND_LEASE_BUFFER_MINUTES
@@ -68,9 +68,9 @@ spec:
             # Canonical spellings; the code still honors the legacy NOSHOWN_*
             # names, so out-of-chart deployments keep working.
             - name: NOSHOW_TIMEOUT_MINUTES
-              value: {{ .Values.config.noshownTimeoutMinutes | quote }}
+              value: {{ .Values.config.noshowTimeoutMinutes | quote }}
             - name: NOSHOW_GRACE_MINUTES
-              value: {{ .Values.config.noshownGraceMinutes | quote }}
+              value: {{ .Values.config.noshowGraceMinutes | quote }}
             - name: LOG_LEVEL
               value: {{ .Values.config.logLevel | quote }}
             {{- if .Values.config.podSchedulingGateName }}

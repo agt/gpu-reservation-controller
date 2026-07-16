@@ -76,7 +76,7 @@ system is designed to accommodate greater values in the future.)
 │      no-show, re-verify no pod raced in, then         │
 │      POST /api/reservations/{id}/cancel (no-show)     │
 │                                                      │
-│    JIT on-demand path (ONDEMAND_PLACEMENT_ENABLED):  │
+│    JIT on-demand path (ONDEMAND_LEASE_ENABLED):      │
 │      d. Safety interlock (guard 3): if a reservation │
 │         holder is stuck Pending for a GPU class,     │
 │         hold lease requests for that class            │
@@ -332,19 +332,20 @@ All settings are supplied via environment variables.
 | `RESERVATION_FETCH_INTERVAL` | no | `300` | Seconds between reservation refresh cycles |
 | `RESERVATION_LOOKAHEAD_DAYS` | no | `7` | How many calendar days ahead to fetch reservations |
 | `KUBECONFIG` | no | *(absent)* | Path to a kubeconfig file; if unset, in-cluster service-account credentials are used |
-| `HEALTH_PORT` | no | `8000` | Port for the `GET /health` liveness endpoint |
-| `TZ` | no | system default | Affects log timestamp display only; reservation window arithmetic is UTC-based and does not depend on it |
-| `ONDEMAND_PLACEMENT_ENABLED` | no | `true` | Set to `false` to disable the JIT on-demand lease path entirely |
+| `HTTP_PORT` | no | `8000` | Bind port for the whole HTTP listener — `GET /health` liveness plus the inbound push (`POST /api/reservations/push`) and preemption-risk forecast (`GET /api/forecast/preemption-risk`) APIs (legacy alias `HEALTH_PORT` still accepted) |
+| `TZ` | no | system default | **Log timestamp display only** — not read by application code; reservation window arithmetic is UTC-based and does not depend on it |
+| `ONDEMAND_LEASE_ENABLED` | no | `true` | Set to `false` to disable the JIT on-demand lease path entirely (legacy alias `ONDEMAND_PLACEMENT_ENABLED` still accepted) |
 | `ONDEMAND_HORIZON_MINUTES` | no | `30` | JIT routing horizon: a pod is queued for a reservation opening within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | no | `10` | Minutes added to a pod's `horae/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
 | `ONDEMAND_DELEGATE_ADMISSION` | no | `false` | Delegate on-demand admission selection to the app for LAS prioritization (`POST /api/reservations/ondemand-admission`); `false` (or any app-call failure) grants every eligible candidate. Opt-in — enable once the app implements the endpoint |
 | `NOSHOW_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and cancelling it app-side (legacy alias `NOSHOWN_TIMEOUT_MINUTES` still accepted) |
 | `NOSHOW_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress (legacy alias `NOSHOWN_GRACE_MINUTES` still accepted) |
-| `POD_LIST_TICK_INTERVAL` | no | `300` | Seconds between queue-processor ticks (pod LIST frequency) |
+| `QUEUE_PROCESSOR_INTERVAL` | no | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST (legacy alias `POD_LIST_TICK_INTERVAL` still accepted) |
 | `POD_SCHEDULING_GATE_NAME` | no | *(absent)* | Name of a SchedulingGate to remove from a pod after admitting it; unset disables scheduling-gate removal |
 | `INBOUND_API_TOKEN` | no | *(absent)* | Bearer token for the inbound APIs (`POST /api/reservations/push` and `GET /api/forecast/preemption-risk`); mount from a Kubernetes Secret. Unset leaves both endpoints **disabled** (returns 503) |
 | `PREEMPTION_LEAD_MINUTES` | no | `15` | Minutes before a reservation slot boundary that phase-A preemption runs, proactively freeing capacity from overstaying pods |
 | `PREEMPTION_CHECK_INTERVAL` | no | `60` | Seconds between preemption sweeps |
+| `PREEMPTION_DELEGATE_SELECTION` | no | `true` | Delegate preemption victim selection to the app (`POST /api/reservations/preemption-victims`) so prioritisation policy lives there; `false` (or any app-call failure) falls back to local uniform-random selection |
 | `CAPACITY_CHECK_INTERVAL` | no | `3600` | Seconds between app-side vs physical GPU capacity audits (default hourly). Each audit compares the reservation app's per-class `total_gpus` against the GPUs physically present in the cluster, logs any difference as a **WARNING**, and pauses new on-demand admissions for any class the app over-counts until the deficiency clears |
 | `POD_ADOPTION_ENABLED` | no | `true` | Re-link an overstay pod to a reservation its user has since booked. Set to `false` to disable |
 | `REQUIRED_GROUP_LABEL` | no | *(absent)* | Pod label naming the usage group a pod belongs to (e.g. `dsmlp/course`). When set, the pod's value for this label must equal the reservation's group name — an additional match constraint alongside `gpu-class` — before the controller admits it, adopts it, or chain-extends its guarantee; a pod without the label is also never JIT-eligible. Unset disables the group constraint |
@@ -402,7 +403,7 @@ Content-Type: application/json
   seen on a normal poll.
 - This is a **partial delta**; bulk synchronisation remains a controller-initiated
   pull, and the next full poll is always the source of truth.
-- The endpoint shares the `HEALTH_PORT` listener (no extra port/Service), and
+- The endpoint shares the `HTTP_PORT` listener (no extra port/Service), and
   responds `200` (with `{"applied", "cancelled", "total_active"}`), `401`
   (missing/invalid bearer), or `503` (endpoint disabled because
   `INBOUND_API_TOKEN` is unset).
@@ -482,7 +483,7 @@ Trimmed example response:
   chances — both conservative.  `pending_jit_gpus` is informational pressure
   from pods awaiting a JIT lease; it is never folded into `shortfall`.
 
-It shares the `HEALTH_PORT` listener and the push API's bearer token — no
+It shares the `HTTP_PORT` listener and the push API's bearer token — no
 extra port, Service, or RBAC.
 
 ---

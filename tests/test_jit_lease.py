@@ -605,7 +605,7 @@ class TestTryRequestLease:
 
 def _admission_config(*, placement=True, delegate=True):
     return SimpleNamespace(
-        ondemand_placement_enabled=placement,
+        ondemand_lease_enabled=placement,
         ondemand_delegate_admission=delegate,
         ondemand_horizon_minutes=30,
         ondemand_lease_buffer_minutes=10,

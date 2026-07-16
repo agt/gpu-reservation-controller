@@ -38,7 +38,7 @@ ENV RESERVATION_API_KEY=""
 # (the Helm chart wires them all).
 ENV RESERVATION_FETCH_INTERVAL="300"
 ENV RESERVATION_LOOKAHEAD_DAYS="7"
-ENV HEALTH_PORT="8000"
+ENV HTTP_PORT="8000"
 
 # KUBECONFIG is intentionally unset; the controller uses in-cluster credentials
 # by default.  Set KUBECONFIG to a mounted kubeconfig path for out-of-cluster use.
@@ -47,9 +47,9 @@ EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD python -c \
-        "import os,urllib.request; urllib.request.urlopen('http://localhost:%s/health' % os.environ.get('HEALTH_PORT','8000'))" \
+        "import os,urllib.request; urllib.request.urlopen('http://localhost:%s/health' % (os.environ.get('HTTP_PORT') or os.environ.get('HEALTH_PORT','8000')))" \
     || exit 1
 
-# Launch via the module entrypoint so HEALTH_PORT controls the bind port
+# Launch via the module entrypoint so HTTP_PORT controls the bind port
 # (uvicorn is started programmatically from app.main:main).
 CMD ["python", "-m", "app.main"]

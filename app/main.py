@@ -10,7 +10,7 @@ Starts four background asyncio tasks inside a FastAPI lifespan:
 
 Additionally, when a pod is detected arriving *inside* an already-open
 reservation window (e.g. a JupyterHub notebook pod), the pod-watch loop
-bypasses the queue-processor polling interval (POD_LIST_TICK_INTERVAL,
+bypasses the queue-processor polling interval (QUEUE_PROCESSOR_INTERVAL,
 default 300 s) and attempts to apply the toleration immediately, minimising
 scheduler delay for the user.
 
@@ -112,7 +112,7 @@ def _configure_logging(config: Config) -> None:
 # Retry backoff shared by both admission paths (CODE-REVIEW D1e).  The jittered
 # range is used when a placement attempt fails for budget/transient reasons; the
 # short retry is used when a pod's scheduling state is not yet knowable and we
-# want to look again promptly (well within one POD_LIST_TICK_INTERVAL tick).
+# want to look again promptly (well within one QUEUE_PROCESSOR_INTERVAL tick).
 RETRY_JITTER_RANGE = (120, 300)
 SHORT_RETRY_SECONDS = 30
 
@@ -964,7 +964,7 @@ async def _run_ondemand_admission(
     ``await``, so the check-then-acquire is race-free under asyncio's
     single-threaded model.)
     """
-    if not config.ondemand_placement_enabled:
+    if not config.ondemand_lease_enabled:
         return
     if state.ondemand_admission_lock.locked():
         state.ondemand_rerun_requested = True
@@ -999,8 +999,8 @@ async def reservation_fetch_loop(
             state.reconcile_noshow()
             state.update_noshow_tracking(
                 now,
-                config.noshown_timeout_minutes,
-                config.noshown_grace_minutes,
+                config.noshow_timeout_minutes,
+                config.noshow_grace_minutes,
             )
             log.info(
                 "Reservation refresh complete: %d active reservation(s), %d GPU class(es) resolved",
@@ -1071,7 +1071,7 @@ async def pod_watch_loop(
     - DELETED → dequeue
     - ADDED inside open window → fast-path immediate toleration attempt
 
-    JIT on-demand path (when ``config.ondemand_placement_enabled``): a pod with
+    JIT on-demand path (when ``config.ondemand_lease_enabled``): a pod with
     no reservation admittable now or within ``ONDEMAND_HORIZON_MINUTES`` is
     routed here instead of waiting — see ``_try_request_lease``.
     - ADDED, Pending, has ``horae/minimum-runtime-seconds`` annotation, and
@@ -1190,7 +1190,7 @@ async def pod_watch_loop(
                 )
 
                 # Fast path: ADDED pod inside an open window — don't wait for
-                # the queue processor's POD_LIST_TICK_INTERVAL tick (default 300 s).
+                # the queue processor's QUEUE_PROCESSOR_INTERVAL tick (default 300 s).
                 if event_type == "ADDED":
                     entry = state.task_queue.get(uid)
                     if entry is not None:
@@ -1227,7 +1227,7 @@ async def pod_watch_loop(
                 group_label if config.required_group_label else get_pod_usage_group(pod)
             )
             jit_eligible = (
-                config.ondemand_placement_enabled
+                config.ondemand_lease_enabled
                 and phase == "Pending"
                 and min_rt is not None
                 and usage_group is not None
@@ -1326,14 +1326,14 @@ async def _cancel_pending_noshows(
 async def queue_processor_loop(
     state: ControllerState, client: ReservationClient, config: Config
 ) -> None:
-    """Every ``config.pod_list_tick_interval`` s, scan the work queue and apply tolerations where eligible.
+    """Every ``config.queue_processor_interval`` s, scan the work queue and apply tolerations where eligible.
 
     Reserved-path logic per entry:
     1. If the reservation window has expired → remove from queue.
     2. If the window hasn't opened yet, or the entry is in retry cooldown → skip.
     3. Delegate budget check + patch to ``_try_apply_toleration``.
 
-    JIT on-demand path (when ``config.ondemand_placement_enabled``):
+    JIT on-demand path (when ``config.ondemand_lease_enabled``):
     4. For each candidate whose ``next_attempt_at`` has passed, attempt a lease
        request (``_try_request_lease``) in FIFO order.
 
@@ -1343,7 +1343,7 @@ async def queue_processor_loop(
     that were ineligible on a previous attempt.
     """
     while True:
-        await asyncio.sleep(config.pod_list_tick_interval)
+        await asyncio.sleep(config.queue_processor_interval)
         now = datetime.now(timezone.utc)
 
         # One cluster snapshot of tolerated pods drives occupancy, the claimed
@@ -1395,7 +1395,7 @@ async def queue_processor_loop(
                 )
 
         # Guard 3: refresh safety interlock from the same snapshot.
-        if config.ondemand_placement_enabled and snapshot is not None:
+        if config.ondemand_lease_enabled and snapshot is not None:
             stuck = [
                 (p.namespace, p.name, p.gpu_class)
                 for p in snapshot
@@ -1911,8 +1911,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         now = datetime.now(timezone.utc)
         state.update_noshow_tracking(
             now,
-            config.noshown_timeout_minutes,
-            config.noshown_grace_minutes,
+            config.noshow_timeout_minutes,
+            config.noshow_grace_minutes,
             reason="init",
         )
         log.info(
@@ -2077,8 +2077,8 @@ async def push_reservations(
         state.reconcile_noshow()
         state.update_noshow_tracking(
             now,
-            config.noshown_timeout_minutes,
-            config.noshown_grace_minutes,
+            config.noshow_timeout_minutes,
+            config.noshow_grace_minutes,
             reason="push",
         )
 
@@ -2225,16 +2225,16 @@ async def preemption_risk_forecast(
 
 
 def main() -> None:
-    """Run the controller, binding uvicorn to the configured HEALTH_PORT.
+    """Run the controller, binding uvicorn to the configured HTTP_PORT.
 
     Launching programmatically (rather than via a hardcoded ``uvicorn`` CLI port)
-    is what makes ``HEALTH_PORT`` actually take effect, so Helm's ``healthPort``
+    is what makes ``HTTP_PORT`` actually take effect, so Helm's ``httpPort``
     and both probes stay consistent with the listening port (CODE-REVIEW P2).
     """
     import uvicorn
 
     config: Config = app.state.config
-    uvicorn.run(app, host="0.0.0.0", port=config.health_port)
+    uvicorn.run(app, host="0.0.0.0", port=config.http_port)
 
 
 if __name__ == "__main__":
