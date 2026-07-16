@@ -14,7 +14,8 @@ pod_has_toleration(pod, ...)                 — check for a specific toleration
 is_gpu_only_pending(pod)                      — guard 1: GPU-only scheduling failure check
 read_pod(name, namespace)                    — fetch current pod object
 snapshot_tolerated_pods(tol_key)             — one LIST → occupancy + claims + guard 3
-snapshot_node_gpu_capacity(taint_key)        — one LIST → allocatable GPUs per class (preemption planning)
+snapshot_node_gpu_inventory(taint_key)       — one LIST → allocatable GPUs per class, per node
+snapshot_node_gpu_capacity(taint_key)        — per-class collapse of the inventory (preemption planning)
 apply_toleration(...)                        — PATCH a pod to add toleration + booking annotation
 PodWatcher                                   — async-generator based pod event stream
 """
@@ -308,6 +309,10 @@ class ToleratedPodInfo:
     # carried so the adoption planner can enforce the same group constraint used
     # at admission.  None when the feature is disabled or the label is absent.
     group_label: Optional[str] = None
+    # The node this pod is bound to (``spec.nodeName``), or None when it has not
+    # been scheduled yet.  Carried so per-node GPU accounting can attribute an
+    # admitted pod's GPUs to the node it physically occupies.
+    node_name: Optional[str] = None
 
 
 async def snapshot_tolerated_pods(
@@ -354,28 +359,32 @@ async def snapshot_tolerated_pods(
                 group_label=(
                     labels.get(group_label_key) if group_label_key else None
                 ),
+                node_name=getattr(pod.spec, "node_name", None) if pod.spec else None,
             )
         )
     log.debug("k8s: tolerated snapshot returned %d pod(s)", len(out))
     return out
 
 
-async def snapshot_node_gpu_capacity(
+async def snapshot_node_gpu_inventory(
     taint_key: str, gpu_resource: str = "nvidia.com/gpu"
-) -> dict[str, int]:
-    """Return total allocatable GPUs per GPU-class label, from node taints.
+) -> dict[str, dict[str, int]]:
+    """Return allocatable GPUs per GPU-class label, broken down **per node**.
 
-    LISTs all nodes and, for each node carrying a *taint_key* taint, sums
-    ``status.allocatable[gpu_resource]`` into the bucket keyed by the taint's
-    value (the GPU-class label, mirroring the toleration the controller
-    applies to pods).  Nodes that are cordoned (``spec.unschedulable``) or
-    being deleted are excluded — their GPUs are not placeable.  Feeds
-    preemption planning's notion of physical capacity per class; the
-    controller has no other source of "how many GPUs actually exist".
+    LISTs all nodes and, for each node carrying a *taint_key* taint, records
+    ``status.allocatable[gpu_resource]`` under ``{taint_value: {node_name: gpus}}``
+    (the GPU-class label mirrors the toleration the controller applies to pods).
+    Nodes that are cordoned (``spec.unschedulable``) or being deleted are
+    excluded — their GPUs are not placeable.
+
+    This is the per-node primitive: ``snapshot_node_gpu_capacity`` collapses it
+    to per-class totals for consumers that only need the aggregate, while
+    per-node accounting (whether any *single* node can host a multi-GPU pod)
+    reads the breakdown directly.
     """
-    log.debug("k8s: list_node (gpu capacity snapshot)")
+    log.debug("k8s: list_node (gpu inventory snapshot)")
     node_list = await _run(_core_v1.list_node)
-    capacity: dict[str, int] = {}
+    inventory: dict[str, dict[str, int]] = {}
     for node in node_list.items:
         if node.spec and node.spec.unschedulable:
             continue
@@ -398,9 +407,26 @@ async def snapshot_node_gpu_capacity(
             )
             gpus = 0
         for gpu_class in classes:
-            capacity[gpu_class] = capacity.get(gpu_class, 0) + gpus
-    log.debug("k8s: node gpu capacity snapshot: %s", capacity)
-    return capacity
+            inventory.setdefault(gpu_class, {})[node.metadata.name] = gpus
+    log.debug("k8s: node gpu inventory snapshot: %s", inventory)
+    return inventory
+
+
+async def snapshot_node_gpu_capacity(
+    taint_key: str, gpu_resource: str = "nvidia.com/gpu"
+) -> dict[str, int]:
+    """Return total allocatable GPUs per GPU-class label, from node taints.
+
+    Thin per-class collapse of ``snapshot_node_gpu_inventory`` (one node LIST,
+    summed across the nodes of each class).  Feeds preemption planning's and the
+    capacity audit's notion of physical capacity per class; the controller has
+    no other source of "how many GPUs actually exist".
+    """
+    inventory = await snapshot_node_gpu_inventory(taint_key, gpu_resource)
+    return {
+        gpu_class: sum(per_node.values())
+        for gpu_class, per_node in inventory.items()
+    }
 
 
 async def apply_toleration(

@@ -5,8 +5,8 @@ Covers:
 - ``ControllerState.find_admittable_reservation`` — the budget/horizon-aware
   routing gate between the reserved queue and a JIT lease request
 - ``main._try_request_lease`` — the async orchestrator: routing re-check,
-  guard 1 / guard 3 gating, lease grant → admit, denial → cooldown, and
-  admission-failure → compensating cancel
+  guard 1 / guard 3 / guard 5 (per-node feasibility) gating, lease grant →
+  admit, denial → cooldown, and admission-failure → compensating cancel
 
 No Kubernetes or HTTP calls are made; ``main`` is imported after setting the
 required env vars, since importing it runs ``create_app()`` at module load.
@@ -542,6 +542,103 @@ class TestTryRequestLease:
         assert result is False
         assert candidate.next_attempt_at > before
         assert client.create_requests == []
+
+    def test_guard5_multi_gpu_no_single_node_holds(self, monkeypatch):
+        """A >=2-GPU pod is held when no single node can host it, even though the
+        class has budget in aggregate — no SU-charged lease is minted."""
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=_lease(605, gpu_count=2))
+        state = _state_ready()
+        state.node_free_by_class = {GPU_CLASS_LABEL: 1}  # largest single-node free = 1
+        candidate = _candidate("uid-1", gpu_requested=2)
+        before = candidate.next_attempt_at
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_gpu_only_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+
+        config = SimpleNamespace(
+            ondemand_horizon_minutes=30, ondemand_lease_buffer_minutes=10,
+            scheduling_gate_name=None,
+        )
+        result = asyncio.run(m._try_request_lease(state, client, config, "uid-1", candidate))
+
+        assert result is False
+        assert candidate.next_attempt_at > before
+        assert client.create_requests == []
+
+    def test_guard5_multi_gpu_single_node_fits_proceeds(self, monkeypatch):
+        """When a single node has enough free GPUs, the multi-GPU lease is granted."""
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=_lease(606, gpu_count=2))
+        state = _state_ready()
+        state.node_free_by_class = {GPU_CLASS_LABEL: 2}
+        candidate = _candidate("uid-1", gpu_requested=2)
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_gpu_only_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        _patch_admission(monkeypatch, m)
+
+        config = SimpleNamespace(
+            ondemand_horizon_minutes=30, ondemand_lease_buffer_minutes=10,
+            scheduling_gate_name=None,
+        )
+        result = asyncio.run(m._try_request_lease(state, client, config, "uid-1", candidate))
+
+        assert result is True
+        assert len(client.create_requests) == 1
+        assert client.create_requests[0].gpu_count == 2
+
+    def test_guard5_single_gpu_pod_not_gated(self, monkeypatch):
+        """Guard 5 only applies to >=2-GPU asks; a 1-GPU pod is never held by it,
+        even when the per-node map shows zero free (the 1-GPU path is unchanged)."""
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=_lease(607, gpu_count=1))
+        state = _state_ready()
+        state.node_free_by_class = {GPU_CLASS_LABEL: 0}
+        candidate = _candidate("uid-1", gpu_requested=1)
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_gpu_only_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        _patch_admission(monkeypatch, m)
+
+        config = SimpleNamespace(
+            ondemand_horizon_minutes=30, ondemand_lease_buffer_minutes=10,
+            scheduling_gate_name=None,
+        )
+        result = asyncio.run(m._try_request_lease(state, client, config, "uid-1", candidate))
+
+        assert result is True
+        assert len(client.create_requests) == 1
+
+    def test_guard5_unknown_class_fails_open(self, monkeypatch):
+        """No per-node data for the class (absent from the map) must not block —
+        a stale/empty map never wedges multi-GPU admission."""
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=_lease(608, gpu_count=2))
+        state = _state_ready()
+        state.node_free_by_class = {}  # unknown
+        candidate = _candidate("uid-1", gpu_requested=2)
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_gpu_only_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        _patch_admission(monkeypatch, m)
+
+        config = SimpleNamespace(
+            ondemand_horizon_minutes=30, ondemand_lease_buffer_minutes=10,
+            scheduling_gate_name=None,
+        )
+        result = asyncio.run(m._try_request_lease(state, client, config, "uid-1", candidate))
+
+        assert result is True
+        assert len(client.create_requests) == 1
 
     def test_unresolved_gpu_class_id_retries_without_requesting(self, monkeypatch):
         m = _main_module(monkeypatch)

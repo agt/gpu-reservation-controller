@@ -43,6 +43,8 @@ from .controller import (
     apply_push_to_active,
     build_preemption_plan,
     canceller_description,
+    free_gpus_by_node_class,
+    largest_node_free_by_class,
     reconcile_capacity,
     select_victims_locally,
     slot_end,
@@ -75,6 +77,7 @@ from .k8s_client import (
     read_pod,
     remove_scheduling_gate,
     snapshot_node_gpu_capacity,
+    snapshot_node_gpu_inventory,
     snapshot_tolerated_pods,
 )
 from .reservation_client import ReservationClient
@@ -610,7 +613,9 @@ async def _preflight_ondemand_candidate(
        passing into the horizon) — route there instead of requesting a lease.
     3. Guard 1 (GPU-only-pending).
     4. Guard 3 (stuck reservation-holder safety interlock).
-    5. Resolve the pod's gpu-class label to a numeric id and size the lease.
+    5. Guard 4 (over-committed gpu-class admission pause).
+    6. Guard 5 (per-node feasibility: no single node can host a multi-GPU ask).
+    7. Resolve the pod's gpu-class label to a numeric id and size the lease.
 
     Returns one of:
     - ``(_PREFLIGHT_REMOVE, None)`` — drop the candidate (gone/terminal, routed
@@ -725,6 +730,29 @@ async def _preflight_ondemand_candidate(
         )
         candidate.next_attempt_at = _short_retry_at(now)
         return _PREFLIGHT_RETRY, None
+
+    # Guard 5: per-node feasibility — a multi-GPU (>=2) pod can only schedule if
+    # some single node has enough free GPUs, and node-scoped extended resources
+    # (nvidia.com/gpu) cannot be split across nodes.  Granting a lease when the
+    # class has budget in aggregate but the free GPUs are fragmented one-per-node
+    # would mint an SU-charged reservation the pod can never run under.  Hold
+    # until a single-node opening appears.  Only a *known* per-class value blocks
+    # (fail-open on unknown, so a stale/absent map never wedges admission); the
+    # 1-GPU path is unaffected.  See ControllerState.node_free_by_class.
+    if candidate.gpu_requested >= 2:
+        largest_free = state.node_free_by_class.get(candidate.gpu_class_label)
+        if largest_free is not None and largest_free < candidate.gpu_requested:
+            log.info(
+                "On-demand candidate %s/%s: no single node has %d free GPU(s) of "
+                "gpu-class=%s (largest single-node free=%d); holding lease request",
+                candidate.pod_namespace,
+                candidate.pod_name,
+                candidate.gpu_requested,
+                candidate.gpu_class_label,
+                largest_free,
+            )
+            candidate.next_attempt_at = _short_retry_at(now)
+            return _PREFLIGHT_RETRY, None
 
     gpu_class_id = state.gpu_class_ids.get(candidate.gpu_class_label)
     if gpu_class_id is None:
@@ -1418,6 +1446,39 @@ async def queue_processor_loop(
                     gpu_class,
                 )
 
+        # Guard 5: refresh per-node feasibility (largest single-node free GPUs per
+        # class) from a node-inventory snapshot joined with this tick's tolerated
+        # `snapshot`.  `snapshot` is deliberately reused rather than re-fetched
+        # alongside `inventory` (avoids a second wide pod LIST this tick); the two
+        # calls are not atomic, so a pod that finishes scheduling in the gap is
+        # briefly invisible here, making the per-node free count optimistic for
+        # the node it actually landed on.  Accepted: guard 3 and the compensating
+        # cancel in _grant_and_admit backstop any grant this skew lets through.
+        # Fail-safe: if either snapshot is missing, leave the prior map intact —
+        # never open multi-GPU admission for a class based on unknown physical
+        # state.  Consulted synchronously by _preflight_ondemand_candidate.
+        if config.ondemand_lease_enabled and snapshot is not None:
+            try:
+                inventory = await snapshot_node_gpu_inventory(TOLERATION_KEY)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "Failed to snapshot node GPU inventory; keeping prior per-node "
+                    "feasibility map: %s",
+                    exc,
+                    exc_info=True,
+                )
+            else:
+                state.node_free_by_class = largest_node_free_by_class(
+                    free_gpus_by_node_class(
+                        inventory, [_pod_view(p) for p in snapshot]
+                    )
+                )
+                log.debug(
+                    "Per-node feasibility refreshed: largest single-node free "
+                    "GPU(s) by class=%s",
+                    state.node_free_by_class,
+                )
+
         to_remove: list[str] = []
 
         # --- reserved path ---
@@ -1479,6 +1540,7 @@ def _pod_view(p) -> PodRuntimeView:
         node_resident=(p.phase == "Running" or (p.phase == "Pending" and not p.scheduled_false)),
         terminating=p.deletion_timestamp is not None,
         group_label=p.group_label,
+        node_name=p.node_name,
     )
 
 
