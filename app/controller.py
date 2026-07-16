@@ -1088,11 +1088,11 @@ class ControllerState:
         """Return the absolute UTC end of the runtime guarantee for a pod admitted
         under *reservation_id*, or ``None`` if no live guarantee can be resolved.
 
-        This is the live, restart-safe replacement for the frozen
-        ``activeDeadlineSeconds`` a pod used to be capped at: it is recomputed
-        from current window arithmetic on every call rather than read back from
-        the pod, so a pod's guarantee can grow (an abutting follow-on booking)
-        the way a Kubernetes deadline never could.
+        The guarantee is live and restart-safe: it is recomputed from current
+        window arithmetic on every call rather than frozen at admission or read
+        back from the pod, so a pod's guarantee can grow after admission (an
+        abutting follow-on booking), which a fixed Kubernetes deadline cannot
+        express.
 
         Looks up *reservation_id* in ``self.reservations`` and returns the end
         of its back-to-back chain (``compute_guaranteed_until``).  ``None`` if

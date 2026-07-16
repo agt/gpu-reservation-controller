@@ -492,15 +492,13 @@ async def annotate_runtime_guarantee(
 ) -> None:
     """Annotate *pod_name* with its runtime guarantee.
 
-    Writes ``horae/pod-runtime-limit-seconds`` (legacy key; now the guaranteed
-    duration in seconds rather than a hard cap — still consumed by in-pod
-    countdown widgets) and ``horae/guaranteed-until`` (the same instant as an
-    absolute UTC ISO-8601 timestamp).  Informational only: unlike the retired
-    ``set_active_deadline``, this never patches ``spec.activeDeadlineSeconds``
-    — demand-driven preemption enforces nothing through a Kubernetes-side
-    deadline, and never reads these annotations back to make a decision; it
-    recomputes the guarantee live from reservation state
-    (``ControllerState.guarantee_end``).
+    Writes ``horae/pod-runtime-limit-seconds`` (the guaranteed duration in
+    seconds, consumed by in-pod countdown widgets) and ``horae/guaranteed-until``
+    (the same instant as an absolute UTC ISO-8601 timestamp).  Informational
+    only: this never patches ``spec.activeDeadlineSeconds`` — demand-driven
+    preemption enforces nothing through a Kubernetes-side deadline, and never
+    reads these annotations back to make a decision; it recomputes the guarantee
+    live from reservation state (``ControllerState.guarantee_end``).
     """
     until_str = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
     log.debug(

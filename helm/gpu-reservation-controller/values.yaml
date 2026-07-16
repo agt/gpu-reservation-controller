@@ -45,7 +45,6 @@ config:
 
   # Seconds between queue-processor ticks (the whole work-queue loop: pod LIST,
   # JIT lease retries, no-show cancels, overstay adoption).
-  # (Legacy env name POD_LIST_TICK_INTERVAL is still honored by the code.)
   queueProcessorInterval: 300
 
   # Calendar days ahead to fetch reservations.
@@ -53,12 +52,10 @@ config:
 
   # Bind port for the whole HTTP listener (GET /health liveness plus the inbound
   # push and preemption-risk forecast APIs).
-  # (Legacy env name HEALTH_PORT is still honored by the code.)
   httpPort: 8000
 
   # Enable the JIT on-demand lease path: request a real on-demand reservation for
   # a pending pod with no open reservation window (set to false to disable).
-  # (Legacy env name ONDEMAND_PLACEMENT_ENABLED is still honored by the code.)
   ondemandLeaseEnabled: true
 
   # Reserved-match horizon (minutes) for the JIT trigger: a pod is queued for

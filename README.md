@@ -217,7 +217,7 @@ effect:   NoSchedule
 | Annotation | Written when | Purpose |
 |------------|--------------|---------|
 | `horae/booking-reference` | toleration applied | Identifies the reservation the pod was admitted under (`res-<id>` — the only prefix, since every admitted pod is tied to a real reservation, JIT or otherwise); the id is the key for the per-reservation GPU budget and for rebuilding occupancy from the cluster |
-| `horae/pod-runtime-limit-seconds` | guarantee recorded | The runtime guarantee's duration in seconds at admission time, for operator visibility and in-pod notification widgets. Legacy key name — no longer backs a hard cap; see *Runtime guarantees and demand-driven preemption* |
+| `horae/pod-runtime-limit-seconds` | guarantee recorded | The runtime guarantee's duration in seconds at admission time, for operator visibility and in-pod notification widgets; see *Runtime guarantees and demand-driven preemption* |
 | `horae/guaranteed-until` | guarantee recorded | The same guarantee as an absolute UTC ISO-8601 instant |
 
 (`horae/minimum-runtime-seconds` and `horae/usage-group` — the usage-group
@@ -234,9 +234,7 @@ best-effort, not authoritative.)
 When a pod is admitted, the controller records how long its GPU access is
 **guaranteed** — but does **not** enforce that with `spec.activeDeadlineSeconds`.
 A pod may run past its guarantee freely; the controller reclaims capacity
-from an overstaying pod only when a new reservation actually needs it. This
-replaced an earlier hard-cap design because users, unable to predict their
-runtime accurately, consistently over-booked "just in case."
+from an overstaying pod only when a new reservation actually needs it.
 
 **Guarantee calculation** — the guaranteed instant is:
 
@@ -245,10 +243,9 @@ runtime accurately, consistently over-booked "just in case."
   the same owner, GPU class, and GPU count (no gap between consecutive
   windows).
 
-Unlike the old cap, this is an absolute instant **recomputed live** on every
-check rather than frozen at admission — so a pod's guarantee can *grow*
-after admission (an abutting follow-on booking), something a Kubernetes
-deadline could never do.
+This is an absolute instant **recomputed live** on every check rather than
+frozen at admission — so a pod's guarantee can *grow* after admission (an
+abutting follow-on booking), something a Kubernetes deadline cannot do.
 
 **Recording the guarantee** — after applying the toleration, the controller
 annotates the pod (see table above) and creates a Kubernetes **Event** with
@@ -332,15 +329,15 @@ All settings are supplied via environment variables.
 | `RESERVATION_FETCH_INTERVAL` | no | `300` | Seconds between reservation refresh cycles |
 | `RESERVATION_LOOKAHEAD_DAYS` | no | `7` | How many calendar days ahead to fetch reservations |
 | `KUBECONFIG` | no | *(absent)* | Path to a kubeconfig file; if unset, in-cluster service-account credentials are used |
-| `HTTP_PORT` | no | `8000` | Bind port for the whole HTTP listener — `GET /health` liveness plus the inbound push (`POST /api/reservations/push`) and preemption-risk forecast (`GET /api/forecast/preemption-risk`) APIs (legacy alias `HEALTH_PORT` still accepted) |
+| `HTTP_PORT` | no | `8000` | Bind port for the whole HTTP listener — `GET /health` liveness plus the inbound push (`POST /api/reservations/push`) and preemption-risk forecast (`GET /api/forecast/preemption-risk`) APIs |
 | `TZ` | no | system default | **Log timestamp display only** — not read by application code; reservation window arithmetic is UTC-based and does not depend on it |
-| `ONDEMAND_LEASE_ENABLED` | no | `true` | Set to `false` to disable the JIT on-demand lease path entirely (legacy alias `ONDEMAND_PLACEMENT_ENABLED` still accepted) |
+| `ONDEMAND_LEASE_ENABLED` | no | `true` | Set to `false` to disable the JIT on-demand lease path entirely |
 | `ONDEMAND_HORIZON_MINUTES` | no | `30` | JIT routing horizon: a pod is queued for a reservation opening within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | no | `10` | Minutes added to a pod's `horae/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
 | `ONDEMAND_DELEGATE_ADMISSION` | no | `false` | Delegate on-demand admission selection to the app for LAS prioritization (`POST /api/reservations/ondemand-admission`); `false` (or any app-call failure) grants every eligible candidate. Opt-in — enable once the app implements the endpoint |
-| `NOSHOW_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and cancelling it app-side (legacy alias `NOSHOWN_TIMEOUT_MINUTES` still accepted) |
-| `NOSHOW_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress (legacy alias `NOSHOWN_GRACE_MINUTES` still accepted) |
-| `QUEUE_PROCESSOR_INTERVAL` | no | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST (legacy alias `POD_LIST_TICK_INTERVAL` still accepted) |
+| `NOSHOW_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and cancelling it app-side |
+| `NOSHOW_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress |
+| `QUEUE_PROCESSOR_INTERVAL` | no | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST |
 | `POD_SCHEDULING_GATE_NAME` | no | *(absent)* | Name of a SchedulingGate to remove from a pod after admitting it; unset disables scheduling-gate removal |
 | `INBOUND_API_TOKEN` | no | *(absent)* | Bearer token for the inbound APIs (`POST /api/reservations/push` and `GET /api/forecast/preemption-risk`); mount from a Kubernetes Secret. Unset leaves both endpoints **disabled** (returns 503) |
 | `PREEMPTION_LEAD_MINUTES` | no | `15` | Minutes before a reservation slot boundary that phase-A preemption runs, proactively freeing capacity from overstaying pods |
