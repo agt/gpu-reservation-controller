@@ -101,7 +101,7 @@ Sources: `app/controller.py` (`enqueue_pod`, `dequeue_pod`, `reconcile_queue`), 
 | DEBUG | `Pod ns/name: GPU budget full (N requested > N available of N reserved); retry in N s` | Toleration not applied because the reservation's GPU budget is exhausted; will retry after a 2–5 min jitter delay. |
 | INFO | `Pod ns/name already has toleration; dequeuing` | The pod was already carrying the toleration (applied externally or by a previous attempt); removed from the queue. |
 | INFO | `Applied toleration key=value:NoSchedule to pod ns/name (booking=ref)` | Toleration patch succeeded; pod is now admitted under the given booking reference. |
-| INFO | `Recorded runtime guarantee on pod ns/name: Ns (until <time>)` | The pod's runtime guarantee has been annotated (`horae/pod-runtime-limit-seconds`, `horae/guaranteed-until`). No `spec.activeDeadlineSeconds` is patched — the guarantee is informational only. |
+| INFO | `Recorded runtime guarantee on pod ns/name: Ns (until <time>)` | The pod's runtime guarantee has been annotated (`horae/pod-runtime-limit-seconds`, `horae/guaranteed-until`); the guarantee is informational only and is not enforced by Kubernetes. |
 | INFO | `Emitted RuntimeGuaranteed event for pod ns/name (guaranteed=Ns, until=<time>)` | A `RuntimeGuaranteed` Kubernetes event has been created on the pod explaining when the guarantee ends. |
 | WARNING | `Failed to record runtime guarantee on pod ns/name: <exception>` | Recording the guarantee failed after the toleration was already applied; best-effort, toleration is not revoked. |
 | WARNING | `Error processing pod ns/name: <exception>; retry in N s` | Toleration patch or pod re-read failed with a transient error; the optimistic occupancy record was rolled back and the entry remains in the queue. |
@@ -224,7 +224,7 @@ Low-level traces of every outbound Kubernetes API call.  Visible only at
 | DEBUG | `k8s: list_pod_for_all_namespaces selector=gpu-class (tolerated snapshot)` | About to LIST all GPU-class pods to rebuild the tolerated-pod snapshot. |
 | DEBUG | `k8s: tolerated snapshot returned N pod(s)` | LIST completed; N pods carry the controller's toleration. |
 | DEBUG | `k8s: patch_namespaced_pod ns/name (add toleration key=value:NoSchedule, booking=ref)` | About to PATCH a pod to add the reservation toleration and booking-reference annotation. |
-| DEBUG † | `k8s: patch_namespaced_pod ns/name (runtime guarantee: Ns, until <time>)` | About to PATCH a pod's `horae/pod-runtime-limit-seconds` / `horae/guaranteed-until` annotations. No `spec.activeDeadlineSeconds` patch is ever issued. |
+| DEBUG † | `k8s: patch_namespaced_pod ns/name (runtime guarantee: Ns, until <time>)` | About to PATCH a pod's `horae/pod-runtime-limit-seconds` / `horae/guaranteed-until` annotations; these are informational only and not enforced by Kubernetes. |
 | DEBUG | `k8s: create_namespaced_event ns (pod=name, reason=RuntimeGuaranteed)` | About to create a `RuntimeGuaranteed` event on the pod. |
 | DEBUG | `k8s: create_namespaced_event ns (pod=name, reason=Preempted)` † | About to create a `Preempted` event on a pod being deleted to recover capacity. |
 | DEBUG | `k8s: create_namespaced_event ns (pod=name, reason=ReservationCancelled)` | About to create a `ReservationCancelled` event on the pod. |

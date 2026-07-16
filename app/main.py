@@ -430,8 +430,7 @@ async def _record_guarantee(
     """Annotate the pod with its runtime guarantee and emit a RuntimeGuaranteed Event.
 
     Callers compute *guaranteed_until* by chaining back-to-back windows
-    (``compute_guaranteed_until``).  Unlike the retired hard deadline this sets
-    no Kubernetes enforcement — no
+    (``compute_guaranteed_until``).  This sets no Kubernetes enforcement — no
     ``spec.activeDeadlineSeconds`` is patched, so a pod may run past its
     guarantee freely.  Demand-driven preemption recovers capacity from an
     overstaying pod only when needed (see ``preemption_loop``), deciding by

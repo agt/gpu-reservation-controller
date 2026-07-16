@@ -1,8 +1,8 @@
 """Coverage for Config.from_env and the unified reserved admission path (T6).
 
 ``Config.from_env`` had no tests (required-var errors, falsy parsing, the
-NOSHOW_* aliases); neither did ``_try_apply_toleration`` itself — the budget
-check, optimistic record/rollback, the already-tolerated dequeue, and the
+renamed int/bool settings); neither did ``_try_apply_toleration`` itself — the
+budget check, optimistic record/rollback, the already-tolerated dequeue, and the
 terminal-phase drop added when the two admission paths were unified.
 
 The async tests import ``app.main`` after setting the required env vars, because
@@ -27,15 +27,10 @@ _CONFIG_ENV = [
     "RESERVATION_LOOKAHEAD_DAYS",
     "KUBECONFIG",
     "HTTP_PORT",
-    "HEALTH_PORT",
     "ONDEMAND_LEASE_ENABLED",
-    "ONDEMAND_PLACEMENT_ENABLED",
     "NOSHOW_TIMEOUT_MINUTES",
-    "NOSHOWN_TIMEOUT_MINUTES",
     "NOSHOW_GRACE_MINUTES",
-    "NOSHOWN_GRACE_MINUTES",
     "QUEUE_PROCESSOR_INTERVAL",
-    "POD_LIST_TICK_INTERVAL",
     "POD_SCHEDULING_GATE_NAME",
     "PREEMPTION_LEAD_MINUTES",
     "PREEMPTION_CHECK_INTERVAL",
@@ -90,66 +85,29 @@ class TestConfigFromEnv:
         # Delegation is opt-in: default off until the app ships the endpoint.
         assert c.ondemand_delegate_admission is False
 
-    def test_noshow_new_name_preferred_over_legacy(self, monkeypatch):
-        from app.config import Config
-
-        _clean_env(monkeypatch)
-        monkeypatch.setenv("RESERVATION_API_URL", "http://x")
-        monkeypatch.setenv("RESERVATION_API_KEY", "k")
-        monkeypatch.setenv("NOSHOW_TIMEOUT_MINUTES", "7")
-        monkeypatch.setenv("NOSHOWN_TIMEOUT_MINUTES", "99")
-        assert Config.from_env().noshow_timeout_minutes == 7
-
-    def test_noshow_legacy_alias_still_honored(self, monkeypatch):
-        from app.config import Config
-
-        _clean_env(monkeypatch)
-        monkeypatch.setenv("RESERVATION_API_URL", "http://x")
-        monkeypatch.setenv("RESERVATION_API_KEY", "k")
-        monkeypatch.setenv("NOSHOWN_GRACE_MINUTES", "42")
-        assert Config.from_env().noshow_grace_minutes == 42
-
     def _base_env(self, monkeypatch):
         _clean_env(monkeypatch)
         monkeypatch.setenv("RESERVATION_API_URL", "http://x")
         monkeypatch.setenv("RESERVATION_API_KEY", "k")
 
-    @pytest.mark.parametrize("canonical,legacy,attr,default,new_val,legacy_val", [
-        ("HTTP_PORT", "HEALTH_PORT", "http_port", 8000, 9001, 9002),
-        ("QUEUE_PROCESSOR_INTERVAL", "POD_LIST_TICK_INTERVAL",
-         "queue_processor_interval", 300, 45, 90),
+    @pytest.mark.parametrize("name,attr,default,override", [
+        ("HTTP_PORT", "http_port", 8000, 9001),
+        ("QUEUE_PROCESSOR_INTERVAL", "queue_processor_interval", 300, 45),
+        ("NOSHOW_TIMEOUT_MINUTES", "noshow_timeout_minutes", 15, 7),
+        ("NOSHOW_GRACE_MINUTES", "noshow_grace_minutes", 30, 42),
     ])
-    def test_renamed_int_alias(self, monkeypatch, canonical, legacy, attr,
-                               default, new_val, legacy_val):
-        # The renamed int vars fall back to their legacy spelling, and the
-        # canonical name wins when both are set (same contract as NOSHOW_*).
+    def test_int_setting_override(self, monkeypatch, name, attr, default,
+                                  override):
+        # Each renamed int setting reads its canonical env var, defaulting when
+        # unset and honoring an explicit override.
         from app.config import Config
 
         self._base_env(monkeypatch)
         assert getattr(Config.from_env(), attr) == default
 
         self._base_env(monkeypatch)
-        monkeypatch.setenv(legacy, str(legacy_val))
-        assert getattr(Config.from_env(), attr) == legacy_val
-
-        self._base_env(monkeypatch)
-        monkeypatch.setenv(canonical, str(new_val))
-        monkeypatch.setenv(legacy, str(legacy_val))
-        assert getattr(Config.from_env(), attr) == new_val
-
-    def test_ondemand_lease_enabled_legacy_alias(self, monkeypatch):
-        # ONDEMAND_LEASE_ENABLED replaces the misleading ONDEMAND_PLACEMENT_ENABLED;
-        # the old name still turns the JIT lease path off.
-        from app.config import Config
-
-        self._base_env(monkeypatch)
-        monkeypatch.setenv("ONDEMAND_PLACEMENT_ENABLED", "false")
-        assert Config.from_env().ondemand_lease_enabled is False
-
-        self._base_env(monkeypatch)
-        monkeypatch.setenv("ONDEMAND_LEASE_ENABLED", "true")
-        monkeypatch.setenv("ONDEMAND_PLACEMENT_ENABLED", "false")
-        assert Config.from_env().ondemand_lease_enabled is True
+        monkeypatch.setenv(name, str(override))
+        assert getattr(Config.from_env(), attr) == override
 
     @pytest.mark.parametrize("value,expected", [
         ("false", False), ("0", False), ("no", False), ("FALSE", False),

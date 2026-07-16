@@ -65,8 +65,6 @@ spec:
               value: {{ .Values.config.ondemandLeaseBufferMinutes | quote }}
             - name: ONDEMAND_DELEGATE_ADMISSION
               value: {{ .Values.config.ondemandDelegateAdmission | quote }}
-            # Canonical spellings; the code still honors the legacy NOSHOWN_*
-            # names, so out-of-chart deployments keep working.
             - name: NOSHOW_TIMEOUT_MINUTES
               value: {{ .Values.config.noshowTimeoutMinutes | quote }}
             - name: NOSHOW_GRACE_MINUTES

@@ -144,10 +144,9 @@ informational only.
 
 When a pod is admitted (toleration successfully applied), the controller
 records how long its GPU access is **guaranteed** — but does **not** enforce
-that guarantee with `spec.activeDeadlineSeconds`.  Users kept overestimating
-their runtime "just in case" when the controller hard-killed pods at a fixed
-estimate, so a pod may now keep running past its guarantee freely; the
-controller reclaims capacity from an overstaying pod only when a new
+that guarantee with `spec.activeDeadlineSeconds`.  A pod may keep running past
+its guarantee freely; the controller does not hard-kill it at a fixed runtime
+estimate and reclaims capacity from an overstaying pod only when a new
 reservation actually needs it.
 
 **Guarantee calculation** — the guaranteed instant is:
@@ -157,12 +156,11 @@ reservation actually needs it.
    sharing the same `user.username`, GPU class, and `gpu_count`, where
    `slot_start(next) == slot_end(previous)` with no gap.
 
-This is the same back-to-back chaining rule the old hard cap used
-(`ControllerState.compute_guaranteed_until`).  Unlike the old cap, the result
-is an **absolute UTC instant recomputed live on every call**, not a duration
-frozen at admission — so a pod's guarantee can *grow* after admission (the
-user books an abutting follow-on reservation), something
-`spec.activeDeadlineSeconds` could never do (Kubernetes forbids raising an
+The back-to-back chaining rule is `ControllerState.compute_guaranteed_until`.
+The result is an **absolute UTC instant recomputed live on every call**, not a
+duration frozen at admission — so a pod's guarantee can *grow* after admission
+(the user books an abutting follow-on reservation), something
+`spec.activeDeadlineSeconds` cannot express (Kubernetes forbids raising an
 existing deadline).  `ControllerState.guarantee_end` is the general-purpose
 entry point: given a booking-reference id, it returns the live guarantee
 instant, or `None` if the reservation is no longer active (its window is
@@ -173,11 +171,11 @@ now that on-demand jobs are ordinary reservations too.
 `_record_guarantee` in `main.py`:
 
 - Annotates the pod (`annotate_runtime_guarantee`) with informational-only
-  `horae/pod-runtime-limit-seconds` (guaranteed duration in seconds — the
-  legacy key name; it no longer backs a hard cap) and `horae/guaranteed-until`
-  (the same instant as an absolute UTC ISO-8601 timestamp).  A guarantee can
-  technically shrink after the annotation is written (a window shortened
-  server-side, or a merge component vanishing) — nothing re-reads these
+  `horae/pod-runtime-limit-seconds` (guaranteed duration in seconds) and
+  `horae/guaranteed-until` (the same instant as an absolute UTC ISO-8601
+  timestamp).  A guarantee can technically shrink after the annotation is
+  written (a window shortened server-side, or a merge component vanishing) —
+  nothing re-reads these
   annotations to make a decision, so a widget should treat them as
   best-effort, not authoritative.
 - Emits a `Normal` Kubernetes Event with `reason: RuntimeGuaranteed`,
@@ -297,8 +295,8 @@ All reservation window arithmetic uses **UTC-aware `datetime` objects** (`timezo
 response; no local-time conversion is performed in the controller.  Every
 `datetime.now()` call in the codebase uses `datetime.now(timezone.utc)`.
 
-The `TZ` environment variable is no longer needed for correctness (it only affects
-log timestamp display).
+The `TZ` environment variable affects log timestamp display only; window
+arithmetic is UTC-based and does not depend on it.
 
 ### Fast path for mid-window pods
 
@@ -628,16 +626,16 @@ the claimed set and the grace re-arm path above applies.
 | `RESERVATION_FETCH_INTERVAL` | `300` | Seconds between reservation refresh cycles |
 | `RESERVATION_LOOKAHEAD_DAYS` | `7` | Calendar days ahead to fetch reservations |
 | `KUBECONFIG` | *(absent = in-cluster)* | Path to kubeconfig file for out-of-cluster use |
-| `HTTP_PORT` | `8000` | Bind port for the **whole** HTTP listener — `GET /health` plus `POST /api/reservations/push` and `GET /api/forecast/preemption-risk` (legacy alias `HEALTH_PORT` still honored) |
+| `HTTP_PORT` | `8000` | Bind port for the **whole** HTTP listener — `GET /health` plus `POST /api/reservations/push` and `GET /api/forecast/preemption-risk` |
 | `INBOUND_API_TOKEN` | *(absent = inbound API disabled)* | Bearer token guarding the inbound APIs (`POST /api/reservations/push` and `GET /api/forecast/preemption-risk`); mount from a Kubernetes Secret. Unset ⇒ both endpoints return 503 |
-| `TZ` | system default | Affects log timestamp display only; no longer required for window arithmetic |
-| `ONDEMAND_LEASE_ENABLED` | `true` | Set to `false` to disable the JIT on-demand lease path entirely (a non-JIT-eligible pod still waits for a matching reservation; an ineligible one is left Pending). Legacy alias `ONDEMAND_PLACEMENT_ENABLED` still honored |
+| `TZ` | system default | Affects log timestamp display only; window arithmetic is UTC-based and does not depend on it |
+| `ONDEMAND_LEASE_ENABLED` | `true` | Set to `false` to disable the JIT on-demand lease path entirely (a non-JIT-eligible pod still waits for a matching reservation; an ineligible one is left Pending) |
 | `ONDEMAND_HORIZON_MINUTES` | `30` | JIT routing horizon: a pod is queued for a reservation that opens within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | `10` | Minutes added to a pod's `horae/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
 | `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch (`POST /api/reservations/ondemand-admission`) for LAS prioritization; `false` (or any app-call failure) grants every eligible candidate — the prior greedy per-pod behaviour. Opt-in: enable once the app implements the endpoint |
-| `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show (legacy alias `NOSHOWN_TIMEOUT_MINUTES` still honored) |
-| `NOSHOW_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared (legacy alias `NOSHOWN_GRACE_MINUTES` still honored) |
-| `QUEUE_PROCESSOR_INTERVAL` | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST (legacy alias `POD_LIST_TICK_INTERVAL` still honored) |
+| `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
+| `NOSHOW_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared |
+| `QUEUE_PROCESSOR_INTERVAL` | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST |
 | `POD_SCHEDULING_GATE_NAME` | *(absent)* | Name of the SchedulingGate to remove after admitting a pod; unset = disabled |
 | `REQUIRED_GROUP_LABEL` | *(absent)* | Pod label naming the usage group (e.g. `dsmlp/course`); when set, the pod's value must equal the reservation's `group.name` — an extra match axis alongside `gpu-class` (see **Matching pods to reservations**), and a pod without the label is never JIT-eligible either. Unset = disabled |
 | `PREEMPTION_LEAD_MINUTES` | `15` | Minutes before a reservation slot boundary that phase-A preemption runs |

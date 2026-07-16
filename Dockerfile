@@ -47,7 +47,7 @@ EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD python -c \
-        "import os,urllib.request; urllib.request.urlopen('http://localhost:%s/health' % (os.environ.get('HTTP_PORT') or os.environ.get('HEALTH_PORT','8000')))" \
+        "import os,urllib.request; urllib.request.urlopen('http://localhost:%s/health' % os.environ.get('HTTP_PORT','8000'))" \
     || exit 1
 
 # Launch via the module entrypoint so HTTP_PORT controls the bind port

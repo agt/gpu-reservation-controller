@@ -13,20 +13,15 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
 
 
-def _env_bool(name: str, default: bool, legacy: Optional[str] = None) -> bool:
+def _env_bool(name: str, default: bool) -> bool:
     """Read a boolean-ish environment variable with an explicit default.
 
-    Replaces the per-flag ``.lower() not in (...)`` / ``in (...)`` one-liners,
-    which disagreed with each other (and with the app) on which spellings count
-    — e.g. ``on`` enabled an app flag but not a controller one.
-
-    ``legacy`` names a deprecated spelling that is still honored when the
-    canonical ``name`` is unset, so renaming an env var never breaks an existing
-    deployment (the same backward-compat pattern as :func:`_env_alias`).
+    A recognised truthy/falsy word (see ``_TRUTHY`` / ``_FALSY``) wins;
+    anything else — including junk — falls back to ``default``.  This keeps the
+    controller's boolean vocabulary in step with the reservation app's
+    ``config_utils``.
     """
     raw = os.environ.get(name)
-    if raw is None and legacy is not None:
-        raw = os.environ.get(legacy)
     if raw is None:
         return default
     value = raw.strip().lower()
@@ -35,17 +30,6 @@ def _env_bool(name: str, default: bool, legacy: Optional[str] = None) -> bool:
     if value in _FALSY:
         return False
     return default
-
-
-def _env_alias(canonical: str, legacy: str, default: str) -> str:
-    """Read a string env var, preferring the canonical spelling.
-
-    Falls back to the deprecated ``legacy`` alias (grep-hostile ``NOSHOWN_*``,
-    the old ``HEALTH_PORT`` / ``POD_LIST_TICK_INTERVAL`` / ``ONDEMAND_PLACEMENT_*``
-    names, …) so existing deployments keep working after a rename, then to
-    ``default`` when neither is set (CODE-REVIEW H3).
-    """
-    return os.environ.get(canonical) or os.environ.get(legacy) or default
 
 
 @dataclass(frozen=True)
@@ -96,18 +80,16 @@ class Config:
                 os.environ.get("RESERVATION_LOOKAHEAD_DAYS", "7")
             ),
             kubeconfig_path=os.environ.get("KUBECONFIG") or None,
-            http_port=int(_env_alias("HTTP_PORT", "HEALTH_PORT", "8000")),
-            ondemand_lease_enabled=_env_bool(
-                "ONDEMAND_LEASE_ENABLED", True, legacy="ONDEMAND_PLACEMENT_ENABLED"
-            ),
+            http_port=int(os.environ.get("HTTP_PORT", "8000")),
+            ondemand_lease_enabled=_env_bool("ONDEMAND_LEASE_ENABLED", True),
             noshow_timeout_minutes=int(
-                _env_alias("NOSHOW_TIMEOUT_MINUTES", "NOSHOWN_TIMEOUT_MINUTES", "15")
+                os.environ.get("NOSHOW_TIMEOUT_MINUTES", "15")
             ),
             noshow_grace_minutes=int(
-                _env_alias("NOSHOW_GRACE_MINUTES", "NOSHOWN_GRACE_MINUTES", "30")
+                os.environ.get("NOSHOW_GRACE_MINUTES", "30")
             ),
             queue_processor_interval=int(
-                _env_alias("QUEUE_PROCESSOR_INTERVAL", "POD_LIST_TICK_INTERVAL", "300")
+                os.environ.get("QUEUE_PROCESSOR_INTERVAL", "300")
             ),
             scheduling_gate_name=os.environ.get("POD_SCHEDULING_GATE_NAME") or None,
             required_group_label=os.environ.get("REQUIRED_GROUP_LABEL") or None,
