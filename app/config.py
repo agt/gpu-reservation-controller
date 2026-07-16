@@ -53,6 +53,7 @@ class Config:
     required_group_label: Optional[str] = None  # pod label naming the usage group to match; None = disabled
     ondemand_horizon_minutes: int = 30    # JIT trigger: reserved-match horizon before requesting a lease
     ondemand_lease_buffer_minutes: int = 10  # added to a pod's minimum-runtime when sizing a JIT lease
+    capacity_check_interval: int = 3600  # seconds between app-side vs physical capacity audits
     log_level: str = "INFO"        # root log level (LOG_LEVEL)
 
     @classmethod
@@ -115,6 +116,9 @@ class Config:
             ),
             ondemand_lease_buffer_minutes=int(
                 os.environ.get("ONDEMAND_LEASE_BUFFER_MINUTES", "10")
+            ),
+            capacity_check_interval=int(
+                os.environ.get("CAPACITY_CHECK_INTERVAL", "3600")
             ),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
         )

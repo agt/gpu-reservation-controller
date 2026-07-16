@@ -111,6 +111,12 @@ config:
   # needs capacity freed, and whether any just-expired blocks need cleanup).
   preemptionCheckInterval: 60
 
+  # Seconds between app-side vs physical GPU capacity audits (default hourly).
+  # Each audit compares the reservation app's per-class total_gpus against the
+  # GPUs physically present in the cluster, logs any difference as a WARNING,
+  # and pauses new on-demand admissions for any class the app over-counts.
+  capacityCheckInterval: 3600
+
   # Re-link an overstay pod (one running past its runtime guarantee) to a
   # reservation the same user has since booked, so it is no longer eligible
   # for preemption.  Set to false to disable.

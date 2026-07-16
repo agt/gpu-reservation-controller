@@ -668,6 +668,14 @@ attachment.
 `label_value` is `null` when the class has no Kubernetes mapping; the
 controller skips reservations for such classes.
 
+`total_gpus` is the app's own count of GPUs in the class.  The controller
+consumes it in its hourly capacity audit: it compares `total_gpus` against the
+GPUs physically present in the cluster (from Kubernetes node taints), logs any
+per-class difference as a WARNING, and pauses new on-demand admissions for any
+class whose `total_gpus` exceeds physical capacity.  A response that omits
+`total_gpus` leaves that class out of the audit (treated as "unknown", never
+flagged over-committed).
+
 **Errors**
 
 | Code | Condition |

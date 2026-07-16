@@ -85,6 +85,8 @@ spec:
               value: {{ .Values.config.preemptionLeadMinutes | quote }}
             - name: PREEMPTION_CHECK_INTERVAL
               value: {{ .Values.config.preemptionCheckInterval | quote }}
+            - name: CAPACITY_CHECK_INTERVAL
+              value: {{ .Values.config.capacityCheckInterval | quote }}
             - name: POD_ADOPTION_ENABLED
               value: {{ .Values.config.podAdoptionEnabled | quote }}
             - name: PREEMPTION_DELEGATE_SELECTION

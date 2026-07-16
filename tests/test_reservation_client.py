@@ -116,7 +116,8 @@ def test_fetch_gpu_classes_returns_list():
         return httpx.Response(
             200,
             json=[
-                {"id": 10, "name": "H100", "label_value": "h100"},
+                # First class carries total_gpus; second omits it entirely.
+                {"id": 10, "name": "H100", "label_value": "h100", "total_gpus": 8},
                 {"id": 20, "name": "A100", "label_value": "a100"},
             ],
         )
@@ -125,6 +126,9 @@ def test_fetch_gpu_classes_returns_list():
     result = asyncio.run(client.fetch_gpu_classes())
     assert result is not None
     assert [(c.id, c.label_value) for c in result] == [(10, "h100"), (20, "a100")]
+    # total_gpus is parsed when present, and defaults to None when absent.
+    assert result[0].total_gpus == 8
+    assert result[1].total_gpus is None
     asyncio.run(client.aclose())
 
 
