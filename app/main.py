@@ -1448,9 +1448,15 @@ async def queue_processor_loop(
 
         # Guard 5: refresh per-node feasibility (largest single-node free GPUs per
         # class) from a node-inventory snapshot joined with this tick's tolerated
-        # snapshot.  Fail-safe: if either snapshot is missing, leave the prior map
-        # intact — never open multi-GPU admission for a class based on unknown
-        # physical state.  Consulted synchronously by _preflight_ondemand_candidate.
+        # `snapshot`.  `snapshot` is deliberately reused rather than re-fetched
+        # alongside `inventory` (avoids a second wide pod LIST this tick); the two
+        # calls are not atomic, so a pod that finishes scheduling in the gap is
+        # briefly invisible here, making the per-node free count optimistic for
+        # the node it actually landed on.  Accepted: guard 3 and the compensating
+        # cancel in _grant_and_admit backstop any grant this skew lets through.
+        # Fail-safe: if either snapshot is missing, leave the prior map intact —
+        # never open multi-GPU admission for a class based on unknown physical
+        # state.  Consulted synchronously by _preflight_ondemand_candidate.
         if config.ondemand_lease_enabled and snapshot is not None:
             try:
                 inventory = await snapshot_node_gpu_inventory(TOLERATION_KEY)

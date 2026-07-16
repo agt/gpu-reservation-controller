@@ -50,7 +50,7 @@ app/
 ├── config.py             Config dataclass populated from environment variables
 ├── schemas.py            Pydantic models mirroring RESERVATION-API.md §6
 ├── reservation_client.py httpx async client — fetches reservations + GPU classes; creates/cancels JIT on-demand reservations
-├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, annotate_runtime_guarantee, emit_preempted_event, snapshot_tolerated_pods / snapshot_node_gpu_capacity (occupancy + capacity)
+├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, annotate_runtime_guarantee, emit_preempted_event, snapshot_tolerated_pods / snapshot_node_gpu_inventory (per-node) / snapshot_node_gpu_capacity (per-class collapse of it)
 └── controller.py         ControllerState, QueueEntry, matching, window arithmetic, preemption planning, preemption-risk forecast
 ```
 
