@@ -43,6 +43,7 @@ from .controller import (
     apply_push_to_active,
     build_preemption_plan,
     canceller_description,
+    reconcile_capacity,
     select_victims_locally,
     slot_end,
     slot_start,
@@ -160,13 +161,19 @@ async def _reconcile_after_reservation_change(
     if gpu_classes is not None:
         new_labels: dict[int, str] = {}
         new_ids: dict[str, int] = {}
+        new_capacity: dict[str, int] = {}
         for gc in gpu_classes:
             if gc.label_value:
                 new_labels[gc.id] = gc.label_value
                 new_ids[gc.label_value] = gc.id
+                # App-side GPU count for the hourly capacity audit; recorded
+                # only when known (see GpuClassDetail.total_gpus).
+                if gc.total_gpus is not None:
+                    new_capacity[gc.label_value] = gc.total_gpus
     else:
         new_labels = dict(state.gpu_class_labels)
         new_ids = dict(state.gpu_class_ids)
+        new_capacity = dict(state.gpu_class_capacity)
 
     # Fallback: resolve any class referenced by active reservations that the
     # bulk list didn't cover (e.g. a class created since the last successful
@@ -179,6 +186,8 @@ async def _reconcile_after_reservation_change(
         if gpu_class and gpu_class.label_value:
             new_labels[cid] = gpu_class.label_value
             new_ids[gpu_class.label_value] = cid
+            if gpu_class.total_gpus is not None:
+                new_capacity[gpu_class.label_value] = gpu_class.total_gpus
             log.info("GPU class %d (%s) → label_value=%r", cid, gpu_class.name, gpu_class.label_value)
         else:
             log.warning(
@@ -190,6 +199,7 @@ async def _reconcile_after_reservation_change(
     state.reservations = active_reservations
     state.gpu_class_labels = new_labels
     state.gpu_class_ids = new_ids
+    state.gpu_class_capacity = new_capacity
 
     # Drop / re-match queue entries whose reservation was cancelled.
     state.reconcile_queue()
@@ -694,6 +704,22 @@ async def _preflight_ondemand_candidate(
         log.debug(
             "On-demand candidate %s/%s: safety interlock active for gpu-class=%s; "
             "retry shortly",
+            candidate.pod_namespace,
+            candidate.pod_name,
+            candidate.gpu_class_label,
+        )
+        candidate.next_attempt_at = _short_retry_at(now)
+        return _PREFLIGHT_RETRY, None
+
+    # Guard 4: capacity overcommit — hold JIT requests for any GPU class whose
+    # app-side count exceeds observed physical capacity (set by the hourly
+    # capacity audit; recomputed each tick so it clears when the deficiency is
+    # resolved).  Admitting on-demand jobs onto a class the app believes is
+    # larger than it physically is would mint leases that can never schedule.
+    if candidate.gpu_class_label in state.overcommitted_gpu_classes:
+        log.info(
+            "On-demand candidate %s/%s: admission paused — gpu-class=%s is "
+            "over-committed (app-side capacity exceeds physical); retry shortly",
             candidate.pod_namespace,
             candidate.pod_name,
             candidate.gpu_class_label,
@@ -1772,6 +1798,84 @@ async def preemption_loop(
 
 
 # ---------------------------------------------------------------------------
+# Background loop 5: capacity audit
+# ---------------------------------------------------------------------------
+
+
+async def _run_capacity_audit(
+    state: ControllerState,
+    config: Config,
+) -> None:
+    """One capacity audit: compare app-side vs physical per-class GPU capacity.
+
+    The app-side counts come from ``state.gpu_class_capacity`` (the reservation
+    app's ``total_gpus`` per class, refreshed each reservation fetch).  Physical
+    capacity is snapshotted live from Kubernetes node taints.  Any difference is
+    logged at WARNING; any class the app believes is larger than it physically
+    is (``app_side > physical``) is added to ``state.overcommitted_gpu_classes``,
+    which pauses new on-demand admissions for that class only.
+
+    Fail-safe: if the node snapshot fails, the audit is skipped and the current
+    pause set is left unchanged — a transient LIST failure must never silently
+    lift a pause (the same "never act on unknown physical state" rule the
+    preemption sweep follows).
+    """
+    try:
+        physical = await snapshot_node_gpu_capacity(TOLERATION_KEY)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Capacity audit: failed to snapshot node GPU capacity: %s; "
+            "leaving on-demand pause set unchanged",
+            exc,
+            exc_info=True,
+        )
+        return
+
+    app_side = dict(state.gpu_class_capacity)
+    diffs, overcommitted = reconcile_capacity(app_side, physical)
+
+    for diff in diffs:
+        log.warning(
+            "Capacity mismatch for gpu-class=%s: app-side=%d, physical=%d (%s)",
+            diff.label,
+            diff.app_side,
+            diff.physical,
+            "app-side OVER physical — on-demand admission paused"
+            if diff.overcommitted
+            else "app-side under physical",
+        )
+
+    previous = state.overcommitted_gpu_classes
+    newly_paused = overcommitted - previous
+    resumed = previous - overcommitted
+    if newly_paused:
+        log.info(
+            "On-demand admission paused for over-committed gpu-class(es): %s",
+            ", ".join(sorted(newly_paused)),
+        )
+    if resumed:
+        log.info(
+            "On-demand admission resumed for gpu-class(es) no longer "
+            "over-committed: %s",
+            ", ".join(sorted(resumed)),
+        )
+    state.overcommitted_gpu_classes = overcommitted
+
+
+async def capacity_audit_loop(
+    state: ControllerState, config: Config
+) -> None:
+    """Every ``config.capacity_check_interval`` s (default hourly), audit
+    app-side vs physical GPU capacity and update the on-demand pause set."""
+    while True:
+        await asyncio.sleep(config.capacity_check_interval)
+        try:
+            await _run_capacity_audit(state, config)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Capacity audit failed: %s", exc, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 
@@ -1823,7 +1927,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             config.reservation_fetch_interval,
         )
 
-    # Launch the four background loops as asyncio tasks.
+    # Run one capacity audit synchronously so an app-side overcommit pauses
+    # on-demand admission from the start rather than up to an interval later.
+    # Best-effort: a snapshot failure here just logs and leaves the pause set
+    # empty (the loop re-checks on its normal cadence).
+    try:
+        await _run_capacity_audit(state, config)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Initial capacity audit failed: %s", exc, exc_info=True)
+
+    # Launch the five background loops as asyncio tasks.
     tasks = [
         asyncio.create_task(
             reservation_fetch_loop(state, client, config),
@@ -1834,6 +1947,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             queue_processor_loop(state, client, config), name="queue-processor"
         ),
         asyncio.create_task(preemption_loop(state, client, config), name="preemption"),
+        asyncio.create_task(
+            capacity_audit_loop(state, config), name="capacity-audit"
+        ),
     ]
     log.info("GPU reservation controller started")
 

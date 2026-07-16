@@ -62,6 +62,7 @@ app/
 | `pod_watch_loop` | continuous (LIST + WATCH) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease; **fast-path**: applies toleration immediately when a new pod arrives inside an open window |
 | `queue_processor_loop` | every `POD_LIST_TICK_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
 | `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee, only when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**) |
+| `capacity_audit_loop` | every `CAPACITY_CHECK_INTERVAL` s (default 3600) | Compares app-side per-class GPU capacity (`total_gpus`) against physical cluster capacity; logs any difference as a WARNING and pauses on-demand admission for over-committed classes (see **App-side vs physical capacity reconciliation**) |
 
 ---
 
@@ -443,6 +444,47 @@ independently.
 existing pod-patch path); `ONDEMAND_HORIZON_MINUTES` and
 `ONDEMAND_LEASE_BUFFER_MINUTES` tune the routing horizon and lease sizing.
 
+### App-side vs physical capacity reconciliation
+
+The controller derives physical GPU capacity solely from Kubernetes node taints
+(`snapshot_node_gpu_capacity` — total allocatable `nvidia.com/gpu` per
+`gpu-class-reservation` taint value).  The reservation app has its **own**
+per-class GPU count, `total_gpus` (RESERVATION-API.md §4), now modelled on
+`schemas.GpuClassDetail` and cached per label in
+`ControllerState.gpu_class_capacity` — refreshed on every reconcile from the
+same `GET /api/gpu-classes` fetch that builds the label maps (only classes whose
+`total_gpus` is known are recorded; a payload omitting it degrades to
+"unknown").
+
+`capacity_audit_loop` (`_run_capacity_audit` in `main.py`) runs every
+`CAPACITY_CHECK_INTERVAL` s (default hourly, plus once synchronously at
+startup):
+
+1. Snapshots physical capacity (`snapshot_node_gpu_capacity`).  **Fail-safe**:
+   if the node LIST fails, the audit is skipped and the current pause set is
+   left unchanged — a transient failure must never silently lift a pause (the
+   same "never act on unknown physical state" rule the preemption sweep
+   follows).
+2. Calls the pure `controller.reconcile_capacity(app_side, physical)`, which
+   walks the union of class labels and returns (a) a `CapacityDiff` for every
+   class whose two counts disagree in either direction — a class present in
+   only one map treats the other side as `0` — and (b) the set of
+   **over-committed** labels (`app_side > physical`).  A class whose app-side
+   count is unknown is never flagged over-committed (overcommit cannot be
+   concluded from missing data).
+3. Logs every diff at **WARNING**; sets `ControllerState.overcommitted_gpu_classes`
+   to the over-committed set (logging INFO as classes enter/leave it).
+
+**Per-class on-demand pause.**  `_preflight_ondemand_candidate` gates JIT
+admission on `overcommitted_gpu_classes` as **guard 4** (mirroring the guard-3
+`stuck_holder_gpu_classes` interlock): a candidate whose `gpu-class` is
+over-committed is short-retried rather than granted, so it stays queued and
+resumes automatically once the class leaves the set on a later audit tick.  Only
+the JIT/on-demand path is gated; reserved-path admission under a real user
+booking is untouched (a booking already implies the app granted real calendar
+capacity).  **RBAC**: none new — the audit reuses the existing `nodes: list`
+permission.
+
 ### Inbound push API
 
 `POST /api/reservations/push` lets the reservation app push **one or more
@@ -600,6 +642,7 @@ the claimed set and the grace re-arm path above applies.
 | `REQUIRED_GROUP_LABEL` | *(absent)* | Pod label naming the usage group (e.g. `dsmlp/course`); when set, the pod's value must equal the reservation's `group.name` — an extra match axis alongside `gpu-class` (see **Matching pods to reservations**), and a pod without the label is never JIT-eligible either. Unset = disabled |
 | `PREEMPTION_LEAD_MINUTES` | `15` | Minutes before a reservation slot boundary that phase-A preemption runs |
 | `PREEMPTION_CHECK_INTERVAL` | `60` | Seconds between preemption sweeps |
+| `CAPACITY_CHECK_INTERVAL` | `3600` | Seconds between app-side vs physical GPU capacity audits; each audit logs per-class differences as WARNING and pauses on-demand admission for classes the app over-counts (see **App-side vs physical capacity reconciliation**) |
 | `PREEMPTION_DELEGATE_SELECTION` | `true` | Ask the app to choose preemption victims from the eligible pool (`POST /api/reservations/preemption-victims`); `false` (or any app-call failure) falls back to local uniform-random selection |
 | `POD_ADOPTION_ENABLED` | `true` | Re-link an overstay pod to a reservation its user has since booked (see **Adopting overstay pods into a re-booked reservation**); `false` disables |
 | `LOG_LEVEL` | `INFO` | Root Python logging level (parsed by `config.py`) |

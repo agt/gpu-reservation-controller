@@ -63,13 +63,22 @@ class ReservationResponse(BaseModel):
 
 
 class GpuClassDetail(GpuClassBrief):
-    """Returned by GET /api/gpu-classes/{id}.
+    """Returned by GET /api/gpu-classes/{id} (and the bulk list).
 
-    Identical shape to ``GpuClassBrief`` (id, name, optional ``label_value`` —
-    the Kubernetes node-label value used to match pod gpu-class labels, e.g.
-    "h100"); subclassed rather than redeclared so the two cannot drift
-    (CODE-REVIEW H7).
+    Extends ``GpuClassBrief`` (id, name, optional ``label_value`` — the
+    Kubernetes node-label value used to match pod gpu-class labels, e.g.
+    "h100") with the app-side ``total_gpus`` count.  Subclassed rather than
+    redeclared so the shared fields cannot drift (CODE-REVIEW H7).
+
+    ``total_gpus`` is the app's own notion of how many GPUs a class has; the
+    hourly capacity audit compares it against the physical per-class capacity
+    observed from Kubernetes node taints (``snapshot_node_gpu_capacity``).  It
+    is ``Optional`` so a payload that omits it (an older app, or a bulk list
+    that doesn't include it) degrades to "unknown" — such a class is left out
+    of the app-side capacity map rather than defaulting to a misleading count.
     """
+
+    total_gpus: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------

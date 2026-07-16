@@ -20,7 +20,7 @@ import logging
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Optional
+from typing import Iterable, NamedTuple, Optional
 
 from .schemas import ReservationResponse
 
@@ -119,6 +119,61 @@ def free_capacity_by_class(
         gpu_class: capacity - used.get(gpu_class, 0)
         for gpu_class, capacity in capacity_by_class.items()
     }
+
+
+class CapacityDiff(NamedTuple):
+    """One class where the app-side and physical GPU counts disagree.
+
+    ``physical`` is the total allocatable GPUs observed from Kubernetes node
+    taints (``snapshot_node_gpu_capacity``); ``app_side`` is the reservation
+    app's ``total_gpus`` for the same class.  ``overcommitted`` is
+    ``app_side > physical`` — the app believes there are more GPUs than
+    physically exist, so on-demand leases it hands out may never schedule.
+    """
+
+    label: str
+    app_side: int
+    physical: int
+
+    @property
+    def overcommitted(self) -> bool:
+        return self.app_side > self.physical
+
+
+def reconcile_capacity(
+    app_side: dict[str, int],
+    physical: dict[str, int],
+) -> tuple[list[CapacityDiff], set[str]]:
+    """Compare app-side vs physical per-class GPU capacity.
+
+    Walks the union of class labels in both maps and returns:
+
+    - a list of :class:`CapacityDiff` for every class whose two counts differ
+      (in either direction), including a class present in only one map — the
+      other side is treated as ``0`` (no physical nodes carry the taint, or the
+      app does not know the class); and
+    - the set of labels that are **over-committed** (``app_side > physical``),
+      the per-class on-demand admission pause gate.
+
+    A class whose app-side count is *unknown* must not appear in ``app_side``
+    at all (the caller omits classes with no ``total_gpus``); such a class can
+    still surface as a diff via the physical side but is never treated as
+    over-committed, since overcommit cannot be concluded from missing data.
+    """
+    diffs: list[CapacityDiff] = []
+    overcommitted: set[str] = set()
+    for label in sorted(set(app_side) | set(physical)):
+        a = app_side.get(label, 0)
+        p = physical.get(label, 0)
+        if a == p:
+            continue
+        diff = CapacityDiff(label=label, app_side=a, physical=p)
+        diffs.append(diff)
+        # Only a *known* app-side count (label present in ``app_side``) can
+        # be over-committed; a class seen only physically is not.
+        if label in app_side and diff.overcommitted:
+            overcommitted.add(label)
+    return diffs, overcommitted
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +499,21 @@ class ControllerState:
         # gpu_class_id, so this map is what main._try_request_lease resolves
         # against.  Refreshed alongside gpu_class_labels.
         self.gpu_class_ids: dict[str, int] = {}
+
+        # App-side per-class GPU capacity: label → total_gpus (the reservation
+        # app's own notion of how many GPUs a class has), refreshed alongside
+        # the label maps.  Keyed by label so it shares a key space with the
+        # physical snapshot (snapshot_node_gpu_capacity).  Populated only for
+        # classes whose total_gpus is known; the hourly capacity audit compares
+        # it against physical capacity (see main._run_capacity_audit).
+        self.gpu_class_capacity: dict[str, int] = {}
+
+        # GPU class labels the hourly audit found over-committed (app-side
+        # total_gpus > physical capacity).  New on-demand admissions are paused
+        # for any class in this set (mirrors stuck_holder_gpu_classes above);
+        # recomputed each audit tick, so a class clears automatically once the
+        # deficiency is resolved.  Empty = no pause.
+        self.overcommitted_gpu_classes: set[str] = set()
 
         # Name of the pod label naming the usage group to match (REQUIRED_GROUP_LABEL),
         # or None when the feature is disabled.  Set once from config at startup.
