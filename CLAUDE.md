@@ -60,7 +60,7 @@ app/
 |------|---------|----------------|
 | `reservation_fetch_loop` | every `RESERVATION_FETCH_INTERVAL` s (default 300) | Re-fetches active reservations; refreshes `gpu_class_id ↔ label_value` maps; reconciles stale queue entries |
 | `pod_watch_loop` | continuous (LIST + WATCH) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease; **fast-path**: applies toleration immediately when a new pod arrives inside an open window |
-| `queue_processor_loop` | every `POD_LIST_TICK_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
+| `queue_processor_loop` | every `QUEUE_PROCESSOR_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
 | `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee, only when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**) |
 | `capacity_audit_loop` | every `CAPACITY_CHECK_INTERVAL` s (default 3600) | Compares app-side per-class GPU capacity (`total_gpus`) against physical cluster capacity; logs any difference as a WARNING and pauses on-demand admission for over-committed classes (see **App-side vs physical capacity reconciliation**) |
 
@@ -305,7 +305,7 @@ log timestamp display).
 When a pod ADDED event arrives while its reservation window is already open
 (the common case for JupyterHub notebook servers launched during a session),
 `pod_watch_loop` calls `_try_apply_toleration` immediately rather than waiting
-up to a full `POD_LIST_TICK_INTERVAL` (default 300 s) for the next
+up to a full `QUEUE_PROCESSOR_INTERVAL` (default 300 s) for the next
 queue-processor tick.
 
 Only ADDED events trigger the fast path.  MODIFIED events — which can arrive in
@@ -343,7 +343,7 @@ without the toleration,
    has spare budget (`available(r) >= gpu_requested`).  If found, the pod is
    queued for it (`enqueue_pod`), with the same fast-path immediate-apply
    when the window is already open.
-2. Otherwise, if the pod is **JIT-eligible** — `ONDEMAND_PLACEMENT_ENABLED`,
+2. Otherwise, if the pod is **JIT-eligible** — `ONDEMAND_LEASE_ENABLED`,
    `Pending`, carries `horae/minimum-runtime-seconds`, and names its usage
    group (the group label when `REQUIRED_GROUP_LABEL` is set, else the
    `horae/usage-group` annotation — the lease request's `group_name` is a
@@ -496,7 +496,7 @@ source of truth.
 
 - **Auth**: a single static bearer token in `INBOUND_API_TOKEN` (mount from a
   Secret).  Unset ⇒ endpoint disabled (503); wrong/missing bearer ⇒ 401
-  (constant-time compare).  It rides the existing FastAPI app / `HEALTH_PORT`,
+  (constant-time compare).  It rides the existing FastAPI app / `HTTP_PORT`,
   so no extra container port or Service is needed.
 - **Body**: `{"reservations": [ReservationResponse, …]}` — the same entry shape
   the pull returns (`schemas.ReservationPushRequest`).
@@ -534,7 +534,7 @@ never report risk from unknown physical state).
 
 - **Auth / wiring**: guarded by the same `INBOUND_API_TOKEN` bearer check as
   the push API (`_require_inbound_auth`; unset ⇒ 503, bad bearer ⇒ 401) and
-  rides the same FastAPI app / `HEALTH_PORT` — no new port, Service, or RBAC.
+  rides the same FastAPI app / `HTTP_PORT` — no new port, Service, or RBAC.
 - **Model** (`ControllerState.forecast_preemption_risk`, pure and
   synchronous, computed under `reservation_lock` with snapshots awaited
   outside it): three calendar-aligned buckets (`[now, top of next hour)` plus
@@ -588,7 +588,7 @@ queue-processor tick rebuilds the map wholesale from a live cluster snapshot
 (`snapshot_tolerated_pods` → `reconcile_occupancy`), so a missed watch event
 self-heals within one tick.  An optimistic placement recorded between ticks whose
 patch is not yet visible in the snapshot may be briefly dropped and re-captured
-on the next tick — a window bounded by the `POD_LIST_TICK_INTERVAL` tick
+on the next tick — a window bounded by the `QUEUE_PROCESSOR_INTERVAL` tick
 (default 300 s).
 
 **No-show declaration is in-memory, but the resulting cancel is durable.**
@@ -596,7 +596,7 @@ on the next tick — a window bounded by the `POD_LIST_TICK_INTERVAL` tick
 awaiting their cancel) are never written back and don't survive a restart.
 After a restart, every mid-window user reservation — including ones the prior
 controller lifetime already declared no-show — receives a fresh
-`NOSHOWN_GRACE_MINUTES` deadline, so a late-arriving holder can reclaim their
+`NOSHOW_GRACE_MINUTES` deadline, so a late-arriving holder can reclaim their
 window across a restart.  But once a no-show's cancel actually **lands**
 (`POST /api/reservations/{id}/cancel`, `reason="no-show"`), that id is
 durably gone from the app's active set — the very next fetch simply no longer
@@ -628,16 +628,16 @@ the claimed set and the grace re-arm path above applies.
 | `RESERVATION_FETCH_INTERVAL` | `300` | Seconds between reservation refresh cycles |
 | `RESERVATION_LOOKAHEAD_DAYS` | `7` | Calendar days ahead to fetch reservations |
 | `KUBECONFIG` | *(absent = in-cluster)* | Path to kubeconfig file for out-of-cluster use |
-| `HEALTH_PORT` | `8000` | Port for `GET /health` (also serves `POST /api/reservations/push`) |
+| `HTTP_PORT` | `8000` | Bind port for the **whole** HTTP listener — `GET /health` plus `POST /api/reservations/push` and `GET /api/forecast/preemption-risk` (legacy alias `HEALTH_PORT` still honored) |
 | `INBOUND_API_TOKEN` | *(absent = inbound API disabled)* | Bearer token guarding the inbound APIs (`POST /api/reservations/push` and `GET /api/forecast/preemption-risk`); mount from a Kubernetes Secret. Unset ⇒ both endpoints return 503 |
 | `TZ` | system default | Affects log timestamp display only; no longer required for window arithmetic |
-| `ONDEMAND_PLACEMENT_ENABLED` | `true` | Set to `false` to disable the JIT on-demand lease path entirely (a non-JIT-eligible pod still waits for a matching reservation; an ineligible one is left Pending) |
+| `ONDEMAND_LEASE_ENABLED` | `true` | Set to `false` to disable the JIT on-demand lease path entirely (a non-JIT-eligible pod still waits for a matching reservation; an ineligible one is left Pending). Legacy alias `ONDEMAND_PLACEMENT_ENABLED` still honored |
 | `ONDEMAND_HORIZON_MINUTES` | `30` | JIT routing horizon: a pod is queued for a reservation that opens within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | `10` | Minutes added to a pod's `horae/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
 | `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch (`POST /api/reservations/ondemand-admission`) for LAS prioritization; `false` (or any app-call failure) grants every eligible candidate — the prior greedy per-pod behaviour. Opt-in: enable once the app implements the endpoint |
 | `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show (legacy alias `NOSHOWN_TIMEOUT_MINUTES` still honored) |
 | `NOSHOW_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared (legacy alias `NOSHOWN_GRACE_MINUTES` still honored) |
-| `POD_LIST_TICK_INTERVAL` | `300` | Seconds between queue-processor ticks (pod LIST frequency) |
+| `QUEUE_PROCESSOR_INTERVAL` | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST (legacy alias `POD_LIST_TICK_INTERVAL` still honored) |
 | `POD_SCHEDULING_GATE_NAME` | *(absent)* | Name of the SchedulingGate to remove after admitting a pod; unset = disabled |
 | `REQUIRED_GROUP_LABEL` | *(absent)* | Pod label naming the usage group (e.g. `dsmlp/course`); when set, the pod's value must equal the reservation's `group.name` — an extra match axis alongside `gpu-class` (see **Matching pods to reservations**), and a pod without the label is never JIT-eligible either. Unset = disabled |
 | `PREEMPTION_LEAD_MINUTES` | `15` | Minutes before a reservation slot boundary that phase-A preemption runs |
@@ -663,7 +663,7 @@ The Dockerfile builds a minimal image:
 - Base: `python:3.13-slim`
 - Non-root user `appuser` (UID 1000)
 - Health check: `GET http://localhost:8000/health`
-- Entrypoint: `uvicorn app.main:app --host 0.0.0.0 --port 8000`
+- Entrypoint: `python -m app.main` (starts uvicorn programmatically so `HTTP_PORT` controls the bind port)
 
 A Helm chart at `helm/gpu-reservation-controller/` renders the
 ServiceAccount, ClusterRole/Binding, Deployment, and `/health` Service; keep

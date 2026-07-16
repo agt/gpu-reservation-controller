@@ -43,18 +43,23 @@ config:
   # Seconds between reservation refresh cycles.
   reservationFetchInterval: 300
 
-  # Seconds between queue-processor ticks (pod LIST frequency).
-  podListTickInterval: 300
+  # Seconds between queue-processor ticks (the whole work-queue loop: pod LIST,
+  # JIT lease retries, no-show cancels, overstay adoption).
+  # (Legacy env name POD_LIST_TICK_INTERVAL is still honored by the code.)
+  queueProcessorInterval: 300
 
   # Calendar days ahead to fetch reservations.
   reservationLookaheadDays: 7
 
-  # Port for the GET /health liveness endpoint.
-  healthPort: 8000
+  # Bind port for the whole HTTP listener (GET /health liveness plus the inbound
+  # push and preemption-risk forecast APIs).
+  # (Legacy env name HEALTH_PORT is still honored by the code.)
+  httpPort: 8000
 
-  # Enable JIT on-demand reservation requests for pending pods with no open
-  # reservation window (set to false to disable).
-  ondemandPlacementEnabled: true
+  # Enable the JIT on-demand lease path: request a real on-demand reservation for
+  # a pending pod with no open reservation window (set to false to disable).
+  # (Legacy env name ONDEMAND_PLACEMENT_ENABLED is still honored by the code.)
+  ondemandLeaseEnabled: true
 
   # Reserved-match horizon (minutes) for the JIT trigger: a pod is queued for
   # its own reservation when one opens now or within this many minutes and has
@@ -76,11 +81,11 @@ config:
   # Minutes after a reservation window opens before the holder is declared a
   # no-show and the controller durably cancels it app-side, freeing the
   # window for re-booking.
-  noshownTimeoutMinutes: 15
+  noshowTimeoutMinutes: 15
 
   # Grace period (minutes) after controller startup before no-shows are
   # declared for windows already in progress.
-  noshownGraceMinutes: 30
+  noshowGraceMinutes: 30
 
   # IANA timezone; affects log timestamp display only (reservation window
   # arithmetic is UTC-based and does not depend on it).

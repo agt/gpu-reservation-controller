@@ -26,12 +26,15 @@ _CONFIG_ENV = [
     "RESERVATION_FETCH_INTERVAL",
     "RESERVATION_LOOKAHEAD_DAYS",
     "KUBECONFIG",
+    "HTTP_PORT",
     "HEALTH_PORT",
+    "ONDEMAND_LEASE_ENABLED",
     "ONDEMAND_PLACEMENT_ENABLED",
     "NOSHOW_TIMEOUT_MINUTES",
     "NOSHOWN_TIMEOUT_MINUTES",
     "NOSHOW_GRACE_MINUTES",
     "NOSHOWN_GRACE_MINUTES",
+    "QUEUE_PROCESSOR_INTERVAL",
     "POD_LIST_TICK_INTERVAL",
     "POD_SCHEDULING_GATE_NAME",
     "PREEMPTION_LEAD_MINUTES",
@@ -76,10 +79,11 @@ class TestConfigFromEnv:
         c = Config.from_env()
         assert c.reservation_api_url == "http://x"   # trailing slash stripped
         assert c.log_level == "INFO"
-        assert c.noshown_timeout_minutes == 15
-        assert c.noshown_grace_minutes == 30
-        assert c.pod_list_tick_interval == 300
-        assert c.ondemand_placement_enabled is True
+        assert c.noshow_timeout_minutes == 15
+        assert c.noshow_grace_minutes == 30
+        assert c.queue_processor_interval == 300
+        assert c.http_port == 8000
+        assert c.ondemand_lease_enabled is True
         assert c.scheduling_gate_name is None
         assert c.preemption_lead_minutes == 15
         assert c.preemption_check_interval == 60
@@ -94,7 +98,7 @@ class TestConfigFromEnv:
         monkeypatch.setenv("RESERVATION_API_KEY", "k")
         monkeypatch.setenv("NOSHOW_TIMEOUT_MINUTES", "7")
         monkeypatch.setenv("NOSHOWN_TIMEOUT_MINUTES", "99")
-        assert Config.from_env().noshown_timeout_minutes == 7
+        assert Config.from_env().noshow_timeout_minutes == 7
 
     def test_noshow_legacy_alias_still_honored(self, monkeypatch):
         from app.config import Config
@@ -103,7 +107,49 @@ class TestConfigFromEnv:
         monkeypatch.setenv("RESERVATION_API_URL", "http://x")
         monkeypatch.setenv("RESERVATION_API_KEY", "k")
         monkeypatch.setenv("NOSHOWN_GRACE_MINUTES", "42")
-        assert Config.from_env().noshown_grace_minutes == 42
+        assert Config.from_env().noshow_grace_minutes == 42
+
+    def _base_env(self, monkeypatch):
+        _clean_env(monkeypatch)
+        monkeypatch.setenv("RESERVATION_API_URL", "http://x")
+        monkeypatch.setenv("RESERVATION_API_KEY", "k")
+
+    @pytest.mark.parametrize("canonical,legacy,attr,default,new_val,legacy_val", [
+        ("HTTP_PORT", "HEALTH_PORT", "http_port", 8000, 9001, 9002),
+        ("QUEUE_PROCESSOR_INTERVAL", "POD_LIST_TICK_INTERVAL",
+         "queue_processor_interval", 300, 45, 90),
+    ])
+    def test_renamed_int_alias(self, monkeypatch, canonical, legacy, attr,
+                               default, new_val, legacy_val):
+        # The renamed int vars fall back to their legacy spelling, and the
+        # canonical name wins when both are set (same contract as NOSHOW_*).
+        from app.config import Config
+
+        self._base_env(monkeypatch)
+        assert getattr(Config.from_env(), attr) == default
+
+        self._base_env(monkeypatch)
+        monkeypatch.setenv(legacy, str(legacy_val))
+        assert getattr(Config.from_env(), attr) == legacy_val
+
+        self._base_env(monkeypatch)
+        monkeypatch.setenv(canonical, str(new_val))
+        monkeypatch.setenv(legacy, str(legacy_val))
+        assert getattr(Config.from_env(), attr) == new_val
+
+    def test_ondemand_lease_enabled_legacy_alias(self, monkeypatch):
+        # ONDEMAND_LEASE_ENABLED replaces the misleading ONDEMAND_PLACEMENT_ENABLED;
+        # the old name still turns the JIT lease path off.
+        from app.config import Config
+
+        self._base_env(monkeypatch)
+        monkeypatch.setenv("ONDEMAND_PLACEMENT_ENABLED", "false")
+        assert Config.from_env().ondemand_lease_enabled is False
+
+        self._base_env(monkeypatch)
+        monkeypatch.setenv("ONDEMAND_LEASE_ENABLED", "true")
+        monkeypatch.setenv("ONDEMAND_PLACEMENT_ENABLED", "false")
+        assert Config.from_env().ondemand_lease_enabled is True
 
     @pytest.mark.parametrize("value,expected", [
         ("false", False), ("0", False), ("no", False), ("FALSE", False),
@@ -115,8 +161,8 @@ class TestConfigFromEnv:
         _clean_env(monkeypatch)
         monkeypatch.setenv("RESERVATION_API_URL", "http://x")
         monkeypatch.setenv("RESERVATION_API_KEY", "k")
-        monkeypatch.setenv("ONDEMAND_PLACEMENT_ENABLED", value)
-        assert Config.from_env().ondemand_placement_enabled is expected
+        monkeypatch.setenv("ONDEMAND_LEASE_ENABLED", value)
+        assert Config.from_env().ondemand_lease_enabled is expected
 
     @pytest.mark.parametrize("value,expected", [
         ("true", True), ("1", True), ("yes", True), ("TRUE", True),

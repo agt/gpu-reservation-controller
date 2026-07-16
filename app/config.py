@@ -13,14 +13,20 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 _FALSY = frozenset({"0", "false", "no", "off"})
 
 
-def _env_bool(name: str, default: bool) -> bool:
+def _env_bool(name: str, default: bool, legacy: Optional[str] = None) -> bool:
     """Read a boolean-ish environment variable with an explicit default.
 
     Replaces the per-flag ``.lower() not in (...)`` / ``in (...)`` one-liners,
     which disagreed with each other (and with the app) on which spellings count
     — e.g. ``on`` enabled an app flag but not a controller one.
+
+    ``legacy`` names a deprecated spelling that is still honored when the
+    canonical ``name`` is unset, so renaming an env var never breaks an existing
+    deployment (the same backward-compat pattern as :func:`_env_alias`).
     """
     raw = os.environ.get(name)
+    if raw is None and legacy is not None:
+        raw = os.environ.get(legacy)
     if raw is None:
         return default
     value = raw.strip().lower()
@@ -31,6 +37,17 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _env_alias(canonical: str, legacy: str, default: str) -> str:
+    """Read a string env var, preferring the canonical spelling.
+
+    Falls back to the deprecated ``legacy`` alias (grep-hostile ``NOSHOWN_*``,
+    the old ``HEALTH_PORT`` / ``POD_LIST_TICK_INTERVAL`` / ``ONDEMAND_PLACEMENT_*``
+    names, …) so existing deployments keep working after a rename, then to
+    ``default`` when neither is set (CODE-REVIEW H3).
+    """
+    return os.environ.get(canonical) or os.environ.get(legacy) or default
+
+
 @dataclass(frozen=True)
 class Config:
     reservation_api_url: str
@@ -38,11 +55,11 @@ class Config:
     reservation_fetch_interval: int   # seconds between refresh cycles
     reservation_lookahead_days: int   # how many calendar days ahead to fetch
     kubeconfig_path: Optional[str]    # None → use in-cluster service account
-    health_port: int
-    ondemand_placement_enabled: bool  # enable/disable on-demand pod placement
-    noshown_timeout_minutes: int   # minutes after slot_start before no-show is declared
-    noshown_grace_minutes: int     # grace period when controller starts mid-window
-    pod_list_tick_interval: int    # seconds between queue-processor ticks
+    http_port: int                    # bind port for the whole FastAPI listener
+    ondemand_lease_enabled: bool      # enable/disable the JIT on-demand lease path
+    noshow_timeout_minutes: int    # minutes after slot_start before no-show is declared
+    noshow_grace_minutes: int      # grace period when controller starts mid-window
+    queue_processor_interval: int  # seconds between queue-processor ticks
     scheduling_gate_name: Optional[str]  # SchedulingGate to remove on admission; None = disabled
     inbound_api_token: Optional[str]  # bearer token for the inbound push API; None = endpoint disabled
     preemption_lead_minutes: int   # lead time before a slot boundary for phase-A preemption
@@ -69,11 +86,6 @@ class Config:
                 "RESERVATION_API_KEY environment variable is required"
             )
 
-        def _noshow(canonical: str, legacy: str, default: str) -> str:
-            # Prefer the NOSHOW_* spelling; fall back to the legacy grep-hostile
-            # NOSHOWN_* name so existing deployments keep working (CODE-REVIEW H3).
-            return os.environ.get(canonical) or os.environ.get(legacy, default)
-
         return cls(
             reservation_api_url=url,
             reservation_api_key=key,
@@ -84,16 +96,18 @@ class Config:
                 os.environ.get("RESERVATION_LOOKAHEAD_DAYS", "7")
             ),
             kubeconfig_path=os.environ.get("KUBECONFIG") or None,
-            health_port=int(os.environ.get("HEALTH_PORT", "8000")),
-            ondemand_placement_enabled=_env_bool("ONDEMAND_PLACEMENT_ENABLED", True),
-            noshown_timeout_minutes=int(
-                _noshow("NOSHOW_TIMEOUT_MINUTES", "NOSHOWN_TIMEOUT_MINUTES", "15")
+            http_port=int(_env_alias("HTTP_PORT", "HEALTH_PORT", "8000")),
+            ondemand_lease_enabled=_env_bool(
+                "ONDEMAND_LEASE_ENABLED", True, legacy="ONDEMAND_PLACEMENT_ENABLED"
             ),
-            noshown_grace_minutes=int(
-                _noshow("NOSHOW_GRACE_MINUTES", "NOSHOWN_GRACE_MINUTES", "30")
+            noshow_timeout_minutes=int(
+                _env_alias("NOSHOW_TIMEOUT_MINUTES", "NOSHOWN_TIMEOUT_MINUTES", "15")
             ),
-            pod_list_tick_interval=int(
-                os.environ.get("POD_LIST_TICK_INTERVAL", "300")
+            noshow_grace_minutes=int(
+                _env_alias("NOSHOW_GRACE_MINUTES", "NOSHOWN_GRACE_MINUTES", "30")
+            ),
+            queue_processor_interval=int(
+                _env_alias("QUEUE_PROCESSOR_INTERVAL", "POD_LIST_TICK_INTERVAL", "300")
             ),
             scheduling_gate_name=os.environ.get("POD_SCHEDULING_GATE_NAME") or None,
             required_group_label=os.environ.get("REQUIRED_GROUP_LABEL") or None,
