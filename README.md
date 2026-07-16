@@ -184,6 +184,18 @@ GPU class is stuck in Pending (admitted but the scheduler cannot place it),
 lease requests are suspended for that class until the stuck pod is resolved.
 Other GPU classes are unaffected.
 
+**Per-node feasibility (guard 5)** — GPUs are node-scoped: a pod requesting N
+`nvidia.com/gpu` only schedules if a *single* node has N free (Kubernetes never
+splits a job across nodes).  Before requesting a lease for a **multi-GPU (≥2)**
+pod, the controller checks the largest single-node free block for its class
+(computed each queue-processor tick from a per-node inventory + pod snapshot —
+`nodes: list`, no new RBAC).  If no single node can host it, the request is held
+and retried, rather than minting an SU-charged lease that could never schedule
+onto fragmented capacity.  A class with no per-node data yet does not block
+(fail-open); 1-GPU pods are unaffected.  (Node-aware *preemption* — freeing a
+whole node for a reserved multi-GPU booking — is planned follow-up work; the
+preemption sweep is still per-class.)
+
 **No-show → cancel** — if a reservation holder fails to launch a pod within
 `NOSHOW_TIMEOUT_MINUTES` of the window opening, the controller durably
 cancels the reservation (`POST /api/reservations/{id}/cancel`,

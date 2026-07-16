@@ -368,11 +368,13 @@ two-step **preflight → delegate → grant** pipeline.
 - **Preflight** (`_preflight_ondemand_candidate`): re-reads the pod (drops it
   if gone/terminal/Unknown), re-runs step 1 above (a matching reservation may
   have appeared since the candidate was queued), applies guard 1
-  (`is_gpu_only_pending`) and guard 3 (`stuck_holder_gpu_classes`), and resolves
-  the pod's `gpu-class` label to a numeric id via `ControllerState.gpu_class_ids`.
-  Survivors become an `OnDemandAdmissionCandidate` — the exact "ask" (username,
-  group, class id, gpu count, and `duration_seconds = minimum-runtime +
-  ONDEMAND_LEASE_BUFFER_MINUTES * 60`, default buffer 10 min).
+  (`is_gpu_only_pending`), guard 3 (`stuck_holder_gpu_classes`), guard 4
+  (`overcommitted_gpu_classes`), and guard 5 (per-node feasibility — see
+  **Per-node capacity accounting** below), and resolves the pod's `gpu-class`
+  label to a numeric id via `ControllerState.gpu_class_ids`.  Survivors become an
+  `OnDemandAdmissionCandidate` — the exact "ask" (username, group, class id, gpu
+  count, and `duration_seconds = minimum-runtime + ONDEMAND_LEASE_BUFFER_MINUTES
+  * 60`, default buffer 10 min).
 - **Delegate** (only when `ONDEMAND_DELEGATE_ADMISSION` is on): the whole
   survivor set is offered to the app in one call
   (`POST /api/reservations/ondemand-admission`,
@@ -482,6 +484,53 @@ the JIT/on-demand path is gated; reserved-path admission under a real user
 booking is untouched (a booking already implies the app granted real calendar
 capacity).  **RBAC**: none new — the audit reuses the existing `nodes: list`
 permission.
+
+### Per-node capacity accounting
+
+Extended resources (`nvidia.com/gpu`) are **node-scoped and atomic**: the
+Kubernetes scheduler only places an N-GPU pod on a *single* node with N free, or
+leaves it Pending — it never splits a job across nodes.  The controller therefore
+cannot (and need not) enforce single-node placement.  But its own budget/capacity
+accounting is otherwise **per-class and count-based** (`available`,
+`free_capacity_by_class`, `snapshot_node_gpu_capacity`), which is exactly right
+for 1-GPU jobs (any free GPU is interchangeable) yet **blind to fragmentation**
+for multi-GPU jobs: a class can show enough free GPUs in aggregate while they are
+scattered one-per-node so no single node can host a 2+ GPU pod.
+
+Per-node accounting closes that blind spot for the **JIT on-demand path**, using
+data already fetched (no new API calls, no new RBAC):
+
+- `k8s_client.snapshot_node_gpu_inventory` returns allocatable GPUs **per class,
+  per node** (`{gpu_class: {node_name: allocatable}}`); `snapshot_node_gpu_capacity`
+  is now a per-class collapse of it.  `ToleratedPodInfo` / `PodRuntimeView` carry
+  `node_name` (`spec.nodeName`), captured through `_pod_view`.
+- Two pure helpers in `controller.py`: `free_gpus_by_node_class` (per-node free =
+  allocatable minus the GPUs of bound, node-resident, non-terminating pods on that
+  node — an unscheduled pod belongs to no node and counts against none) and
+  `largest_node_free_by_class` (the largest single-node opening per class).  Because
+  GPU nodes are tainted `gpu-class-reservation=<class>:NoSchedule`, controller-tolerated
+  pods are the only GPU consumers on them, so a tolerated-pods-only occupancy count is
+  accurate.
+- `ControllerState.node_free_by_class` (largest single-node free GPUs per class) is
+  refreshed every `queue_processor_loop` tick from a node-inventory + tolerated-pod
+  snapshot.  **Fail-safe**: if either snapshot fails, the prior map is left unchanged
+  (never open admission on unknown physical state).
+
+**Guard 5** (`_preflight_ondemand_candidate`): a JIT candidate requesting **≥2
+GPUs** whose `gpu-class` has a *known* largest-single-node-free below the ask is
+short-retried rather than granted — the controller does not mint an SU-charged
+lease the pod could never schedule under.  **Fail-open on unknown**: a class absent
+from `node_free_by_class` (no data yet, or a snapshot gap) never blocks, so a stale
+map cannot wedge admission; the reactive guard-3 interlock and the compensating
+cancel in `_grant_and_admit` remain the backstop.  The 1-GPU path is unaffected.
+
+Two node-aware consumers are **deliberately deferred** to a follow-up: preemption
+victim-targeting (concentrating kills on one node so a reserved multi-GPU booking
+can land — today the sweep still frees GPUs per class, count-based) and the
+preemption-risk forecast's shortfall (still per-class).  Guard 5 is a per-candidate
+feasibility check against a snapshot, not batch-level bin-packing: two ≥2-GPU
+candidates can both pass against the same single-node opening in one batch, with
+guard 3 backstopping the loser.
 
 ### Inbound push API
 

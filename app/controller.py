@@ -121,6 +121,48 @@ def free_capacity_by_class(
     }
 
 
+def free_gpus_by_node_class(
+    capacity_by_node_class: dict[str, dict[str, int]],
+    pods: "list[PodRuntimeView]",
+) -> dict[str, dict[str, int]]:
+    """Return free GPUs per node, per class: allocatable minus node-resident use.
+
+    *capacity_by_node_class* is ``{gpu_class: {node_name: allocatable}}`` (from
+    ``k8s_client.snapshot_node_gpu_inventory``).  A pod is subtracted from the
+    node it is bound to only when it is actually occupying a GPU there —
+    ``node_name`` is set (scheduled), ``node_resident`` (not terminal), and not
+    ``terminating`` (its GPUs are being recovered).  An unscheduled pod
+    (``node_name is None``) belongs to no node and counts against none.  A pod on
+    a node/class absent from the inventory is ignored (its physical capacity is
+    unknown).  A returned value may be negative (more in use than the snapshot
+    says exists).  Pure — no I/O, no mutation of the inputs.
+    """
+    free = {gpu_class: dict(nodes) for gpu_class, nodes in capacity_by_node_class.items()}
+    for p in pods:
+        if not p.node_name or not p.node_resident or p.terminating:
+            continue
+        per_node = free.get(p.gpu_class)
+        if per_node is not None and p.node_name in per_node:
+            per_node[p.node_name] -= p.gpu_count
+    return free
+
+
+def largest_node_free_by_class(
+    free_by_node_class: dict[str, dict[str, int]],
+) -> dict[str, int]:
+    """Collapse per-node free GPUs to the largest *single-node* opening per class.
+
+    ``{gpu_class: max over nodes of free}``.  A multi-GPU pod requesting ``g``
+    GPUs of a class can only schedule if some single node has ``g`` free, so this
+    is the number an admission feasibility check compares against.  A class with
+    no nodes maps to ``0``.  Pure.
+    """
+    return {
+        gpu_class: max(nodes.values(), default=0)
+        for gpu_class, nodes in free_by_node_class.items()
+    }
+
+
 class CapacityDiff(NamedTuple):
     """One class where the app-side and physical GPU counts disagree.
 
@@ -238,6 +280,7 @@ class PodRuntimeView:
     node_resident: bool            # Running, or (Pending and not scheduled_false)
     terminating: bool              # metadata.deletionTimestamp is set
     group_label: Optional[str] = None  # value of REQUIRED_GROUP_LABEL pod label; None when disabled
+    node_name: Optional[str] = None    # spec.nodeName; None until the pod is scheduled onto a node
 
 
 @dataclass
@@ -545,6 +588,17 @@ class ControllerState:
         # queue_processor_loop tick.  On-demand placement is held for any class
         # in this set; other classes are unaffected.  Empty = no interlock.
         self.stuck_holder_gpu_classes: set[str] = set()
+
+        # Per-node feasibility (guard 5): the largest number of free GPUs on any
+        # *single* node, per GPU-class label (max over nodes of allocatable minus
+        # node-resident use — see controller.largest_node_free_by_class).  A
+        # multi-GPU on-demand candidate is held when no single node can host it,
+        # so the controller does not mint an SU-charged lease that can never
+        # schedule.  Refreshed each queue_processor_loop tick from a node-inventory
+        # + tolerated-pod snapshot; a class absent from the map is "unknown" and
+        # never blocks (fail-open); a failed snapshot leaves the prior map intact
+        # (fail-safe).  Empty = no data yet.
+        self.node_free_by_class: dict[str, int] = {}
 
         # No-show tracking:
         # Maps reservation_id → deadline by which a matching pod must appear.

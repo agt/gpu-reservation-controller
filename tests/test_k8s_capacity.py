@@ -1,8 +1,10 @@
-"""Tests for k8s_client.snapshot_node_gpu_capacity.
+"""Tests for the k8s_client node/pod capacity snapshots.
 
-Uses SimpleNamespace node stubs and a fake ``_core_v1.list_node`` (no real
-Kubernetes client), matching the ``monkeypatch`` / ``asyncio.run`` convention
-used for the other async k8s_client wrappers.
+Covers ``snapshot_node_gpu_capacity`` (per-class totals), its per-node primitive
+``snapshot_node_gpu_inventory``, and the ``node_name`` capture added to
+``snapshot_tolerated_pods``.  Uses SimpleNamespace stubs and a fake ``_core_v1``
+(no real Kubernetes client), matching the ``monkeypatch`` / ``asyncio.run``
+convention used for the other async k8s_client wrappers.
 """
 
 from __future__ import annotations
@@ -158,3 +160,125 @@ class TestSnapshotNodeGpuCapacity:
 
     def test_no_nodes(self, monkeypatch):
         assert _run_snapshot(monkeypatch, []) == {}
+
+
+# ---------------------------------------------------------------------------
+# snapshot_node_gpu_inventory — the per-node primitive
+# ---------------------------------------------------------------------------
+
+
+def _run_inventory(monkeypatch, nodes: list) -> dict[str, dict[str, int]]:
+    monkeypatch.setattr(k8s_client, "_core_v1", _FakeCoreV1(nodes))
+    return asyncio.run(k8s_client.snapshot_node_gpu_inventory(TAINT_KEY))
+
+
+class TestSnapshotNodeGpuInventory:
+    def test_per_node_breakdown(self, monkeypatch):
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")], allocatable={"nvidia.com/gpu": "4"}),
+            _node("n2", taints=[_taint(TAINT_KEY, "h100")], allocatable={"nvidia.com/gpu": "8"}),
+        ]
+        assert _run_inventory(monkeypatch, nodes) == {"h100": {"n1": 4, "n2": 8}}
+
+    def test_multiple_classes_bucketed_by_node(self, monkeypatch):
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")], allocatable={"nvidia.com/gpu": "4"}),
+            _node("n2", taints=[_taint(TAINT_KEY, "a100")], allocatable={"nvidia.com/gpu": "2"}),
+        ]
+        assert _run_inventory(monkeypatch, nodes) == {
+            "h100": {"n1": 4},
+            "a100": {"n2": 2},
+        }
+
+    def test_unschedulable_and_deleting_nodes_excluded(self, monkeypatch):
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "4"}, unschedulable=True),
+            _node("n2", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "4"}, deleting=True),
+            _node("n3", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "4"}),
+        ]
+        assert _run_inventory(monkeypatch, nodes) == {"h100": {"n3": 4}}
+
+    def test_garbage_and_missing_allocatable_treated_as_zero(self, monkeypatch):
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "not-a-number"}),
+            _node("n2", taints=[_taint(TAINT_KEY, "h100")], allocatable={}),
+        ]
+        assert _run_inventory(monkeypatch, nodes) == {"h100": {"n1": 0, "n2": 0}}
+
+    def test_untainted_node_ignored(self, monkeypatch):
+        nodes = [_node("n1", taints=[], allocatable={"nvidia.com/gpu": "4"})]
+        assert _run_inventory(monkeypatch, nodes) == {}
+
+    def test_capacity_is_the_per_class_sum_of_the_inventory(self, monkeypatch):
+        """``snapshot_node_gpu_capacity`` must equal the collapsed inventory."""
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")], allocatable={"nvidia.com/gpu": "4"}),
+            _node("n2", taints=[_taint(TAINT_KEY, "h100")], allocatable={"nvidia.com/gpu": "8"}),
+            _node("n3", taints=[_taint(TAINT_KEY, "a100")], allocatable={"nvidia.com/gpu": "2"}),
+        ]
+        inventory = _run_inventory(monkeypatch, nodes)
+        capacity = _run_snapshot(monkeypatch, nodes)
+        assert capacity == {
+            gpu_class: sum(per_node.values())
+            for gpu_class, per_node in inventory.items()
+        }
+        assert capacity == {"h100": 12, "a100": 2}
+
+
+# ---------------------------------------------------------------------------
+# snapshot_tolerated_pods — node_name capture
+# ---------------------------------------------------------------------------
+
+
+class _FakeCoreV1Pods:
+    def __init__(self, pods: list):
+        self._pods = pods
+
+    def list_pod_for_all_namespaces(self, label_selector=None):
+        return SimpleNamespace(items=self._pods)
+
+
+def _tolerated_pod(
+    name: str, *, uid: str, node_name, gpu_class: str = "h100", gpu_count: int = 1
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        metadata=SimpleNamespace(
+            namespace="alice",
+            name=name,
+            uid=uid,
+            labels={"gpu-class": gpu_class},
+            annotations={"horae/booking-reference": "res-1"},
+            deletion_timestamp=None,
+        ),
+        status=SimpleNamespace(phase="Running", conditions=None),
+        spec=SimpleNamespace(
+            node_name=node_name,
+            tolerations=[
+                SimpleNamespace(key=TAINT_KEY, value=gpu_class, effect="NoSchedule")
+            ],
+            containers=[
+                SimpleNamespace(
+                    resources=SimpleNamespace(
+                        requests={"nvidia.com/gpu": str(gpu_count)}
+                    )
+                )
+            ],
+        ),
+    )
+
+
+class TestSnapshotToleratedPodsNodeName:
+    def test_captures_node_name_and_none_when_unscheduled(self, monkeypatch):
+        pods = [
+            _tolerated_pod("p1", uid="u1", node_name="n1"),
+            _tolerated_pod("p2", uid="u2", node_name=None),  # scheduled nowhere yet
+        ]
+        monkeypatch.setattr(k8s_client, "_core_v1", _FakeCoreV1Pods(pods))
+        out = asyncio.run(k8s_client.snapshot_tolerated_pods(TAINT_KEY))
+        by_uid = {p.uid: p for p in out}
+        assert by_uid["u1"].node_name == "n1"
+        assert by_uid["u2"].node_name is None
