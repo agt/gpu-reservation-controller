@@ -497,6 +497,8 @@ class TestTryRequestLease:
 
         assert result is True  # dropped: our toleration cannot help
         assert client.create_requests == []
+        # A definite (non-GPU) verdict is not "awaiting the scheduler".
+        assert candidate.awaiting_schedule_signal is False
 
     def test_guard1_indeterminate_short_retries(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -519,6 +521,9 @@ class TestTryRequestLease:
         assert result is False
         assert candidate.next_attempt_at > before
         assert client.create_requests == []
+        # Indeterminate guard-1 parks the candidate on the scheduler's verdict;
+        # the flag lets a subsequent MODIFIED re-attempt it immediately.
+        assert candidate.awaiting_schedule_signal is True
 
     def test_guard3_stuck_holder_interlock_short_retries(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -542,6 +547,10 @@ class TestTryRequestLease:
         assert result is False
         assert candidate.next_attempt_at > before
         assert client.create_requests == []
+        # The scheduler *has* rendered a GPU-only verdict; the candidate is held
+        # by the interlock, not awaiting the scheduler — so the flag stays False
+        # and its (jittered) backoff is never short-circuited by a MODIFIED.
+        assert candidate.awaiting_schedule_signal is False
 
     def test_unresolved_gpu_class_id_retries_without_requesting(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -797,3 +806,120 @@ class TestRunOndemandAdmission:
         # The nested trigger did not launch a parallel batch; the outer loop ran
         # the trailing pass and cleared the flag.
         assert state.ondemand_rerun_requested is False
+
+
+# ---------------------------------------------------------------------------
+# pod_watch_loop: MODIFIED-driven fast re-attempt on the scheduler's verdict
+# ---------------------------------------------------------------------------
+
+
+class _FakeWatcher:
+    """Yields a fixed list of (event_type, pod) events, then stops."""
+
+    def __init__(self, events):
+        self._events = events
+
+    async def events(self):
+        for ev in self._events:
+            yield ev
+
+
+def _watch_config():
+    """Minimal config for driving pod_watch_loop (only the attributes it reads)."""
+    return SimpleNamespace(
+        ondemand_horizon_minutes=30,
+        required_group_label=None,
+        ondemand_lease_enabled=True,
+        scheduling_gate_name=None,
+    )
+
+
+def _pending_jit_pod(*, uid="uid-1", conditions=None):
+    """A Pending, JIT-eligible pod: gpu-class label + min-runtime / usage-group
+    annotations, no toleration.  *conditions* drives is_gpu_only_pending."""
+    return SimpleNamespace(
+        metadata=SimpleNamespace(
+            uid=uid, name="pod-1", namespace=USERNAME,
+            annotations={
+                "horae/minimum-runtime-seconds": "600",
+                "horae/usage-group": GROUP_NAME,
+            },
+            labels={"gpu-class": GPU_CLASS_LABEL},
+        ),
+        status=SimpleNamespace(phase="Pending", conditions=conditions),
+        spec=SimpleNamespace(tolerations=[], containers=[], scheduling_gates=None),
+    )
+
+
+class TestScheduleSignalFastPath:
+    """The MODIFIED carrying the scheduler's verdict re-attempts a parked JIT
+    candidate immediately, instead of waiting for a periodic scan."""
+
+    def _run_with(self, monkeypatch, m, state, events):
+        """Drive pod_watch_loop over *events*, capturing _run_ondemand_admission
+        calls (which are otherwise wired to the network)."""
+        calls: list = []
+
+        async def fake_admission(st, cl, cfg):
+            calls.append((st, cl, cfg))
+
+        monkeypatch.setattr(m, "_run_ondemand_admission", fake_admission)
+        monkeypatch.setattr(m, "PodWatcher", lambda **kw: _FakeWatcher(events))
+        asyncio.run(m.pod_watch_loop(state, None, _watch_config()))
+        return calls
+
+    def test_verdict_modified_retriggers_parked_candidate(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        state = _state_ready()
+        candidate = _candidate("uid-1")
+        candidate.awaiting_schedule_signal = True
+        candidate.next_attempt_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        state.ondemand_candidates["uid-1"] = candidate
+        before = candidate.next_attempt_at
+
+        # The scheduler has now recorded a GPU-only Unschedulable verdict.
+        events = [("MODIFIED", _pending_jit_pod(conditions=[_gpu_only_condition()]))]
+        calls = self._run_with(monkeypatch, m, state, events)
+
+        assert len(calls) == 1  # batch was kicked
+        assert candidate.awaiting_schedule_signal is False  # flag cleared
+        assert candidate.next_attempt_at < before  # phantom cooldown reset to now
+
+    def test_unflagged_candidate_is_not_retriggered(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        state = _state_ready()
+        candidate = _candidate("uid-1")
+        candidate.awaiting_schedule_signal = False  # e.g. parked on a denial backoff
+        cooldown = datetime.now(timezone.utc) + timedelta(minutes=5)
+        candidate.next_attempt_at = cooldown
+        state.ondemand_candidates["uid-1"] = candidate
+
+        events = [("MODIFIED", _pending_jit_pod(conditions=[_gpu_only_condition()]))]
+        calls = self._run_with(monkeypatch, m, state, events)
+
+        assert calls == []  # no batch: an unflagged candidate is left alone
+        assert candidate.next_attempt_at == cooldown  # backoff untouched
+
+    def test_verdict_still_absent_does_not_retrigger(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        state = _state_ready()
+        candidate = _candidate("uid-1")
+        candidate.awaiting_schedule_signal = True
+        state.ondemand_candidates["uid-1"] = candidate
+
+        # A reconcile MODIFIED with no PodScheduled verdict yet (conditions=None
+        # → is_gpu_only_pending returns None): keep waiting, do not kick a batch.
+        events = [("MODIFIED", _pending_jit_pod(conditions=None))]
+        calls = self._run_with(monkeypatch, m, state, events)
+
+        assert calls == []
+        assert candidate.awaiting_schedule_signal is True  # still parked
+
+    def test_modified_for_untracked_pod_is_ignored(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        state = _state_ready()  # no candidates tracked
+
+        events = [("MODIFIED", _pending_jit_pod(conditions=[_gpu_only_condition()]))]
+        calls = self._run_with(monkeypatch, m, state, events)
+
+        assert calls == []

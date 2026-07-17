@@ -348,11 +348,20 @@ without the toleration,
    **required** natural key app-side) — it becomes an
    `OnDemandCandidate` and, on the **ADDED** event, kicks an immediate
    admission batch (`main._run_ondemand_admission`) covering it plus every
-   other due waiter.  `MODIFIED` events do **not** re-trigger a batch — denial
-   and guard short-retries ride the queue-processor tick — so a burst of
-   reconcile `MODIFIED`s cannot hammer the app (the trade-off: a pod whose
-   `PodScheduled` condition is not yet set at ADDED time waits for the next
-   tick instead of resolving in ~30 s).
+   other due waiter.  Most `MODIFIED` events do **not** re-trigger a batch —
+   denial and guard short-retries ride the queue-processor tick — so a burst of
+   reconcile `MODIFIED`s cannot hammer the app.  The **one** exception is the
+   `MODIFIED` that carries the scheduler's verdict: when a fresh pod's
+   `PodScheduled` condition is not yet set at ADDED time, guard 1 is
+   indeterminate and the candidate is parked with `awaiting_schedule_signal`;
+   the `MODIFIED` that finally sets the condition (`is_gpu_only_pending` now
+   returns non-`None`) clears the flag, resets the candidate's cooldown, and
+   re-attempts immediately — resolving in ~1 s + a lease round-trip instead of
+   waiting up to a full periodic scan (~270–300 s).  The flag is set **only** by
+   the indeterminate guard-1 branch, so this fast-path reset can never
+   short-circuit a 409-denial or guard-3/4 backoff, and it fires at most once
+   per park (the flag is cleared before the batch runs), preserving the
+   anti-hammer property.
 3. Otherwise, if `find_best_reservation` finds *any* future match (beyond the
    horizon, or over budget), the pod is queued for it anyway — this preserves
    the plain wait-for-window behaviour for a pod that isn't JIT-eligible.

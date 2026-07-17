@@ -680,6 +680,11 @@ async def _preflight_ondemand_candidate(
 
     # Guard 1: GPU-only-pending check.
     gpu_only = is_gpu_only_pending(fresh_pod)
+    # Record *why* the candidate is (or isn't) waiting: True only when the
+    # scheduler has not yet recorded a verdict (gpu_only is None), so the
+    # MODIFIED-driven fast re-attempt in pod_watch_loop fires solely for this
+    # case and never short-circuits a denial or guard-3/4 backoff.
+    candidate.awaiting_schedule_signal = gpu_only is None
     if gpu_only is False:
         log.info(
             "On-demand candidate %s/%s: not GPU-only-pending (%r); dropping",
@@ -1078,8 +1083,12 @@ async def pod_watch_loop(
       else the ``horae/usage-group`` annotation — the lease ask's required
       ``group_name``) → add as a candidate and attempt a lease request
       immediately
-    - MODIFIED for a tracked candidate (respecting its retry cooldown) →
-      attempt again, so a guard-1 short retry resolves quickly
+    - MODIFIED carrying the scheduler's verdict (``PodScheduled`` now set) for a
+      tracked candidate that was parked on an indeterminate guard-1 result →
+      re-attempt immediately, so a fresh pod does not wait a full periodic scan.
+      Other MODIFIED events do NOT re-trigger a batch (denial and guard retries
+      ride the queue-processor tick), so a reconcile-MODIFIED burst cannot
+      hammer the reservation app.
     - DELETED or terminal (Succeeded/Failed) → release any held slot, and if the
       pod was admitted under a JIT on-demand lease, cancel that lease too
       (``_teardown_ondemand_lease`` — a lease covers only its one pod)
@@ -1251,11 +1260,42 @@ async def pod_watch_loop(
                     # Responsive path: a newly-discovered candidate kicks an
                     # immediate admission batch covering it plus every other due
                     # waiter (coalesced, so an ADDED burst does not launch a
-                    # batch per event).  MODIFIED events deliberately do NOT
-                    # re-trigger — denial and guard retries ride the
+                    # batch per event).  Most MODIFIED events deliberately do
+                    # NOT re-trigger — denial and guard retries ride the
                     # queue-processor tick — so a burst of reconcile MODIFIEDs
                     # cannot hammer the reservation app.
                     await _run_ondemand_admission(state, client, config)
+                elif event_type == "MODIFIED":
+                    # The one MODIFIED worth reacting to: the scheduler has just
+                    # recorded a verdict for a candidate we parked on an
+                    # indeterminate guard-1 result.  Without this, that candidate
+                    # waits up to a full periodic scan (~270-300 s) even though
+                    # it became admissible within ~1 s of ADDED.
+                    #
+                    # Tightly scoped so the anti-hammer property holds:
+                    # is_gpu_only_pending() is a pure in-memory check on the
+                    # watch object (no API call), and only a tracked candidate
+                    # still flagged awaiting_schedule_signal can trigger — so an
+                    # ordinary reconcile MODIFIED costs one boolean and returns.
+                    # The flag is cleared before the batch runs (fires at most
+                    # once per park), and because only the guard-1-None branch
+                    # sets it, resetting next_attempt_at here can never defeat a
+                    # denial or guard-3/4 backoff.
+                    candidate = state.ondemand_candidates.get(uid)
+                    if (
+                        candidate is not None
+                        and candidate.awaiting_schedule_signal
+                        and is_gpu_only_pending(pod) is not None
+                    ):
+                        candidate.awaiting_schedule_signal = False
+                        candidate.next_attempt_at = datetime.now(timezone.utc)
+                        log.debug(
+                            "On-demand candidate %s/%s: scheduling verdict "
+                            "arrived; re-attempting immediately",
+                            namespace,
+                            name,
+                        )
+                        await _run_ondemand_admission(state, client, config)
                 continue
 
             # Not JIT-eligible (missing the min-runtime annotation, the
