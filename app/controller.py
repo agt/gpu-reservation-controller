@@ -260,6 +260,12 @@ class OnDemandCandidate:
     # horae/usage-group annotation.  JIT eligibility requires it, so it is only
     # Optional to keep dataclass field ordering.
     usage_group: Optional[str] = None
+    # Set True only while the candidate is parked on an indeterminate guard-1
+    # result (the scheduler has not yet recorded a PodScheduled verdict).  A
+    # MODIFIED watch event carrying that verdict re-attempts immediately instead
+    # of waiting for a periodic scan; other cooldowns (denial, guard-3/4) leave
+    # this False so they are never short-circuited.  See main.pod_watch_loop.
+    awaiting_schedule_signal: bool = False
 
 
 @dataclass(frozen=True)
