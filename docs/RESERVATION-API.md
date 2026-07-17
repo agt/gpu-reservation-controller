@@ -379,6 +379,7 @@ reason. Requires a `read_write` service key (or an admin JWT).
 | `"no-show"` | The reservation holder never ran pods (applies to leases and to already-started bookings) |
 | `"controller-revoked"` | The controller released a lease grant it never admitted a pod under (e.g. a budget race, or controller shutdown) |
 | `"pod-terminated"` | The lease's pod finished, crashed, or was removed, so the controller released the now-unneeded lease |
+| `"superseded"` | The controller merged the lease's pod into the user's now-open matching booking; the lease is retired **penalty-exempt** (only already-consumed time is charged — the booking re-covers its remaining time). Same retention math as a `continue` source |
 
 Scope:
 
@@ -391,8 +392,11 @@ Scope:
 The retained SU charge is the standard, unwaived late-cancellation charge —
 identical to the member cancelling at that instant (time already consumed in
 full, plus the fraction-of-cost penalty on the unused remainder inside the next
-24 h; short remainders are forgiven by the exemption). The reason is stored in
-`cancel_reason` and appears in all reservation responses.
+24 h; short remainders are forgiven by the exemption). The **one exception** is
+`reason: "superseded"`, which is penalty-exempt: only already-consumed time is
+retained (the merged-into booking re-covers the remaining time, so charging a
+penalty would double-charge it). The reason is stored in `cancel_reason` and
+appears in all reservation responses.
 
 **Responses**
 

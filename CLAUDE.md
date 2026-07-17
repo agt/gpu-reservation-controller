@@ -288,6 +288,51 @@ become admittable for it, it is routed to the reserved queue instead of
 requesting a lease — the pre-admission analogue of adoption, before there is
 even a pod to preempt.
 
+### Merging a JIT lease into a matching booking
+
+A user who starts a pod **before** their booked window opens is admitted under a
+just-in-time on-demand **lease** (`kind="on_demand"`; see **Just-in-time (JIT)
+on-demand leases**).  Once that user's matching **booking** window opens, the
+lease and the booking cover the same job — double-holding capacity and
+double-charging SU on any overlap — until the pod happens to fall past its lease
+guarantee and adoption re-links it.  **Merge** (`ONDEMAND_MERGE_ENABLED`, default
+on) closes that gap proactively: as soon as the booking is open, the pod is
+re-linked onto it and the lease is retired — **without** waiting for the lease
+guarantee to lapse (the one intended difference from adoption).
+
+`ControllerState.plan_ondemand_merges` (pure) is the planner: it pairs a pod
+whose **current** reservation is a live `kind="on_demand"` lease with a
+currently-open booking the same user holds that has spare budget
+(`find_open_booking_for` — budget-based, **not** equal-`gpu_count`, so a pod using
+**fewer** GPUs than the booking reserved still merges, which chaining never
+could).  It is the proactive sibling of `plan_pod_adoptions`, sharing the same
+occupancy-budget tally, but drops the `_past_guarantee` gate.  A pod whose
+current reservation is already a booking, or that has no open booking, is left
+untouched (a pod still in its **pre-booking** window stays on its lease —
+correctly — until the booking opens).
+
+`_merge_ondemand_into_bookings` in `main.py` executes it, modelled on
+`_adopt_pods`: re-annotate the pod's `horae/booking-reference` to the booking
+(annotation-only patch), and **only on patch success** re-home occupancy
+(`relink_occupancy`), refresh the in-memory view, re-record the guarantee
+(now the booking's — up to its chain end), and emit an `OverstayRelinked` event.
+**Then** it retires the now-superfluous lease: cancels it **penalty-exempt**
+(`POST /api/reservations/{id}/cancel`, `reason="superseded"` — the app charges
+only already-consumed time, never a penalty on the unused tail, since the booking
+re-covers the lease's remaining time) and drops it from `state.reservations`.
+Ordering is deliberate — re-link **first** (the pod is never stranded without a
+reservation), cancel **second**.  A cancel that does not land parks the lease id
+in `ControllerState.pending_ondemand_merge_cancels`, retried every
+queue-processor tick by `_drain_pending_merge_cancels` (mirroring
+`pending_noshow_cancels`); the lease's short natural expiry is the backstop.
+
+Merge runs in the same two places adoption does — inside `_run_preemption_sweep`
+**before** victims are planned (a merged pod is on its booking and can never be a
+victim) and once per **queue-processor tick** — always **before** `_adopt_pods`,
+threading one shared view list so a just-merged pod is not re-processed by
+adoption.  **RBAC / config**: no new Kubernetes permissions (merge reuses the
+existing pod-patch + cancel paths).
+
 ### Timezone
 
 All reservation window arithmetic uses **UTC-aware `datetime` objects** (`timezone.utc`).
@@ -701,6 +746,7 @@ the claimed set and the grace re-arm path above applies.
 | `CAPACITY_CHECK_INTERVAL` | `3600` | Seconds between app-side vs physical GPU capacity audits; each audit logs per-class differences as WARNING and pauses on-demand admission for classes the app over-counts (see **App-side vs physical capacity reconciliation**) |
 | `PREEMPTION_DELEGATE_SELECTION` | `true` | Ask the app to choose preemption victims from the eligible pool (`POST /api/reservations/preemption-victims`); `false` (or any app-call failure) falls back to local uniform-random selection |
 | `POD_ADOPTION_ENABLED` | `true` | Re-link an overstay pod to a reservation its user has since booked (see **Adopting overstay pods into a re-booked reservation**); `false` disables |
+| `ONDEMAND_MERGE_ENABLED` | `true` | Merge a JIT on-demand lease's pod into the user's matching booking the moment that booking's window opens — re-link the pod and retire the lease penalty-exempt, without waiting for the lease guarantee to lapse (see **Merging a JIT lease into a matching booking**); `false` disables (the pod then converges lazily via adoption once past its lease guarantee) |
 | `LOG_LEVEL` | `INFO` | Root Python logging level (parsed by `config.py`) |
 
 ---

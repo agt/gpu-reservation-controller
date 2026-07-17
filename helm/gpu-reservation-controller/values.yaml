@@ -124,6 +124,12 @@ config:
   # for preemption.  Set to false to disable.
   podAdoptionEnabled: true
 
+  # Merge a JIT on-demand lease's pod into the user's matching booking the moment
+  # that booking's window opens (re-link the pod, retire the lease penalty-exempt),
+  # without waiting for the lease guarantee to lapse.  Set to false to disable
+  # (the pod then converges lazily via adoption once past its lease guarantee).
+  ondemandMergeEnabled: true
+
   # Delegate preemption victim selection to the reservation app
   # (POST /api/reservations/preemption-victims) so prioritisation policy lives
   # there.  Set to false — or let any app-call failure occur — to fall back to

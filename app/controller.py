@@ -623,6 +623,14 @@ class ControllerState:
         # app-side cancel is what actually frees the window for re-booking.
         self.pending_noshow_cancels: set[int] = set()
 
+        # On-demand lease ids whose pod has been merged into a now-open matching
+        # booking but whose penalty-exempt cancel (reason="superseded") has not
+        # yet landed.  Populated by _merge_ondemand_into_bookings when the cancel
+        # fails; drained every queue-processor tick until it succeeds so a merged
+        # lease never lingers holding capacity / accruing SU.  In-memory only
+        # (a restart re-derives the merge from the pod's booking-reference).
+        self.pending_ondemand_merge_cancels: set[int] = set()
+
         # Reservation ids currently "claimed" by a live reserved-path holder pod
         # — each holder's booking reservation plus the back-to-back chain its
         # runtime cap extends across (see reservations_claimed_by).  A reservation
@@ -1653,6 +1661,67 @@ class ControllerState:
             ):
                 continue
             if not self._past_guarantee(p, now):
+                continue
+            res = self.find_open_booking_for(
+                p.namespace,
+                p.gpu_class,
+                now,
+                p.gpu_count,
+                extra_used=extra_used,
+                group_label=p.group_label,
+            )
+            if res is None or res.id == p.reservation_id:
+                continue
+            assignments.append((p, res))
+            extra_used[res.id] = extra_used.get(res.id, 0) + p.gpu_count
+        return assignments
+
+    def plan_ondemand_merges(
+        self,
+        pods: list[PodRuntimeView],
+        now: datetime,
+    ) -> list[tuple[PodRuntimeView, ReservationResponse]]:
+        """Plan (but do not execute) merges of JIT-lease pods into an open booking.
+
+        The proactive counterpart to ``plan_pod_adoptions``: when a user starts a
+        pod *before* their booked window opens, the controller admits it under a
+        just-in-time on-demand **lease** (``kind="on_demand"``).  Once that user's
+        matching **booking** window opens, the lease and the booking are two
+        reservations covering the same job — double-holding capacity and
+        double-charging SU on any overlap — until the pod happens to fall past its
+        lease guarantee and ``plan_pod_adoptions`` re-links it.  This planner
+        re-links such a pod as soon as the booking is open, **without** waiting
+        for the lease guarantee to lapse (the one intended difference from
+        ``plan_pod_adoptions``), so the caller can retire the lease immediately.
+
+        A pod qualifies when it is controller-admitted, physically present
+        (``node_resident``, not ``terminating``, ``gpu_count > 0``), its current
+        reservation is a live ``kind="on_demand"`` lease, and the same user holds
+        a currently-open booking with spare budget (``find_open_booking_for`` —
+        which checks *budget*, not equal ``gpu_count``, so a pod using **fewer**
+        GPUs than the booking reserved still merges).  A pod whose current
+        reservation is already a booking, or that has no open booking to merge
+        into, is left untouched (it stays on its lease — correctly — until the
+        booking opens).
+
+        Budget is respected across the pass with a running per-reservation tally
+        (mirrors ``plan_pod_adoptions``).  Pure — no I/O, no state mutation; the
+        caller performs the annotation patch, occupancy re-home, and lease cancel.
+        """
+        assignments: list[tuple[PodRuntimeView, ReservationResponse]] = []
+        extra_used: dict[int, int] = {}
+        for p in pods:
+            if (
+                p.reservation_id is None
+                or not p.node_resident
+                or p.terminating
+                or p.gpu_count <= 0
+            ):
+                continue
+            current = next(
+                (r for r in self.reservations if r.id == p.reservation_id), None
+            )
+            if current is None or current.kind != "on_demand":
                 continue
             res = self.find_open_booking_for(
                 p.namespace,
