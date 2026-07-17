@@ -49,6 +49,7 @@ class Config:
     preemption_lead_minutes: int   # lead time before a slot boundary for phase-A preemption
     preemption_check_interval: int  # seconds between preemption sweeps
     pod_adoption_enabled: bool = True  # re-link overstay pods to a user's new booking
+    ondemand_merge_enabled: bool = True  # merge a JIT lease's pod into a now-open matching booking
     preemption_delegate_selection: bool = True  # ask the app to choose victims; local random fallback
     ondemand_delegate_admission: bool = False  # ask the app which pending pods to admit; grant-all fallback
     required_group_label: Optional[str] = None  # pod label naming the usage group to match; None = disabled
@@ -101,6 +102,7 @@ class Config:
                 os.environ.get("PREEMPTION_CHECK_INTERVAL", "60")
             ),
             pod_adoption_enabled=_env_bool("POD_ADOPTION_ENABLED", True),
+            ondemand_merge_enabled=_env_bool("ONDEMAND_MERGE_ENABLED", True),
             preemption_delegate_selection=_env_bool(
                 "PREEMPTION_DELEGATE_SELECTION", True
             ),

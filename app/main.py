@@ -1450,16 +1450,24 @@ async def queue_processor_loop(
         if snapshot is not None:
             await _cancel_pending_noshows(state, client, snapshot)
 
-        # Adopt overstay pods whose user has re-booked capacity: re-link them to
-        # the new reservation so they stop surfacing as overstay even when no
-        # boundary is near for the preemption sweep to act on.  Held under the
-        # reservation lock (unlike the rest of this tick) so a concurrent
-        # fetch/push cannot swap the reservation set across the patch awaits.
-        if config.pod_adoption_enabled and snapshot is not None:
+        # Merge JIT-lease pods into a now-open matching booking, then adopt
+        # overstay pods whose user has re-booked capacity: both re-link pods to a
+        # reservation the user holds (the merge additionally retires the lease),
+        # so they stop surfacing as overstay even when no boundary is near for the
+        # preemption sweep to act on.  Held under the reservation lock (unlike the
+        # rest of this tick) so a concurrent fetch/push cannot swap the
+        # reservation set across the patch awaits.  The same view list is threaded
+        # through both so a just-merged pod is not re-processed by adoption.
+        if snapshot is not None and (
+            config.ondemand_merge_enabled or config.pod_adoption_enabled
+        ):
             async with state.reservation_lock:
-                await _adopt_pods(
-                    state, config, [_pod_view(p) for p in snapshot], now
-                )
+                views = [_pod_view(p) for p in snapshot]
+                await _merge_ondemand_into_bookings(state, client, config, views, now)
+                await _adopt_pods(state, config, views, now)
+        # Retry any merged-lease cancels that did not land on an earlier tick so a
+        # merged lease never lingers holding capacity / accruing SU.
+        await _drain_pending_merge_cancels(state, client)
 
         # Guard 3: refresh safety interlock from the same snapshot.
         if config.ondemand_lease_enabled and snapshot is not None:
@@ -1703,6 +1711,141 @@ async def _adopt_pods(
             )
 
 
+async def _merge_ondemand_into_bookings(
+    state: ControllerState,
+    client: ReservationClient,
+    config: Config,
+    pods: list[PodRuntimeView],
+    now: datetime,
+) -> None:
+    """Merge a JIT on-demand lease's pod into a now-open matching booking.
+
+    Caller must hold ``state.reservation_lock`` and pass the ``pods`` list it
+    derived from a fresh ``snapshot_tolerated_pods``.  For each merge planned by
+    ``plan_ondemand_merges`` (a pod running under a ``kind="on_demand"`` lease
+    whose user now holds an open matching booking), re-link the pod's
+    booking-reference to the booking — the same annotation-only patch
+    ``_adopt_pods`` performs — and, **only on patch success**, retire the lease:
+    cancel it penalty-exempt (``reason="superseded"``, so the app charges only
+    already-consumed time, never a penalty on the unused tail — the pod's future
+    time is re-covered by the booking) and drop it from ``state.reservations``.
+
+    Ordering is deliberate: the pod is re-linked to the booking **first** (so it
+    is never left stranded without a reservation), then the lease is cancelled.
+    If the cancel does not land, the lease id is parked in
+    ``state.pending_ondemand_merge_cancels`` for the queue processor to retry —
+    the pod is already safely on its booking, and the lease's short natural
+    expiry is the backstop.  Each pod is independently best-effort: a patch
+    failure logs a warning and never deletes the pod.  *pods* is mutated in place
+    so subsequent adoption planning in the same tick sees the new binding.
+    """
+    if not config.ondemand_merge_enabled:
+        return
+    for view, res_new in state.plan_ondemand_merges(pods, now):
+        lease_id = view.reservation_id
+        booking_reference = make_booking_reference(res_new.id)
+        try:
+            fresh_pod = await read_pod(view.name, view.namespace)
+            if is_terminal_phase(fresh_pod):
+                continue
+            await apply_toleration(
+                view.name,
+                view.namespace,
+                fresh_pod,
+                TOLERATION_KEY,
+                view.gpu_class,
+                booking_reference,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Failed to merge on-demand pod %s/%s into booking #%d: %s",
+                view.namespace,
+                view.name,
+                res_new.id,
+                exc,
+            )
+            continue
+
+        # Patch landed: re-home occupancy and refresh the in-memory view so the
+        # merged pod contributes zero demand and is guaranteed by the booking.
+        state.relink_occupancy(view.uid, res_new.id, view.gpu_count)
+        idx = pods.index(view)
+        pods[idx] = replace(view, reservation_id=res_new.id)
+
+        guaranteed_until = state.compute_guaranteed_until(now, res_new)
+        log.info(
+            "Merged on-demand pod %s/%s from lease #%s into booking #%d "
+            "(guaranteed until %s)",
+            view.namespace,
+            view.name,
+            lease_id,
+            res_new.id,
+            guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        await _record_guarantee(
+            view.name, view.namespace, fresh_pod, guaranteed_until, now
+        )
+        try:
+            await emit_overstay_relinked_event(
+                fresh_pod, view.name, view.namespace, res_new.id, guaranteed_until
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Could not emit OverstayRelinked event for merged pod %s/%s: %s",
+                view.namespace,
+                view.name,
+                exc,
+            )
+
+        # Retire the now-superfluous lease (penalty-exempt: its future time is
+        # re-covered by the booking).  Best-effort; parks for retry on failure.
+        if lease_id is not None:
+            await _cancel_merged_lease(state, client, lease_id)
+
+
+async def _cancel_merged_lease(
+    state: ControllerState, client: ReservationClient, lease_id: int
+) -> None:
+    """Cancel a lease whose pod merged into a booking; park for retry on failure.
+
+    Caller holds ``state.reservation_lock``.  Cancels the lease penalty-exempt
+    (``reason="superseded"``) and, on success, drops it from
+    ``state.reservations`` so it stops holding capacity; on failure the id is
+    added to ``state.pending_ondemand_merge_cancels`` for
+    ``_drain_pending_merge_cancels`` to retry.  A row that is already gone or no
+    longer an active lease is simply discarded from the retry set.  Idempotent
+    and best-effort, mirroring ``_teardown_ondemand_lease``.
+    """
+    res = next((r for r in state.reservations if r.id == lease_id), None)
+    if res is None or res.status != "active" or res.kind != "on_demand":
+        state.pending_ondemand_merge_cancels.discard(lease_id)
+        return
+    if await client.cancel_reservation(lease_id, "superseded"):
+        state.reservations = [r for r in state.reservations if r.id != lease_id]
+        state.pending_ondemand_merge_cancels.discard(lease_id)
+    else:
+        state.pending_ondemand_merge_cancels.add(lease_id)
+
+
+async def _drain_pending_merge_cancels(
+    state: ControllerState, client: ReservationClient
+) -> None:
+    """Retry penalty-exempt cancels for merged leases that did not land earlier.
+
+    A merge re-links the pod to its booking immediately, but the lease cancel is
+    best-effort; a failed cancel parks the lease id in
+    ``state.pending_ondemand_merge_cancels``.  This drains that set (mirroring
+    ``_cancel_pending_noshows``) so a merged lease never lingers holding capacity
+    / accruing SU.  Held under the reservation lock so a concurrent fetch/push
+    cannot swap the reservation set across the cancel awaits.
+    """
+    if not state.pending_ondemand_merge_cancels:
+        return
+    async with state.reservation_lock:
+        for lease_id in sorted(state.pending_ondemand_merge_cancels):
+            await _cancel_merged_lease(state, client, lease_id)
+
+
 def _build_selection_request(need: BoundaryPreemptionNeed) -> PreemptionSelectionRequest:
     """Flatten a boundary's per-class candidate pool into an app request body."""
     candidates = [
@@ -1824,10 +1967,12 @@ async def _run_preemption_sweep(
 
     async with state.reservation_lock:
         pods = [_pod_view(p) for p in snapshot]
-        # Rescue overstay pods whose user has re-booked capacity before planning
-        # any kills: an adopted pod's occupancy re-homes to its new reservation
+        # Merge a JIT lease's pod into a now-open matching booking, then rescue
+        # overstay pods whose user has re-booked capacity — both before planning
+        # any kills.  A merged/adopted pod's occupancy re-homes to its booking
         # (zeroing that boundary's demand) and its refreshed view is no longer
         # past-guarantee, so it can never be selected as a victim.
+        await _merge_ondemand_into_bookings(state, client, config, pods, now)
         await _adopt_pods(state, config, pods, now)
         doomed: set[str] = set()
         to_kill: list[tuple[PodRuntimeView, str]] = []
