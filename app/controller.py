@@ -20,7 +20,7 @@ import logging
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, NamedTuple, Optional
+from typing import Iterable, Literal, NamedTuple, Optional
 
 from .schemas import ReservationResponse
 
@@ -557,7 +557,12 @@ class GuaranteeStatus:
     """
 
     view: PodRuntimeView
-    status: str                          # "guaranteed" | "overstay"
+    # The two literals mirror k8s_client.GUARANTEE_STATUS_GUARANTEED /
+    # _OVERSTAY (kept as bare strings here so controller.py stays free of
+    # k8s_client imports); annotate_runtime_guarantee stamps the same values at
+    # admission, so they must not drift or the diff-and-skip reconcile would
+    # re-patch every pod every tick.
+    status: Literal["guaranteed", "overstay"]
     guaranteed_until: Optional[datetime]  # live end when guaranteed; None when overstay
 
 
@@ -2244,6 +2249,10 @@ class ControllerState:
         report a guarantee for.
         """
         out: dict[str, GuaranteeStatus] = {}
+        # The "guaranteed" / "overstay" literals below must match the values
+        # k8s_client.annotate_runtime_guarantee stamps at admission (see
+        # GuaranteeStatus) — a drift would make _apply_guarantee_status re-patch
+        # every pod on every tick.
         for p in pods:
             if p.reservation_id is None:
                 continue
