@@ -609,3 +609,90 @@ class TestTerminationWarnings:
 
         assert writes == []
         assert clears == []
+
+    def test_phase_a_victim_warned_beyond_kill_window(self, monkeypatch):
+        """The headline case: an overstayer whose boundary sits *beyond* the kill
+        window is warned in advance (never possible before the horizon was
+        decoupled from the kill lead).  now = S − 25m, lead 15m → S is outside
+        the (S−40, S−10] kill window but inside the 30m warning horizon, so the
+        pod is warned but not killed, with terminate_at = the future kill-window
+        start S − lead."""
+        m = _main_module(monkeypatch)
+        state = _state(_overstayer(2, "alice", 1), _boundary_reservation(1, gpu_count=1))
+        config = _config(
+            preemption_lead_minutes=15, termination_warning_lead_minutes=30
+        )
+
+        pod = _pod("v1", booking_reference="res-2", reservation_id=2, gpu_count=1)
+        deleted, _events = _patch_snapshots(
+            monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 1}
+        )
+        writes, clears = _patch_warnings(monkeypatch, m)
+
+        asyncio.run(m._run_preemption_sweep(state, config, now=S - timedelta(minutes=25)))
+
+        assert deleted == []          # S is beyond the kill window — no phase-A kill yet
+        assert clears == []
+        assert len(writes) == 1
+        namespace, name, at, risk, _msg = writes[0]
+        assert (namespace, name) == (USERNAME, "pod-v1")
+        assert at == S - timedelta(minutes=15)   # kill-window start, in the future
+        assert risk == "1.00"
+
+    def test_warning_horizon_gated_by_config(self, monkeypatch):
+        """Same setup, but a warning horizon equal to the kill lead leaves S out
+        of reach: no boundary is in scope at all, so nothing is warned — proving
+        the knob controls the look-ahead."""
+        m = _main_module(monkeypatch)
+        state = _state(_overstayer(2, "alice", 1), _boundary_reservation(1, gpu_count=1))
+        config = _config(
+            preemption_lead_minutes=15, termination_warning_lead_minutes=15
+        )
+
+        pod = _pod("v1", booking_reference="res-2", reservation_id=2, gpu_count=1)
+        deleted, _events = _patch_snapshots(
+            monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 1}
+        )
+        writes, clears = _patch_warnings(monkeypatch, m)
+
+        asyncio.run(m._run_preemption_sweep(state, config, now=S - timedelta(minutes=25)))
+
+        assert deleted == []
+        assert writes == []
+        assert clears == []
+
+    def test_warning_cleared_when_rebook_extends_guarantee(self, monkeypatch):
+        """A pod carrying a warning whose user has since re-booked a back-to-back
+        follow-on window: its guarantee now grows past the boundary, so it drops
+        out of the at-risk pool and the stale warning is retracted."""
+        m = _main_module(monkeypatch)
+        # alice's holder res-2 ends at S; the back-to-back res-3 (start S) chains
+        # her guarantee to S+2h, past the boundary bob's res-1 opens at.
+        rebook = reservation(
+            3,
+            start_utc=S,
+            end_utc=S + timedelta(hours=2),
+            gpu_count=1,
+            gpu_class_label=GPU_CLASS_LABEL,
+            username="alice",
+            user_id=1,
+        )
+        state = _state(
+            _victim_ending_at_boundary(), rebook, _boundary_reservation(1, gpu_count=1)
+        )
+        config = _config(preemption_lead_minutes=15)
+
+        pod = _pod(
+            "v1", booking_reference="res-2", reservation_id=2, gpu_count=1,
+            termination_warning_at=S_ISO, termination_warning_risk="1.00",
+        )
+        deleted, _events = _patch_snapshots(
+            monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 1}
+        )
+        writes, clears = _patch_warnings(monkeypatch, m)
+
+        asyncio.run(m._run_preemption_sweep(state, config, now=S - timedelta(minutes=10)))
+
+        assert deleted == []          # protected — guarantee now outlasts the boundary
+        assert writes == []
+        assert clears == [(USERNAME, "pod-v1")]

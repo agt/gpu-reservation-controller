@@ -523,16 +523,22 @@ class TerminationWarning:
     """One at-risk pod's projected preemption, for the warning annotations.
 
     Produced by ``ControllerState.plan_termination_warnings``.  ``terminate_at``
-    is the *soonest* upcoming booking boundary at which the pod is an eligible
-    preemption victim in a class that is short on capacity; ``risk`` is that
-    boundary's ``min(1, shortfall / pool_gpus)`` (the uniform-random local
-    selection model — pool *membership* is exact, the number models the
-    fallback).  Purely informational: the controller stamps these onto the pod
-    and never reads them back to make a decision.
+    is the projected *kill instant* — ``max(boundary − lead, guarantee_end)`` —
+    at the *soonest* upcoming booking boundary where the pod is an eligible
+    preemption victim in a class that is short on capacity.  This is the
+    kill-window start the sweep would actually delete the pod at (phase A runs
+    ``lead`` minutes *before* the boundary; a pod already past its guarantee is
+    killed then, not at the boundary), matching the forecast API's model.  For a
+    phase-B victim whose guarantee ends exactly at the boundary it degrades to
+    the boundary itself.  ``risk`` is that boundary's
+    ``min(1, shortfall / pool_gpus)`` (the uniform-random local selection model —
+    pool *membership* is exact, the number models the fallback).  Purely
+    informational: the controller stamps these onto the pod and never reads them
+    back to make a decision.
     """
 
     view: PodRuntimeView
-    terminate_at: datetime   # soonest at-risk boundary
+    terminate_at: datetime   # projected kill instant at the soonest at-risk boundary
     risk: float              # (0, 1] at that boundary
 
 
@@ -2130,6 +2136,7 @@ class ControllerState:
         capacity_by_class: dict[str, int],
         pods: list[PodRuntimeView],
         now: datetime,
+        lead: timedelta,
     ) -> dict[str, "TerminationWarning"]:
         """Identify pods at risk of preemption at an upcoming boundary.
 
@@ -2146,12 +2153,26 @@ class ControllerState:
           ``kills_needed``-sized subset — the app's victim-selection policy is
           opaque, so any pool member could be chosen.
 
-        *boundaries* are the sweep's in-scope boundaries (``upcoming_boundaries``);
-        *pods* is the **post-kill** snapshot (the caller has removed pods it just
-        preempted), so ``free`` here already reflects the recovered capacity and
-        doomed pods can never be warned.  Iterating *boundaries* ascending means
-        a pod at risk at several boundaries keeps its **soonest** one (both the
-        ``terminate_at`` timestamp and the ``risk`` come from that boundary).
+        *boundaries* is the **warning look-ahead** set — the union of the sweep's
+        own kill window (``upcoming_boundaries``) with a wider forward horizon
+        (``forecast_boundaries(now, now + TERMINATION_WARNING_LEAD_MINUTES)``),
+        decoupled from the kill *lead* so a pod that will be a **phase-A** victim
+        (already past its guarantee, killed proactively at ``boundary − lead``)
+        is warned *before* its boundary enters the kill window rather than on the
+        same tick it is killed.  *pods* is the **post-kill** snapshot (the caller
+        has removed pods it just preempted), so ``free`` here already reflects the
+        recovered capacity and doomed pods can never be warned.  Iterating
+        *boundaries* ascending means a pod at risk at several boundaries keeps its
+        **soonest** one (both the ``terminate_at`` timestamp and the ``risk``
+        come from that boundary).
+
+        ``terminate_at`` is the projected **kill instant**
+        ``max(boundary − lead, guarantee_end)`` — the start of the sweep's kill
+        window and the earliest the pod could actually be deleted (phase A fires
+        at ``boundary − lead``, but never before the pod's own guarantee ends).
+        A fully-past-guarantee pod (``guarantee_end is None`` here, or already
+        elapsed) projects to ``boundary − lead``; a phase-B victim whose
+        guarantee ends at the boundary degrades to the boundary itself.
 
         Returns a map keyed by pod uid.  Pure — no I/O, no state mutation; the
         caller writes the annotations.
@@ -2175,7 +2196,14 @@ class ControllerState:
                 for p in need.eligible_by_class.get(gpu_class, []):
                     if p.uid in warnings:
                         continue  # a sooner boundary already claimed this pod
+                    # Project the kill-window start: phase A deletes an
+                    # already-past-guarantee pod at ``boundary − lead``, but
+                    # never before its own guarantee ends.
+                    kill_start = boundary - lead
+                    ge = guarantee_end_by_uid.get(p.uid)
+                    if ge is not None and ge > kill_start:
+                        kill_start = ge
                     warnings[p.uid] = TerminationWarning(
-                        view=p, terminate_at=boundary, risk=risk
+                        view=p, terminate_at=kill_start, risk=risk
                     )
         return warnings

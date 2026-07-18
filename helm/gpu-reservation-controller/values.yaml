@@ -136,6 +136,13 @@ config:
   # informational — nothing is enforced.  Set to false to disable.
   terminationWarningEnabled: true
 
+  # How far ahead (minutes) the termination-warning look-ahead scans for at-risk
+  # boundaries, decoupled from PREEMPTION_LEAD_MINUTES.  Larger than the kill lead
+  # so a pod killed proactively at boundary − lead (a "phase-A" victim) is warned
+  # before its boundary enters the kill window.  Larger = more advance notice but
+  # more speculative warnings on future demand that may change.
+  terminationWarningLeadMinutes: 30
+
   # Delegate preemption victim selection to the reservation app
   # (POST /api/reservations/preemption-victims) so prioritisation policy lives
   # there.  Set to false — or let any app-call failure occur — to fall back to

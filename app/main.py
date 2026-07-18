@@ -2020,7 +2020,19 @@ async def _run_preemption_sweep(
     lead = timedelta(minutes=config.preemption_lead_minutes)
     state.prune_preemption_marks(now, lead)
     boundaries = state.upcoming_boundaries(now, lead)
-    if not boundaries:
+    # Warnings look further ahead than the kill window (see the warn block under
+    # the lock): a phase-A victim's boundary can sit beyond the kill window yet
+    # still warrant advance notice, so the sweep must run — and take its
+    # snapshots — even when there are no kill-window boundaries.  forecast_boundaries
+    # is forward-only (never widens the already-open side) and drops no-shows;
+    # unioning with the kill window floors the horizon there.
+    warn_boundaries: list[datetime] = []
+    if config.termination_warning_enabled:
+        warning_lead = timedelta(minutes=config.termination_warning_lead_minutes)
+        warn_boundaries = sorted(
+            set(boundaries) | set(state.forecast_boundaries(now, now + warning_lead))
+        )
+    if not boundaries and not warn_boundaries:
         return
 
     try:
@@ -2095,7 +2107,7 @@ async def _run_preemption_sweep(
         if config.termination_warning_enabled:
             pods_after = [p for p in pods if p.uid not in doomed]
             warn_plan = state.plan_termination_warnings(
-                boundaries, capacity, pods_after, now
+                warn_boundaries, capacity, pods_after, now, lead
             )
 
         for victim, message in to_kill:

@@ -231,7 +231,7 @@ effect:   NoSchedule
 | `horae/booking-reference` | toleration applied | Identifies the reservation the pod was admitted under (`res-<id>` — the only prefix, since every admitted pod is tied to a real reservation, JIT or otherwise); the id is the key for the per-reservation GPU budget and for rebuilding occupancy from the cluster |
 | `horae/pod-runtime-limit-seconds` | guarantee recorded | The runtime guarantee's duration in seconds at admission time, for operator visibility and in-pod notification widgets; see *Runtime guarantees and demand-driven preemption* |
 | `horae/guaranteed-until` | guarantee recorded | The same guarantee as an absolute UTC ISO-8601 instant |
-| `horae/termination-warning-at` | at risk of preemption | Projected termination instant (the soonest upcoming boundary the pod is an eligible victim at, absolute UTC ISO-8601); cleared when the pod is no longer at risk. See *Termination-warning annotations* |
+| `horae/termination-warning-at` | at risk of preemption | Projected kill instant `max(boundary − lead, guarantee_end)` (the start of the sweep's kill window at the soonest boundary the pod is an eligible victim at, absolute UTC ISO-8601); cleared when the pod is no longer at risk. See *Termination-warning annotations* |
 | `horae/termination-warning-risk` | at risk of preemption | Preemption risk in (0, 1] at that boundary (`min(1, shortfall/pool_gpus)`, 2 decimals) |
 | `horae/termination-warning-message` | at risk of preemption | Human-readable warning text |
 
@@ -287,16 +287,22 @@ Kubernetes Event with reason `Preempted` before deletion.
 **Termination-warning annotations** (`TERMINATION_WARNING_ENABLED`, default on).
 After the sweep executes its kills, it stamps the **survivors still at risk** of
 preemption at an upcoming boundary with informational `horae/termination-warning-*`
-annotations (see the annotations table above): the projected termination time
-(the soonest boundary the pod is an eligible victim at), a risk score in (0, 1],
-and a human-readable message. Eligibility is evaluated *as of the boundary*, so a
-pod whose guarantee expires between now and the boundary is flagged. The full
-eligible pool of a short class is warned (the app's victim choice is opaque, so
-any pool member could be picked), the set is computed after the kills so a pod
-being preempted is never also warned, and a warning is **cleared** once the pod
-is no longer at risk (its user re-booked, demand evaporated, or it was adopted).
-Purely informational — nothing is enforced Kubernetes-side; a widget can surface
-it so a job checkpoints or re-books in time.
+annotations (see the annotations table above): the projected kill instant
+`max(boundary − lead, guarantee_end)` — the start of the kill window, so a pod
+killed proactively `lead` minutes before its boundary reports that earlier time
+— a risk score in (0, 1], and a human-readable message. The warning look-ahead is
+**decoupled from the kill lead** via `TERMINATION_WARNING_LEAD_MINUTES` (default
+30, wider than `PREEMPTION_LEAD_MINUTES`): the boundary set unions the sweep's own
+kill window with a wider forward horizon, so a **phase-A** victim (an overstayer
+killed proactively at `boundary − lead`) is warned *before* its boundary enters
+the kill window instead of on the same tick it is killed. Eligibility is evaluated
+*as of the boundary*, so a pod whose guarantee expires between now and the boundary
+is flagged. The full eligible pool of a short class is warned (the app's victim
+choice is opaque, so any pool member could be picked), the set is computed after
+the kills so a pod being preempted is never also warned, and a warning is
+**cleared** once the pod is no longer at risk (its user re-booked, demand
+evaporated, or it was adopted). Purely informational — nothing is enforced
+Kubernetes-side; a widget can surface it so a job checkpoints or re-books in time.
 
 **Adopting overstay pods into a re-booked reservation**
 (`POD_ADOPTION_ENABLED`, default on). Because pods overrun, a user may book a
@@ -375,7 +381,8 @@ All settings are supplied via environment variables.
 | `CAPACITY_CHECK_INTERVAL` | no | `3600` | Seconds between app-side vs physical GPU capacity audits (default hourly). Each audit compares the reservation app's per-class `total_gpus` against the GPUs physically present in the cluster, logs any difference as a **WARNING**, and pauses new on-demand admissions for any class the app over-counts until the deficiency clears |
 | `POD_ADOPTION_ENABLED` | no | `true` | Re-link an overstay pod to a reservation its user has since booked. Set to `false` to disable |
 | `ONDEMAND_MERGE_ENABLED` | no | `true` | Merge a JIT on-demand lease's pod into the user's matching booking the moment that booking's window opens — re-link the pod and retire the lease penalty-exempt (`reason="superseded"`), without waiting for the lease guarantee to lapse. Set to `false` to disable (the pod converges lazily via adoption once past its lease guarantee) |
-| `TERMINATION_WARNING_ENABLED` | no | `true` | After each preemption sweep, stamp pods still at risk of preemption at an upcoming boundary with informational `horae/termination-warning-*` annotations (projected termination time, risk score, message). Purely informational — nothing is enforced. Set to `false` to disable |
+| `TERMINATION_WARNING_ENABLED` | no | `true` | After each preemption sweep, stamp pods still at risk of preemption at an upcoming boundary with informational `horae/termination-warning-*` annotations (projected kill instant, risk score, message). Purely informational — nothing is enforced. Set to `false` to disable |
+| `TERMINATION_WARNING_LEAD_MINUTES` | no | `30` | How far ahead (minutes) the termination-warning look-ahead scans, decoupled from `PREEMPTION_LEAD_MINUTES` so a pod killed proactively at `boundary − lead` (a phase-A victim) is warned before its boundary enters the kill window; larger = more advance notice but more speculative warnings |
 | `REQUIRED_GROUP_LABEL` | no | *(absent)* | Pod label naming the usage group a pod belongs to (e.g. `dsmlp/course`). When set, the pod's value for this label must equal the reservation's group name — an additional match constraint alongside `gpu-class` — before the controller admits it, adopts it, or chain-extends its guarantee; a pod without the label is also never JIT-eligible. Unset disables the group constraint |
 | `LOG_LEVEL` | no | `INFO` | Python logging level for the controller |
 

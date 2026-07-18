@@ -37,6 +37,7 @@ from tests.conftest import reservation
 NOW = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)
 BOUNDARY = NOW + timedelta(minutes=10)
 BOUNDARY_ISO = "2024-01-15T09:10:00Z"
+LEAD = timedelta(minutes=15)   # PREEMPTION_LEAD_MINUTES default
 
 
 def _view(
@@ -87,9 +88,11 @@ class TestPlanTerminationWarnings:
             _view("v0", reservation_id=100),  # absent reservation → past guarantee
             _view("v1", reservation_id=101),
         ]
-        warn = state.plan_termination_warnings([BOUNDARY], {GPU_CLASS_LABEL: 2}, pods, NOW)
+        warn = state.plan_termination_warnings([BOUNDARY], {GPU_CLASS_LABEL: 2}, pods, NOW, LEAD)
         assert set(warn) == {"v0", "v1"}
-        assert warn["v0"].terminate_at == BOUNDARY
+        # Absent reservation → fully past guarantee → projected kill instant is
+        # the kill-window start, boundary − lead (phase A kills that early).
+        assert warn["v0"].terminate_at == BOUNDARY - LEAD
         assert warn["v0"].risk == 0.5   # shortfall 1 / pool 2
         assert warn["v1"].risk == 0.5
 
@@ -103,9 +106,9 @@ class TestPlanTerminationWarnings:
         pods = [_view("v0", reservation_id=100), _view("v1", reservation_id=101)]
         # Pass boundaries out of order to prove the planner sorts them.
         warn = state.plan_termination_warnings(
-            [b2, BOUNDARY], {GPU_CLASS_LABEL: 2}, pods, NOW
+            [b2, BOUNDARY], {GPU_CLASS_LABEL: 2}, pods, NOW, LEAD
         )
-        assert warn["v0"].terminate_at == BOUNDARY   # not b2
+        assert warn["v0"].terminate_at == BOUNDARY - LEAD   # soonest boundary (B1), not b2
         assert warn["v0"].risk == 1.0                # B1's value, not B2's 0.5
 
     def test_boundary_relative_eligibility_flags_soon_to_expire_pod(self):
@@ -124,9 +127,12 @@ class TestPlanTerminationWarnings:
         state = _state(holder, _booking(1, BOUNDARY, gpu_count=1))
         pod = _view("p", reservation_id=2)
 
-        warn = state.plan_termination_warnings([BOUNDARY], {GPU_CLASS_LABEL: 1}, [pod], NOW)
+        warn = state.plan_termination_warnings([BOUNDARY], {GPU_CLASS_LABEL: 1}, [pod], NOW, LEAD)
         assert set(warn) == {"p"}
         assert warn["p"].risk == 1.0
+        # Phase-B victim: guarantee ends AT the boundary, so the kill-window
+        # start max(boundary − lead, guarantee_end) degrades to the boundary.
+        assert warn["p"].terminate_at == BOUNDARY
 
         # Contrast: the sweep's own now-relative candidate planning skips it.
         need = state.plan_boundary_candidates(BOUNDARY, {GPU_CLASS_LABEL: 1}, [pod], NOW)
@@ -135,7 +141,7 @@ class TestPlanTerminationWarnings:
     def test_no_shortfall_no_warning(self):
         state = _state(_booking(1, BOUNDARY, gpu_count=1))
         pods = [_view("v0", reservation_id=100)]
-        warn = state.plan_termination_warnings([BOUNDARY], {GPU_CLASS_LABEL: 4}, pods, NOW)
+        warn = state.plan_termination_warnings([BOUNDARY], {GPU_CLASS_LABEL: 4}, pods, NOW, LEAD)
         assert warn == {}
 
     def test_shortfall_but_empty_pool_no_warning(self):
@@ -151,15 +157,48 @@ class TestPlanTerminationWarnings:
         )
         state = _state(holder, _booking(1, BOUNDARY, gpu_count=1))
         pod = _view("p", reservation_id=2)
-        warn = state.plan_termination_warnings([BOUNDARY], {GPU_CLASS_LABEL: 1}, [pod], NOW)
+        warn = state.plan_termination_warnings([BOUNDARY], {GPU_CLASS_LABEL: 1}, [pod], NOW, LEAD)
         assert warn == {}
 
     def test_risk_clamped_to_one(self):
         # demand 3, pool of a single 1-GPU pod → 3/1 clamps to 1.0.
         state = _state(_booking(1, BOUNDARY, gpu_count=3))
         pods = [_view("v0", reservation_id=100)]
-        warn = state.plan_termination_warnings([BOUNDARY], {GPU_CLASS_LABEL: 1}, pods, NOW)
+        warn = state.plan_termination_warnings([BOUNDARY], {GPU_CLASS_LABEL: 1}, pods, NOW, LEAD)
         assert warn["v0"].risk == 1.0
+
+    def test_phase_a_victim_projects_kill_window_start(self):
+        # A boundary well beyond the kill lead: a fully-past-guarantee pod is
+        # warned now, and terminate_at is the *future* kill-window start
+        # (boundary − lead), not the boundary itself — advance notice of the
+        # proactive phase-A kill.
+        far = NOW + timedelta(minutes=40)
+        state = _state(_booking(1, far, gpu_count=1))
+        pods = [_view("v0", reservation_id=100)]  # absent reservation → past guarantee
+        warn = state.plan_termination_warnings([far], {GPU_CLASS_LABEL: 1}, pods, NOW, LEAD)
+        assert set(warn) == {"v0"}
+        assert warn["v0"].terminate_at == far - LEAD == NOW + timedelta(minutes=25)
+
+    def test_guarantee_end_between_kill_start_and_boundary(self):
+        # A pod whose guarantee ends *between* boundary − lead and the boundary
+        # cannot be killed before its guarantee lapses, so terminate_at is
+        # clamped up to guarantee_end (not boundary − lead).
+        far = NOW + timedelta(minutes=40)          # kill-window start = NOW + 25m
+        guarantee_end = NOW + timedelta(minutes=30)  # between 25m and 40m
+        holder = reservation(
+            2,
+            start_utc=NOW - timedelta(minutes=30),
+            end_utc=guarantee_end,
+            gpu_count=1,
+            gpu_class_label=GPU_CLASS_LABEL,
+            username=USERNAME,
+            user_id=1,
+        )
+        state = _state(holder, _booking(1, far, gpu_count=1))
+        pod = _view("p", reservation_id=2)
+        warn = state.plan_termination_warnings([far], {GPU_CLASS_LABEL: 1}, [pod], NOW, LEAD)
+        assert set(warn) == {"p"}
+        assert warn["p"].terminate_at == guarantee_end
 
 
 # ---------------------------------------------------------------------------
