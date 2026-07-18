@@ -89,6 +89,8 @@ spec:
               value: {{ .Values.config.podAdoptionEnabled | quote }}
             - name: ONDEMAND_MERGE_ENABLED
               value: {{ .Values.config.ondemandMergeEnabled | quote }}
+            - name: TERMINATION_WARNING_ENABLED
+              value: {{ .Values.config.terminationWarningEnabled | quote }}
             - name: PREEMPTION_DELEGATE_SELECTION
               value: {{ .Values.config.preemptionDelegateSelection | quote }}
             {{- if .Values.inboundApiTokenSecret.name }}

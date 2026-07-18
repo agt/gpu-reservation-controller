@@ -130,6 +130,12 @@ config:
   # (the pod then converges lazily via adoption once past its lease guarantee).
   ondemandMergeEnabled: true
 
+  # Stamp pods at risk of demand-driven preemption with informational
+  # horae/termination-warning-* annotations (projected termination time, risk
+  # score, and a human-readable message) after each preemption sweep.  Purely
+  # informational — nothing is enforced.  Set to false to disable.
+  terminationWarningEnabled: true
+
   # Delegate preemption victim selection to the reservation app
   # (POST /api/reservations/preemption-victims) so prioritisation policy lives
   # there.  Set to false — or let any app-call failure occur — to fall back to

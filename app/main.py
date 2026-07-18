@@ -40,6 +40,7 @@ from .controller import (
     PodRuntimeView,
     PreemptionForecast,
     QueueEntry,
+    TerminationWarning,
     apply_push_to_active,
     build_preemption_plan,
     canceller_description,
@@ -54,7 +55,9 @@ from .k8s_client import (
     TERMINAL_PHASES,
     PodWatcher,
     annotate_runtime_guarantee,
+    annotate_termination_warning,
     apply_toleration,
+    clear_termination_warning,
     delete_pod,
     emit_overstay_relinked_event,
     emit_preempted_event,
@@ -1635,6 +1638,76 @@ async def _preempt_pod(
         log.warning("Could not delete pod %s/%s: %s", namespace, name, exc)
 
 
+def _termination_warning_message(at_str: str, risk_str: str) -> str:
+    """Build the human-readable ``horae/termination-warning-message`` value.
+
+    Rendered deterministically from the projected instant and risk so it only
+    changes when they do (keeping the no-op-skip comparison stable).
+    """
+    return (
+        f"At risk of preemption: this pod is at or nearing the end of its GPU "
+        f"runtime guarantee and may be terminated as early as {at_str} to free "
+        f"capacity for a reservation starting then (risk {risk_str}). Extend or "
+        f"re-book the reservation to retain capacity."
+    )
+
+
+async def _apply_termination_warnings(
+    snapshot: "list",
+    warn_plan: dict[str, TerminationWarning],
+    doomed: set[str],
+) -> None:
+    """Reconcile termination-warning annotations against *warn_plan*.
+
+    *snapshot* is the same ``snapshot_tolerated_pods`` list the sweep planned
+    from (each entry carries the pod's current warning annotations); *warn_plan*
+    is ``ControllerState.plan_termination_warnings`` output keyed by uid.  For
+    every snapshot pod not being preempted this tick (``uid not in doomed``):
+
+    - in *warn_plan* and its (at, risk) differ from what the pod carries → write
+      (``annotate_termination_warning``);
+    - not in *warn_plan* but currently carrying a warning → clear
+      (``clear_termination_warning``) — the pod left the at-risk pool;
+    - otherwise → no-op (skip the API round-trip; risk is compared at the
+      2-decimal precision it is written with, so an unchanged warning is stable).
+
+    Each pod is independently best-effort: a failure logs a warning and never
+    affects preemption.  Mirrors ``_record_guarantee``'s failure handling.
+    """
+    for p in snapshot:
+        if p.uid in doomed:
+            continue  # being deleted this tick; the delete removes any annotation
+        desired = warn_plan.get(p.uid)
+        try:
+            if desired is not None:
+                risk_str = f"{desired.risk:.2f}"
+                at_str = desired.terminate_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                if (
+                    p.termination_warning_at == at_str
+                    and p.termination_warning_risk == risk_str
+                ):
+                    continue  # unchanged — do not re-patch
+                await annotate_termination_warning(
+                    p.name,
+                    p.namespace,
+                    desired.terminate_at,
+                    risk_str,
+                    _termination_warning_message(at_str, risk_str),
+                )
+            elif (
+                p.termination_warning_at is not None
+                or p.termination_warning_risk is not None
+            ):
+                await clear_termination_warning(p.name, p.namespace)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Failed to reconcile termination warning on pod %s/%s: %s",
+                p.namespace,
+                p.name,
+                exc,
+            )
+
+
 async def _adopt_pods(
     state: ControllerState,
     config: Config,
@@ -2014,6 +2087,17 @@ async def _run_preemption_sweep(
                 doomed.add(victim.uid)
                 to_kill.append((victim, _preemption_message(state, victim, boundary, now)))
 
+        # After all kills are chosen, flag the post-kill survivors that are still
+        # at risk of preemption at an in-scope boundary (see
+        # plan_termination_warnings).  Computed under the lock because it reads
+        # reservation state; the annotation I/O runs after the lock is released.
+        warn_plan: dict[str, TerminationWarning] = {}
+        if config.termination_warning_enabled:
+            pods_after = [p for p in pods if p.uid not in doomed]
+            warn_plan = state.plan_termination_warnings(
+                boundaries, capacity, pods_after, now
+            )
+
         for victim, message in to_kill:
             log.info(
                 "Preempting pod %s/%s (gpu-class=%s, gpus=%d): %s",
@@ -2024,6 +2108,12 @@ async def _run_preemption_sweep(
                 message,
             )
             await _preempt_pod(state, victim.namespace, victim.name, victim.uid, message)
+
+    # Reconcile warning annotations outside the lock — it is best-effort pod
+    # patching that mutates no controller state.  Pods preempted this tick
+    # (``doomed``) are skipped; the delete removes any annotation they carried.
+    if config.termination_warning_enabled:
+        await _apply_termination_warnings(snapshot, warn_plan, doomed)
 
 
 async def preemption_loop(

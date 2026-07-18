@@ -245,6 +245,44 @@ state.
 **RBAC**: the controller's ServiceAccount must have `create` on `events` and
 `get`/`list` on `nodes`, in addition to the existing pod permissions.
 
+### Termination-warning annotations
+
+After each preemption sweep executes its kills, it stamps the **survivors that
+are still at risk** of being preempted at an upcoming boundary with a set of
+informational `horae/termination-warning-*` annotations (`TERMINATION_WARNING_ENABLED`,
+default on).  Like the runtime-guarantee annotations these enforce nothing and
+are never read back to make a decision — a widget should treat them as a
+best-effort heads-up so a job can checkpoint, extend, or re-book.
+
+- **Annotations** (written by `k8s_client.annotate_termination_warning`):
+  `horae/termination-warning-at` (the projected termination instant — the
+  soonest at-risk boundary, absolute UTC ISO-8601), `horae/termination-warning-risk`
+  (`min(1, shortfall/pool_gpus)` at that boundary, rounded to 2 decimals), and
+  `horae/termination-warning-message` (human-readable, rendered deterministically
+  from the two).
+- **Identification** (`ControllerState.plan_termination_warnings`, pure): reusing
+  the forecast primitive `forecast_boundary_need`, for each in-scope boundary
+  (`upcoming_boundaries`, the same lead window the sweep already evaluates) it
+  flags the **full eligible pool** of any class with a residual shortfall.
+  Eligibility is **boundary-relative** (`guarantee_end <= boundary`, chains
+  intact — computed once at the real now), so a pod whose guarantee expires
+  *between* now and the boundary is flagged even though the sweep's own
+  now-relative candidate planning would not yet consider it.  The set is computed
+  from the **post-kill** pod set (pods preempted this tick are excluded), so a
+  warning never targets a pod already being terminated.  Iterating boundaries
+  ascending gives each pod its **soonest** at-risk boundary (both the timestamp
+  and the risk come from it).
+- **Reconciliation** (`main._apply_termination_warnings`, best-effort, outside
+  `reservation_lock`): diffs the desired warning against what each pod in the
+  snapshot already carries (surfaced on `ToleratedPodInfo`) — writes a new/changed
+  warning, **clears** (`clear_termination_warning`, annotation values set to
+  `None`) a stale one when a pod leaves the at-risk pool (its user re-booked,
+  demand evaporated, or it was adopted), and skips an unchanged one to avoid
+  per-tick API churn.  This is restart-safe: the pod's own annotations are the
+  state, so nothing leaks across a restart.
+- **RBAC / config**: none new — the write/clear reuses the existing `pods: patch`
+  permission.  `TERMINATION_WARNING_ENABLED=false` disables the feature.
+
 ### Adopting overstay pods into a re-booked reservation
 
 Because pods may overrun, a user can book a **fresh** reservation (a new,
@@ -747,6 +785,7 @@ the claimed set and the grace re-arm path above applies.
 | `PREEMPTION_DELEGATE_SELECTION` | `true` | Ask the app to choose preemption victims from the eligible pool (`POST /api/reservations/preemption-victims`); `false` (or any app-call failure) falls back to local uniform-random selection |
 | `POD_ADOPTION_ENABLED` | `true` | Re-link an overstay pod to a reservation its user has since booked (see **Adopting overstay pods into a re-booked reservation**); `false` disables |
 | `ONDEMAND_MERGE_ENABLED` | `true` | Merge a JIT on-demand lease's pod into the user's matching booking the moment that booking's window opens — re-link the pod and retire the lease penalty-exempt, without waiting for the lease guarantee to lapse (see **Merging a JIT lease into a matching booking**); `false` disables (the pod then converges lazily via adoption once past its lease guarantee) |
+| `TERMINATION_WARNING_ENABLED` | `true` | After each preemption sweep, stamp pods still at risk of preemption at an upcoming boundary with informational `horae/termination-warning-*` annotations — projected termination time, risk score, and a message (see **Termination-warning annotations**); `false` disables |
 | `LOG_LEVEL` | `INFO` | Root Python logging level (parsed by `config.py`) |
 
 ---
