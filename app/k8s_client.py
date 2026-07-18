@@ -161,6 +161,29 @@ def get_pod_booking_reference(pod) -> Optional[str]:
     return annotations.get("horae/booking-reference")
 
 
+# Annotation keys for the informational termination-warning stamped on a pod at
+# risk of demand-driven preemption (see main._apply_termination_warnings).  Like
+# the runtime-guarantee annotations, these are best-effort and never read back
+# to make a decision; the sweep recomputes risk live from reservation state.
+TERMINATION_WARNING_AT = "horae/termination-warning-at"
+TERMINATION_WARNING_RISK = "horae/termination-warning-risk"
+TERMINATION_WARNING_MESSAGE = "horae/termination-warning-message"
+
+
+def get_pod_termination_warning(pod) -> tuple[Optional[str], Optional[str]]:
+    """Return the pod's ``(termination-warning-at, termination-warning-risk)``.
+
+    Either element is ``None`` when its annotation is absent.  Used only to
+    diff the desired warning against what the pod already carries, so a
+    repeated sweep does not re-patch an unchanged warning.
+    """
+    annotations: dict = getattr(pod.metadata, "annotations", None) or {}
+    return (
+        annotations.get(TERMINATION_WARNING_AT),
+        annotations.get(TERMINATION_WARNING_RISK),
+    )
+
+
 # Prefix recorded in a horae/booking-reference value.  Every admitted pod is a
 # real reservation now (the lease model requests one just-in-time rather than
 # placing onto an ad-hoc block), so there is only one kind.  Construction
@@ -313,6 +336,12 @@ class ToleratedPodInfo:
     # been scheduled yet.  Carried so per-node GPU accounting can attribute an
     # admitted pod's GPUs to the node it physically occupies.
     node_name: Optional[str] = None
+    # Current values of the termination-warning annotations (raw strings), or
+    # None when absent.  Carried so the sweep can diff the warning it wants to
+    # write against what the pod already has and skip a no-op re-patch, and can
+    # detect a stale warning to clear when the pod leaves the at-risk pool.
+    termination_warning_at: Optional[str] = None
+    termination_warning_risk: Optional[str] = None
 
 
 async def snapshot_tolerated_pods(
@@ -343,6 +372,7 @@ async def snapshot_tolerated_pods(
         conditions = (pod.status.conditions or []) if pod.status else []
         scheduled = next((c for c in conditions if c.type == "PodScheduled"), None)
         booking = get_pod_booking_reference(pod)
+        warning_at, warning_risk = get_pod_termination_warning(pod)
         labels = pod.metadata.labels or {}
         out.append(
             ToleratedPodInfo(
@@ -360,6 +390,8 @@ async def snapshot_tolerated_pods(
                     labels.get(group_label_key) if group_label_key else None
                 ),
                 node_name=getattr(pod.spec, "node_name", None) if pod.spec else None,
+                termination_warning_at=warning_at,
+                termination_warning_risk=warning_risk,
             )
         )
     log.debug("k8s: tolerated snapshot returned %d pod(s)", len(out))
@@ -547,6 +579,71 @@ async def annotate_runtime_guarantee(
         seconds,
         until_str,
     )
+
+
+async def annotate_termination_warning(
+    pod_name: str,
+    namespace: str,
+    terminate_at: datetime,
+    risk: str,
+    message: str,
+) -> None:
+    """Stamp *pod_name* with the informational termination-warning annotations.
+
+    Writes ``horae/termination-warning-at`` (the projected preemption instant,
+    absolute UTC ISO-8601, matching ``guaranteed-until``), ``-risk`` (a value in
+    (0, 1] as a pre-rounded string), and ``-message`` (human-readable).  Purely
+    informational — nothing is enforced Kubernetes-side and these are never read
+    back to make a decision (the sweep recomputes risk live from reservation
+    state); a widget should treat them as a best-effort heads-up.
+    """
+    at_str = terminate_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    log.debug(
+        "k8s: patch_namespaced_pod %s/%s (termination warning: at %s, risk %s)",
+        namespace, pod_name, at_str, risk,
+    )
+    patch = {
+        "metadata": {
+            "annotations": {
+                TERMINATION_WARNING_AT: at_str,
+                TERMINATION_WARNING_RISK: risk,
+                TERMINATION_WARNING_MESSAGE: message,
+            }
+        },
+    }
+    await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
+    log.info(
+        "Termination warning on pod %s/%s: may be preempted at %s (risk %s)",
+        namespace,
+        pod_name,
+        at_str,
+        risk,
+    )
+
+
+async def clear_termination_warning(pod_name: str, namespace: str) -> None:
+    """Remove the termination-warning annotations from *pod_name*.
+
+    Retraction path: the pod left the at-risk pool (its user re-booked, demand
+    evaporated, or it was adopted), so a stale "you may be preempted" stamp
+    would mislead.  Setting each annotation value to ``None`` in a strategic
+    merge patch deletes the key.
+    """
+    log.debug(
+        "k8s: patch_namespaced_pod %s/%s (clear termination warning)",
+        namespace, pod_name,
+    )
+    patch = {
+        "metadata": {
+            "annotations": {
+                TERMINATION_WARNING_AT: None,
+                TERMINATION_WARNING_RISK: None,
+                TERMINATION_WARNING_MESSAGE: None,
+            }
+        },
+    }
+    await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
+    log.info("Cleared termination warning on pod %s/%s", namespace, pod_name)
 
 
 async def _emit_pod_event(

@@ -243,7 +243,8 @@ class _FakeCoreV1Pods:
 
 
 def _tolerated_pod(
-    name: str, *, uid: str, node_name, gpu_class: str = "h100", gpu_count: int = 1
+    name: str, *, uid: str, node_name, gpu_class: str = "h100", gpu_count: int = 1,
+    annotations: dict | None = None
 ) -> SimpleNamespace:
     return SimpleNamespace(
         metadata=SimpleNamespace(
@@ -251,7 +252,7 @@ def _tolerated_pod(
             name=name,
             uid=uid,
             labels={"gpu-class": gpu_class},
-            annotations={"horae/booking-reference": "res-1"},
+            annotations=annotations or {"horae/booking-reference": "res-1"},
             deletion_timestamp=None,
         ),
         status=SimpleNamespace(phase="Running", conditions=None),
@@ -282,3 +283,23 @@ class TestSnapshotToleratedPodsNodeName:
         by_uid = {p.uid: p for p in out}
         assert by_uid["u1"].node_name == "n1"
         assert by_uid["u2"].node_name is None
+
+    def test_captures_termination_warning_annotations(self, monkeypatch):
+        pods = [
+            _tolerated_pod(
+                "p1", uid="u1", node_name="n1",
+                annotations={
+                    "horae/booking-reference": "res-1",
+                    "horae/termination-warning-at": "2024-01-15T10:00:00Z",
+                    "horae/termination-warning-risk": "0.50",
+                },
+            ),
+            _tolerated_pod("p2", uid="u2", node_name="n1"),  # no warning annotations
+        ]
+        monkeypatch.setattr(k8s_client, "_core_v1", _FakeCoreV1Pods(pods))
+        out = asyncio.run(k8s_client.snapshot_tolerated_pods(TAINT_KEY))
+        by_uid = {p.uid: p for p in out}
+        assert by_uid["u1"].termination_warning_at == "2024-01-15T10:00:00Z"
+        assert by_uid["u1"].termination_warning_risk == "0.50"
+        assert by_uid["u2"].termination_warning_at is None
+        assert by_uid["u2"].termination_warning_risk is None

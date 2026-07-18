@@ -53,7 +53,8 @@ def _config(**overrides) -> Config:
 
 def _pod(uid: str, *, booking_reference: str, reservation_id: int, gpu_count: int = 1,
           phase: str = "Running", scheduled_false: bool = False, deletion_timestamp=None,
-          namespace: str = USERNAME) -> ToleratedPodInfo:
+          namespace: str = USERNAME, termination_warning_at=None,
+          termination_warning_risk=None) -> ToleratedPodInfo:
     return ToleratedPodInfo(
         namespace=namespace,
         name=f"pod-{uid}",
@@ -65,7 +66,25 @@ def _pod(uid: str, *, booking_reference: str, reservation_id: int, gpu_count: in
         phase=phase,
         scheduled_false=scheduled_false,
         deletion_timestamp=deletion_timestamp,
+        termination_warning_at=termination_warning_at,
+        termination_warning_risk=termination_warning_risk,
     )
+
+
+def _patch_warnings(monkeypatch, m):
+    """Capture ``annotate_termination_warning`` / ``clear_termination_warning``."""
+    writes: list[tuple] = []
+    clears: list[tuple[str, str]] = []
+
+    async def _annotate(name, namespace, terminate_at, risk, message):
+        writes.append((namespace, name, terminate_at, risk, message))
+
+    async def _clear(name, namespace):
+        clears.append((namespace, name))
+
+    monkeypatch.setattr(m, "annotate_termination_warning", _annotate)
+    monkeypatch.setattr(m, "clear_termination_warning", _clear)
+    return writes, clears
 
 
 def _patch_snapshots(monkeypatch, m, *, pods, capacity, read_pod_ok=True):
@@ -463,3 +482,130 @@ class TestDelegatedVictimSelection:
         asyncio.run(m._run_preemption_sweep(state, config, client, now=S))
         assert deleted == [(USERNAME, "pod-v1")]
         assert client.requests == []
+
+
+# ---------------------------------------------------------------------------
+# Termination-warning annotations (post-Phase-A reconcile)
+# ---------------------------------------------------------------------------
+
+S_ISO = "2024-01-15T10:00:00Z"  # S.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _victim_ending_at_boundary():
+    """Alice's holder whose runtime guarantee ends exactly at the boundary S."""
+    return reservation(
+        2,
+        start_utc=S - timedelta(hours=2),
+        end_utc=S,
+        gpu_count=1,
+        gpu_class_label=GPU_CLASS_LABEL,
+        username="alice",
+        user_id=1,
+    )
+
+
+class TestTerminationWarnings:
+    def test_at_risk_survivor_warned_in_phase_a(self, monkeypatch):
+        """A pod protected in phase A (still within guarantee) but occupying the
+        GPU an imminent booking needs is stamped with a warning."""
+        m = _main_module(monkeypatch)
+        state = _state(_victim_ending_at_boundary(), _boundary_reservation(1, gpu_count=1))
+        config = _config(preemption_lead_minutes=15)
+
+        pod = _pod("v1", booking_reference="res-2", reservation_id=2, gpu_count=1)
+        deleted, _events = _patch_snapshots(
+            monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 1}
+        )
+        writes, clears = _patch_warnings(monkeypatch, m)
+
+        asyncio.run(m._run_preemption_sweep(state, config, now=S - timedelta(minutes=10)))
+
+        assert deleted == []          # protected during phase A
+        assert clears == []
+        assert len(writes) == 1
+        namespace, name, at, risk, _msg = writes[0]
+        assert (namespace, name) == (USERNAME, "pod-v1")
+        assert at == S
+        assert risk == "1.00"
+
+    def test_preempted_pod_is_not_warned(self, monkeypatch):
+        """At phase B the pod is killed, not warned (it is in the doomed set)."""
+        m = _main_module(monkeypatch)
+        state = _state(_victim_ending_at_boundary(), _boundary_reservation(1, gpu_count=1))
+        config = _config(preemption_lead_minutes=15)
+
+        pod = _pod("v1", booking_reference="res-2", reservation_id=2, gpu_count=1)
+        deleted, _events = _patch_snapshots(
+            monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 1}
+        )
+        writes, clears = _patch_warnings(monkeypatch, m)
+
+        asyncio.run(m._run_preemption_sweep(state, config, now=S))
+
+        assert deleted == [(USERNAME, "pod-v1")]
+        assert writes == []
+        assert clears == []
+
+    def test_stale_warning_cleared_when_no_longer_at_risk(self, monkeypatch):
+        """A pod carrying a warning that no longer applies (ample capacity) has
+        its annotations retracted."""
+        m = _main_module(monkeypatch)
+        state = _state(_overstayer(2, "alice", 1), _boundary_reservation(1, gpu_count=1))
+        config = _config(preemption_lead_minutes=15)
+
+        pod = _pod(
+            "v1", booking_reference="res-2", reservation_id=2, gpu_count=1,
+            termination_warning_at=S_ISO, termination_warning_risk="1.00",
+        )
+        deleted, _events = _patch_snapshots(
+            monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 4}  # no shortfall
+        )
+        writes, clears = _patch_warnings(monkeypatch, m)
+
+        asyncio.run(m._run_preemption_sweep(state, config, now=S - timedelta(minutes=10)))
+
+        assert deleted == []
+        assert writes == []
+        assert clears == [(USERNAME, "pod-v1")]
+
+    def test_unchanged_warning_is_not_repatched(self, monkeypatch):
+        """A pod already carrying the exact warning that would be computed is a
+        no-op — no write, no clear (avoids per-tick API churn)."""
+        m = _main_module(monkeypatch)
+        state = _state(_victim_ending_at_boundary(), _boundary_reservation(1, gpu_count=1))
+        config = _config(preemption_lead_minutes=15)
+
+        pod = _pod(
+            "v1", booking_reference="res-2", reservation_id=2, gpu_count=1,
+            termination_warning_at=S_ISO, termination_warning_risk="1.00",
+        )
+        deleted, _events = _patch_snapshots(
+            monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 1}
+        )
+        writes, clears = _patch_warnings(monkeypatch, m)
+
+        asyncio.run(m._run_preemption_sweep(state, config, now=S - timedelta(minutes=10)))
+
+        assert deleted == []
+        assert writes == []
+        assert clears == []
+
+    def test_disabled_flag_skips_warning_reconcile(self, monkeypatch):
+        """With TERMINATION_WARNING_ENABLED off, neither write nor clear runs."""
+        m = _main_module(monkeypatch)
+        state = _state(_victim_ending_at_boundary(), _boundary_reservation(1, gpu_count=1))
+        config = _config(preemption_lead_minutes=15, termination_warning_enabled=False)
+
+        pod = _pod(
+            "v1", booking_reference="res-2", reservation_id=2, gpu_count=1,
+            termination_warning_at=S_ISO, termination_warning_risk="1.00",
+        )
+        deleted, _events = _patch_snapshots(
+            monkeypatch, m, pods=[pod], capacity={GPU_CLASS_LABEL: 1}
+        )
+        writes, clears = _patch_warnings(monkeypatch, m)
+
+        asyncio.run(m._run_preemption_sweep(state, config, now=S - timedelta(minutes=10)))
+
+        assert writes == []
+        assert clears == []

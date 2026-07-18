@@ -518,6 +518,24 @@ class PreemptionForecast:
     pods: list[PodForecast]
 
 
+@dataclass(frozen=True)
+class TerminationWarning:
+    """One at-risk pod's projected preemption, for the warning annotations.
+
+    Produced by ``ControllerState.plan_termination_warnings``.  ``terminate_at``
+    is the *soonest* upcoming booking boundary at which the pod is an eligible
+    preemption victim in a class that is short on capacity; ``risk`` is that
+    boundary's ``min(1, shortfall / pool_gpus)`` (the uniform-random local
+    selection model — pool *membership* is exact, the number models the
+    fallback).  Purely informational: the controller stamps these onto the pod
+    and never reads them back to make a decision.
+    """
+
+    view: PodRuntimeView
+    terminate_at: datetime   # soonest at-risk boundary
+    risk: float              # (0, 1] at that boundary
+
+
 # ---------------------------------------------------------------------------
 # Shared controller state
 # ---------------------------------------------------------------------------
@@ -2105,3 +2123,59 @@ class ControllerState:
             buckets=summaries,
             pods=pod_forecasts,
         )
+
+    def plan_termination_warnings(
+        self,
+        boundaries: list[datetime],
+        capacity_by_class: dict[str, int],
+        pods: list[PodRuntimeView],
+        now: datetime,
+    ) -> dict[str, "TerminationWarning"]:
+        """Identify pods at risk of preemption at an upcoming boundary.
+
+        The warning sibling of ``plan_boundary_candidates``, used by the
+        preemption sweep after it has executed its kills to annotate the
+        survivors that could still be preempted at a boundary in scope.  Two
+        deliberate differences from the sweep's own candidate planning:
+
+        - Eligibility is **boundary-relative** (``guarantee_end <= boundary``),
+          reusing ``forecast_boundary_need`` — so a pod whose guarantee expires
+          *between* now and the boundary is flagged, not only pods already past
+          guarantee now (which the sweep is busy killing this tick).
+        - The **full eligible pool** of a short class is warned, not a
+          ``kills_needed``-sized subset — the app's victim-selection policy is
+          opaque, so any pool member could be chosen.
+
+        *boundaries* are the sweep's in-scope boundaries (``upcoming_boundaries``);
+        *pods* is the **post-kill** snapshot (the caller has removed pods it just
+        preempted), so ``free`` here already reflects the recovered capacity and
+        doomed pods can never be warned.  Iterating *boundaries* ascending means
+        a pod at risk at several boundaries keeps its **soonest** one (both the
+        ``terminate_at`` timestamp and the ``risk`` come from that boundary).
+
+        Returns a map keyed by pod uid.  Pure — no I/O, no state mutation; the
+        caller writes the annotations.
+        """
+        free = free_capacity_by_class(capacity_by_class, pods)
+        guarantee_end_by_uid: dict[str, Optional[datetime]] = {
+            p.uid: self.guarantee_end(p.reservation_id, now=now)
+            for p in pods
+            if p.reservation_id is not None
+        }
+        warnings: dict[str, TerminationWarning] = {}
+        for boundary in sorted(boundaries):
+            need = self.forecast_boundary_need(
+                boundary, free, pods, now, guarantee_end_by_uid
+            )
+            for gpu_class, shortfall in need.kills_needed_by_class.items():
+                pool_gpus = need.pool_gpus_by_class.get(gpu_class, 0)
+                if pool_gpus <= 0:
+                    continue  # unmet shortfall with no eligible pods — nothing to warn
+                risk = min(1.0, shortfall / pool_gpus)
+                for p in need.eligible_by_class.get(gpu_class, []):
+                    if p.uid in warnings:
+                        continue  # a sooner boundary already claimed this pod
+                    warnings[p.uid] = TerminationWarning(
+                        view=p, terminate_at=boundary, risk=risk
+                    )
+        return warnings
