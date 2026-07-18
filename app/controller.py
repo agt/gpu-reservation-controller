@@ -542,6 +542,25 @@ class TerminationWarning:
     risk: float              # (0, 1] at that boundary
 
 
+@dataclass(frozen=True)
+class GuaranteeStatus:
+    """One admitted pod's live guarantee status, for the status annotations.
+
+    Produced by ``ControllerState.plan_guarantee_status``.  ``status`` is
+    ``"guaranteed"`` while the pod is inside its live (chain-aware) runtime
+    guarantee, else ``"overstay"``.  ``guaranteed_until`` is the live guarantee
+    end when guaranteed (written to ``horae/guaranteed-until``), or ``None`` when
+    overstay — the reconcile then leaves the pod's existing (now-past)
+    ``guaranteed-until`` frozen and flips only the status.  Purely informational:
+    the controller stamps these onto the pod and never reads them back to make a
+    decision.
+    """
+
+    view: PodRuntimeView
+    status: str                          # "guaranteed" | "overstay"
+    guaranteed_until: Optional[datetime]  # live end when guaranteed; None when overstay
+
+
 # ---------------------------------------------------------------------------
 # Shared controller state
 # ---------------------------------------------------------------------------
@@ -2207,3 +2226,34 @@ class ControllerState:
                         view=p, terminate_at=kill_start, risk=risk
                     )
         return warnings
+
+    def plan_guarantee_status(
+        self,
+        pods: list[PodRuntimeView],
+        now: datetime,
+    ) -> dict[str, "GuaranteeStatus"]:
+        """Return the desired live guarantee status per admitted pod, keyed by uid.
+
+        Pure and now-relative.  For each pod carrying a resolvable
+        ``reservation_id``, the live guarantee end (``guarantee_end``, chain-aware)
+        decides the status: ``"guaranteed"`` with that end while it is still in the
+        future, else ``"overstay"`` with ``None`` (the reconcile leaves the pod's
+        existing, now-past ``guaranteed-until`` frozen and flips only the status).
+        A pod with no ``reservation_id`` — not admitted by this controller, or
+        whose booking-reference does not parse — is skipped: it is not ours to
+        report a guarantee for.
+        """
+        out: dict[str, GuaranteeStatus] = {}
+        for p in pods:
+            if p.reservation_id is None:
+                continue
+            ge = self.guarantee_end(p.reservation_id, now=now)
+            if ge is not None and ge > now:
+                out[p.uid] = GuaranteeStatus(
+                    view=p, status="guaranteed", guaranteed_until=ge
+                )
+            else:
+                out[p.uid] = GuaranteeStatus(
+                    view=p, status="overstay", guaranteed_until=None
+                )
+        return out

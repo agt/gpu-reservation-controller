@@ -36,6 +36,7 @@ from .controller import (
     TOLERATION_KEY,
     BoundaryPreemptionNeed,
     ControllerState,
+    GuaranteeStatus,
     OnDemandCandidate,
     PodRuntimeView,
     PreemptionForecast,
@@ -54,6 +55,7 @@ from .controller import (
 from .k8s_client import (
     TERMINAL_PHASES,
     PodWatcher,
+    annotate_guarantee_status,
     annotate_runtime_guarantee,
     annotate_termination_warning,
     apply_toleration,
@@ -1461,6 +1463,20 @@ async def queue_processor_loop(
         # rest of this tick) so a concurrent fetch/push cannot swap the
         # reservation set across the patch awaits.  The same view list is threaded
         # through both so a just-merged pod is not re-processed by adoption.
+        # Reconcile the live guarantee-status annotations from this snapshot,
+        # *before* merge/adoption: a pod whose guarantee has lapsed since it was
+        # stamped flips to "overstay" here, then a rescued pod is authoritatively
+        # re-stamped "guaranteed" by the adoption/merge ``_record_guarantee``
+        # below — so a just-re-linked pod is never left flickering on this tick's
+        # stale (pre-re-link) reservation id.  The plan reads reservation state,
+        # so it is computed under the lock; the best-effort I/O runs outside.
+        if snapshot is not None:
+            async with state.reservation_lock:
+                status_plan = state.plan_guarantee_status(
+                    [_pod_view(p) for p in snapshot], now
+                )
+            await _apply_guarantee_status(snapshot, status_plan)
+
         if snapshot is not None and (
             config.ondemand_merge_enabled or config.pod_adoption_enabled
         ):
@@ -1702,6 +1718,59 @@ async def _apply_termination_warnings(
         except Exception as exc:  # noqa: BLE001
             log.warning(
                 "Failed to reconcile termination warning on pod %s/%s: %s",
+                p.namespace,
+                p.name,
+                exc,
+            )
+
+
+async def _apply_guarantee_status(
+    snapshot: "list",
+    status_plan: dict[str, GuaranteeStatus],
+) -> None:
+    """Reconcile the live ``horae/guarantee-status`` annotations against *status_plan*.
+
+    *snapshot* is a ``snapshot_tolerated_pods`` list (each entry carries the
+    pod's current status annotations); *status_plan* is
+    ``ControllerState.plan_guarantee_status`` output keyed by uid.  For every
+    pod present in the plan:
+
+    - ``"guaranteed"`` → write the status and the refreshed ``guaranteed-until``
+      when either differs from what the pod carries;
+    - ``"overstay"`` → write the status alone (the pod's now-past
+      ``guaranteed-until`` is left frozen) when it differs;
+    - otherwise → no-op (skip the API round-trip).
+
+    Admission / adoption / merge already stamp ``"guaranteed"`` promptly via
+    ``annotate_runtime_guarantee``; this per-tick reconcile is what flips a pod
+    to ``"overstay"`` once its guarantee lapses.  There is no clear path: the
+    status persists for the pod's admitted life and vanishes with the pod.  Each
+    pod is independently best-effort, mirroring ``_apply_termination_warnings``.
+    """
+    for p in snapshot:
+        desired = status_plan.get(p.uid)
+        if desired is None:
+            continue
+        try:
+            if desired.guaranteed_until is not None:
+                until_str = desired.guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+                if (
+                    p.guarantee_status == desired.status
+                    and p.guaranteed_until == until_str
+                ):
+                    continue  # unchanged — do not re-patch
+                await annotate_guarantee_status(
+                    p.name, p.namespace, desired.status, desired.guaranteed_until
+                )
+            else:
+                if p.guarantee_status == desired.status:
+                    continue  # unchanged — do not re-patch
+                await annotate_guarantee_status(
+                    p.name, p.namespace, desired.status, None
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Failed to reconcile guarantee status on pod %s/%s: %s",
                 p.namespace,
                 p.name,
                 exc,

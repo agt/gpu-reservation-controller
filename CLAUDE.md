@@ -171,11 +171,12 @@ now that on-demand jobs are ordinary reservations too.
 `_record_guarantee` in `main.py`:
 
 - Annotates the pod (`annotate_runtime_guarantee`) with informational-only
-  `horae/pod-runtime-limit-seconds` (guaranteed duration in seconds) and
+  `horae/pod-runtime-limit-seconds` (guaranteed duration in seconds),
   `horae/guaranteed-until` (the same instant as an absolute UTC ISO-8601
-  timestamp).  A guarantee can technically shrink after the annotation is
-  written (a window shortened server-side, or a merge component vanishing) —
-  nothing re-reads these
+  timestamp), and `horae/guarantee-status` (`guaranteed` at admission — see
+  **Live guarantee-status annotations** below).  A guarantee can technically
+  shrink after the annotation is written (a window shortened server-side, or a
+  merge component vanishing) — nothing re-reads these
   annotations to make a decision, so a widget should treat them as
   best-effort, not authoritative.
 - Emits a `Normal` Kubernetes Event with `reason: RuntimeGuaranteed`,
@@ -303,6 +304,47 @@ best-effort heads-up so a job can checkpoint, extend, or re-book.
   cost of more speculative warnings on future demand that may change (bounded by
   the best-effort framing, the diff-and-skip reconcile, and live self-clearing
   when a user re-books or the booking no-shows).
+
+### Live guarantee-status annotations
+
+Distinct from the at-risk termination warning, every controller-admitted pod
+carries a **general, always-present status** so a widget can show a job's
+guarantee standing regardless of whether preemption is imminent.  Two keys,
+both informational-only and never read back to make a decision:
+
+- `horae/guarantee-status` — `guaranteed` while the pod is inside its live
+  (chain-aware) runtime guarantee, `overstay` once it is running past it.
+- `horae/guaranteed-until` — the guarantee-end instant (the *same* key
+  `annotate_runtime_guarantee` writes at admission), kept **live**: future while
+  in-guarantee, and left at its now-past value once overstay.
+
+**Stamping and lifecycle.**  The status is written at the moments the guarantee
+itself changes, plus a periodic reconcile for the one transition no event
+covers:
+
+- **Admission / adoption / merge** — `annotate_runtime_guarantee` (called by
+  `_record_guarantee`) now also stamps `horae/guarantee-status: guaranteed`
+  alongside the runtime-limit and `guaranteed-until` keys, so a freshly admitted
+  or re-linked pod is immediately `guaranteed` with a forward end.
+- **Expiration** — `main._apply_guarantee_status` runs once per
+  **queue-processor tick** (reusing that tick's `snapshot_tolerated_pods`, no
+  extra API call): `ControllerState.plan_guarantee_status` (pure) computes each
+  admitted pod's live status from `guarantee_end`, and the reconcile flips a
+  lapsed pod to `overstay` (leaving its now-past `guaranteed-until` frozen).  A
+  pod whose guarantee **grew** (an abutting follow-on booking) gets its
+  `guaranteed-until` refreshed forward on the same path.
+
+**Diff-and-skip / restart-safe.**  The reconcile compares against the status the
+pod already carries (surfaced on `ToleratedPodInfo.guarantee_status /
+guaranteed_until`) and skips an unchanged pod, so it patches only on a real
+transition.  There is **no clear path** — unlike the termination warning, the
+status persists for the pod's admitted life and vanishes with the pod.  The
+pod's own annotations are the state, so nothing leaks across a restart.  Each
+pod is best-effort (a failure logs and is retried next tick).
+
+**RBAC / config**: none new — the writes reuse the existing `pods: patch`
+permission, and the feature is always on (like the runtime-guarantee
+annotations it extends).
 
 ### Adopting overstay pods into a re-booked reservation
 

@@ -184,6 +184,32 @@ def get_pod_termination_warning(pod) -> tuple[Optional[str], Optional[str]]:
     )
 
 
+# Annotation key for the pod's live guarantee status: whether it is still inside
+# its runtime guarantee (``"guaranteed"``) or running past it (``"overstay"``).
+# It rides alongside the existing ``horae/guaranteed-until`` (the guarantee-end
+# instant, kept live) as a general status surface, stamped at admission and
+# refreshed as the status changes (guarantee lapsing, adoption/merge).  Like the
+# other guarantee/termination annotations it is best-effort and never read back
+# to make a decision.
+GUARANTEE_STATUS = "horae/guarantee-status"
+GUARANTEE_STATUS_GUARANTEED = "guaranteed"
+GUARANTEE_STATUS_OVERSTAY = "overstay"
+
+
+def get_pod_guarantee_status(pod) -> tuple[Optional[str], Optional[str]]:
+    """Return the pod's ``(guarantee-status, guaranteed-until)`` annotations.
+
+    Either element is ``None`` when its annotation is absent.  Used only to
+    diff the desired status against what the pod already carries, so a repeated
+    reconcile does not re-patch an unchanged status.
+    """
+    annotations: dict = getattr(pod.metadata, "annotations", None) or {}
+    return (
+        annotations.get(GUARANTEE_STATUS),
+        annotations.get("horae/guaranteed-until"),
+    )
+
+
 # Prefix recorded in a horae/booking-reference value.  Every admitted pod is a
 # real reservation now (the lease model requests one just-in-time rather than
 # placing onto an ad-hoc block), so there is only one kind.  Construction
@@ -342,6 +368,11 @@ class ToleratedPodInfo:
     # detect a stale warning to clear when the pod leaves the at-risk pool.
     termination_warning_at: Optional[str] = None
     termination_warning_risk: Optional[str] = None
+    # Current values of the live guarantee-status annotations (raw strings), or
+    # None when absent.  Carried so the per-tick reconcile can diff the status it
+    # wants against what the pod already has and skip a no-op re-patch.
+    guarantee_status: Optional[str] = None
+    guaranteed_until: Optional[str] = None
 
 
 async def snapshot_tolerated_pods(
@@ -373,6 +404,7 @@ async def snapshot_tolerated_pods(
         scheduled = next((c for c in conditions if c.type == "PodScheduled"), None)
         booking = get_pod_booking_reference(pod)
         warning_at, warning_risk = get_pod_termination_warning(pod)
+        guarantee_status, guaranteed_until = get_pod_guarantee_status(pod)
         labels = pod.metadata.labels or {}
         out.append(
             ToleratedPodInfo(
@@ -392,6 +424,8 @@ async def snapshot_tolerated_pods(
                 node_name=getattr(pod.spec, "node_name", None) if pod.spec else None,
                 termination_warning_at=warning_at,
                 termination_warning_risk=warning_risk,
+                guarantee_status=guarantee_status,
+                guaranteed_until=guaranteed_until,
             )
         )
     log.debug("k8s: tolerated snapshot returned %d pod(s)", len(out))
@@ -551,12 +585,15 @@ async def annotate_runtime_guarantee(
     """Annotate *pod_name* with its runtime guarantee.
 
     Writes ``horae/pod-runtime-limit-seconds`` (the guaranteed duration in
-    seconds, consumed by in-pod countdown widgets) and ``horae/guaranteed-until``
-    (the same instant as an absolute UTC ISO-8601 timestamp).  Informational
-    only: this never patches ``spec.activeDeadlineSeconds`` — demand-driven
-    preemption enforces nothing through a Kubernetes-side deadline, and never
-    reads these annotations back to make a decision; it recomputes the guarantee
-    live from reservation state (``ControllerState.guarantee_end``).
+    seconds, consumed by in-pod countdown widgets), ``horae/guaranteed-until``
+    (the same instant as an absolute UTC ISO-8601 timestamp), and
+    ``horae/guarantee-status`` (``"guaranteed"`` — recording a guarantee always
+    means the pod is inside one; the reconcile in ``main`` flips this to
+    ``"overstay"`` once the guarantee lapses).  Informational only: this never
+    patches ``spec.activeDeadlineSeconds`` — demand-driven preemption enforces
+    nothing through a Kubernetes-side deadline, and never reads these
+    annotations back to make a decision; it recomputes the guarantee live from
+    reservation state (``ControllerState.guarantee_end``).
     """
     until_str = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
     log.debug(
@@ -568,6 +605,7 @@ async def annotate_runtime_guarantee(
             "annotations": {
                 "horae/pod-runtime-limit-seconds": str(seconds),
                 "horae/guaranteed-until": until_str,
+                GUARANTEE_STATUS: GUARANTEE_STATUS_GUARANTEED,
             }
         },
     }
@@ -579,6 +617,36 @@ async def annotate_runtime_guarantee(
         seconds,
         until_str,
     )
+
+
+async def annotate_guarantee_status(
+    pod_name: str,
+    namespace: str,
+    status: str,
+    guaranteed_until: Optional[datetime],
+) -> None:
+    """Update *pod_name*'s live ``horae/guarantee-status`` (+ ``guaranteed-until``).
+
+    Writes ``horae/guarantee-status`` (``"guaranteed"`` | ``"overstay"``) and,
+    **only when** *guaranteed_until* is provided, refreshes
+    ``horae/guaranteed-until`` to that absolute UTC ISO-8601 instant.  For an
+    overstay pod *guaranteed_until* is ``None`` so the existing (now-past)
+    ``guaranteed-until`` value is left frozen — only the status key flips.
+    Informational only, mirroring ``annotate_runtime_guarantee``: nothing is
+    enforced Kubernetes-side and these are never read back to make a decision.
+    """
+    annotations: dict = {GUARANTEE_STATUS: status}
+    if guaranteed_until is not None:
+        annotations["horae/guaranteed-until"] = guaranteed_until.strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    log.debug(
+        "k8s: patch_namespaced_pod %s/%s (guarantee status: %s)",
+        namespace, pod_name, status,
+    )
+    patch = {"metadata": {"annotations": annotations}}
+    await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
+    log.info("Guarantee status on pod %s/%s: %s", namespace, pod_name, status)
 
 
 async def annotate_termination_warning(
