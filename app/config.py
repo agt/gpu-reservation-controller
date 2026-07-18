@@ -51,6 +51,7 @@ class Config:
     pod_adoption_enabled: bool = True  # re-link overstay pods to a user's new booking
     ondemand_merge_enabled: bool = True  # merge a JIT lease's pod into a now-open matching booking
     termination_warning_enabled: bool = True  # annotate pods at risk of demand-driven preemption
+    termination_warning_lead_minutes: int = 30  # warning look-ahead, decoupled from PREEMPTION_LEAD_MINUTES
     preemption_delegate_selection: bool = True  # ask the app to choose victims; local random fallback
     ondemand_delegate_admission: bool = False  # ask the app which pending pods to admit; grant-all fallback
     required_group_label: Optional[str] = None  # pod label naming the usage group to match; None = disabled
@@ -105,6 +106,9 @@ class Config:
             pod_adoption_enabled=_env_bool("POD_ADOPTION_ENABLED", True),
             ondemand_merge_enabled=_env_bool("ONDEMAND_MERGE_ENABLED", True),
             termination_warning_enabled=_env_bool("TERMINATION_WARNING_ENABLED", True),
+            termination_warning_lead_minutes=int(
+                os.environ.get("TERMINATION_WARNING_LEAD_MINUTES", "30")
+            ),
             preemption_delegate_selection=_env_bool(
                 "PREEMPTION_DELEGATE_SELECTION", True
             ),

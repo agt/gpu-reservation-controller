@@ -255,23 +255,39 @@ are never read back to make a decision — a widget should treat them as a
 best-effort heads-up so a job can checkpoint, extend, or re-book.
 
 - **Annotations** (written by `k8s_client.annotate_termination_warning`):
-  `horae/termination-warning-at` (the projected termination instant — the
-  soonest at-risk boundary, absolute UTC ISO-8601), `horae/termination-warning-risk`
+  `horae/termination-warning-at` (the projected **kill instant** —
+  `max(boundary − PREEMPTION_LEAD_MINUTES, guarantee_end)`, the start of the
+  sweep's kill window and the earliest the pod could actually be deleted,
+  absolute UTC ISO-8601), `horae/termination-warning-risk`
   (`min(1, shortfall/pool_gpus)` at that boundary, rounded to 2 decimals), and
   `horae/termination-warning-message` (human-readable, rendered deterministically
-  from the two).
+  from the two).  A pod killed proactively at a boundary (a **phase-A** victim,
+  already past its guarantee) therefore reports the earlier `boundary − lead`
+  kill time, not the boundary; a **phase-B** victim whose guarantee ends at the
+  boundary degrades to the boundary itself.
 - **Identification** (`ControllerState.plan_termination_warnings`, pure): reusing
-  the forecast primitive `forecast_boundary_need`, for each in-scope boundary
-  (`upcoming_boundaries`, the same lead window the sweep already evaluates) it
-  flags the **full eligible pool** of any class with a residual shortfall.
-  Eligibility is **boundary-relative** (`guarantee_end <= boundary`, chains
-  intact — computed once at the real now), so a pod whose guarantee expires
-  *between* now and the boundary is flagged even though the sweep's own
-  now-relative candidate planning would not yet consider it.  The set is computed
-  from the **post-kill** pod set (pods preempted this tick are excluded), so a
-  warning never targets a pod already being terminated.  Iterating boundaries
-  ascending gives each pod its **soonest** at-risk boundary (both the timestamp
-  and the risk come from it).
+  the forecast primitive `forecast_boundary_need`, for each in-scope boundary it
+  flags the **full eligible pool** of any class with a residual shortfall.  The
+  warning look-ahead is **decoupled from the kill lead** (`TERMINATION_WARNING_LEAD_MINUTES`,
+  default 30, wider than `PREEMPTION_LEAD_MINUTES`): the boundary set is the
+  **union** of the sweep's own kill window (`upcoming_boundaries(now, lead)`) with
+  a wider forward horizon (`forecast_boundaries(now, now + warning_lead)` —
+  forward-only, so it never widens the already-open side, and it drops no-shows).
+  This gives a **phase-A** victim advance notice: an overstayer killed
+  proactively at `boundary − lead` is flagged *before* its boundary enters the
+  kill window, rather than on the very tick the sweep kills it (which is all the
+  old kill-window-only horizon could manage — phase-B victims already got notice,
+  phase-A victims got none).  Eligibility is **boundary-relative**
+  (`guarantee_end <= boundary`, chains intact — computed once at the real now), so
+  a pod whose guarantee expires *between* now and the boundary is flagged even
+  though the sweep's own now-relative candidate planning would not yet consider
+  it.  The set is computed from the **post-kill** pod set (pods preempted this
+  tick are excluded), so a warning never targets a pod already being terminated.
+  Iterating boundaries ascending gives each pod its **soonest** at-risk boundary
+  (both the kill-instant timestamp and the risk come from it).  Because the wider
+  horizon can put an at-risk boundary beyond the kill window, the sweep now runs
+  (and takes its snapshots) whenever *either* a kill-window or a warning boundary
+  is in scope, not only when there is a boundary to kill at.
 - **Reconciliation** (`main._apply_termination_warnings`, best-effort, outside
   `reservation_lock`): diffs the desired warning against what each pod in the
   snapshot already carries (surfaced on `ToleratedPodInfo`) — writes a new/changed
@@ -281,7 +297,12 @@ best-effort heads-up so a job can checkpoint, extend, or re-book.
   per-tick API churn.  This is restart-safe: the pod's own annotations are the
   state, so nothing leaks across a restart.
 - **RBAC / config**: none new — the write/clear reuses the existing `pods: patch`
-  permission.  `TERMINATION_WARNING_ENABLED=false` disables the feature.
+  permission.  `TERMINATION_WARNING_ENABLED=false` disables the feature;
+  `TERMINATION_WARNING_LEAD_MINUTES` (default 30) sets how far ahead warnings
+  look, independent of the kill lead — larger gives more advance notice at the
+  cost of more speculative warnings on future demand that may change (bounded by
+  the best-effort framing, the diff-and-skip reconcile, and live self-clearing
+  when a user re-books or the booking no-shows).
 
 ### Adopting overstay pods into a re-booked reservation
 
@@ -786,6 +807,7 @@ the claimed set and the grace re-arm path above applies.
 | `POD_ADOPTION_ENABLED` | `true` | Re-link an overstay pod to a reservation its user has since booked (see **Adopting overstay pods into a re-booked reservation**); `false` disables |
 | `ONDEMAND_MERGE_ENABLED` | `true` | Merge a JIT on-demand lease's pod into the user's matching booking the moment that booking's window opens — re-link the pod and retire the lease penalty-exempt, without waiting for the lease guarantee to lapse (see **Merging a JIT lease into a matching booking**); `false` disables (the pod then converges lazily via adoption once past its lease guarantee) |
 | `TERMINATION_WARNING_ENABLED` | `true` | After each preemption sweep, stamp pods still at risk of preemption at an upcoming boundary with informational `horae/termination-warning-*` annotations — projected termination time, risk score, and a message (see **Termination-warning annotations**); `false` disables |
+| `TERMINATION_WARNING_LEAD_MINUTES` | `30` | How far ahead (minutes) the termination-warning look-ahead scans, decoupled from `PREEMPTION_LEAD_MINUTES` so a pod killed proactively at `boundary − lead` (a phase-A victim) is warned before its boundary enters the kill window; larger = more advance notice but more speculative warnings |
 | `LOG_LEVEL` | `INFO` | Root Python logging level (parsed by `config.py`) |
 
 ---
