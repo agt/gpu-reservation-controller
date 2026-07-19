@@ -149,6 +149,12 @@ config:
   # local uniform-random selection.
   preemptionDelegateSelection: true
 
+  # Report each ended overstay's duration to the app for offline analysis
+  # (POST /api/reservations/{id}/overstay).  Best-effort and analysis-only —
+  # it records nothing that affects admission, capacity, or the reservation
+  # pull.  Ships dark: leave false unless you want the reporting.
+  overstayReportEnabled: false
+
 # ---------------------------------------------------------------------------
 # ServiceAccount and RBAC
 # ---------------------------------------------------------------------------

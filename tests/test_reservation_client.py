@@ -18,6 +18,7 @@ from app.schemas import (
     OnDemandAdmissionCandidate,
     OnDemandAdmissionRequest,
     OnDemandReservationRequest,
+    OverstayReportRequest,
 )
 
 from tests.conftest import reservation as _reservation
@@ -318,4 +319,47 @@ def test_cancel_reservation_error_returns_false():
 
     client = _client_with_handler(_config(), handler)
     assert asyncio.run(client.cancel_reservation(42, "no-show")) is False
+    asyncio.run(client.aclose())
+
+
+# ---------------------------------------------------------------------------
+# report_overstay — analysis-only, best-effort
+# ---------------------------------------------------------------------------
+
+
+def _overstay_req() -> OverstayReportRequest:
+    start = datetime(2026, 7, 19, 17, 0, 0, tzinfo=timezone.utc)
+    return OverstayReportRequest(
+        pod_uid="pod-abc",
+        gpu_count=1,
+        start_utc=start,
+        end_utc=start + timedelta(minutes=30),
+        end_reason="preempted",
+    )
+
+
+def test_report_overstay_posts_to_reservation_path():
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": 1})
+
+    client = _client_with_handler(_config(), handler)
+    ok = asyncio.run(client.report_overstay(4412, _overstay_req()))
+    assert ok is True
+    assert seen["path"] == "/api/reservations/4412/overstay"
+    assert seen["body"]["pod_uid"] == "pod-abc"
+    assert seen["body"]["end_reason"] == "preempted"
+    asyncio.run(client.aclose())
+
+
+def test_report_overstay_swallows_errors():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    client = _client_with_handler(_config(), handler)
+    # Best-effort: a non-2xx returns False and never raises.
+    assert asyncio.run(client.report_overstay(42, _overstay_req())) is False
     asyncio.run(client.aclose())

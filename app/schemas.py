@@ -232,6 +232,30 @@ class OnDemandAdmissionResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Overstay report (POST /api/reservations/{id}/overstay)
+# ---------------------------------------------------------------------------
+
+
+class OverstayReportRequest(BaseModel):
+    """Body of ``POST /api/reservations/{id}/overstay`` — analysis-only.
+
+    Sent best-effort when a pod's overstay *ends* (deleted / terminated /
+    preempted), so the full duration is known.  ``start_utc`` is the
+    guarantee-end instant the pod crossed into overstay; ``end_utc`` is the
+    termination instant.  The GPU class, owner, and group are resolved app-side
+    from the parent reservation (the path id), so only the pod's ``gpu_count``,
+    the window, and the ``end_reason`` are carried.  ``pod_uid`` is the app-side
+    dedup key.
+    """
+
+    pod_uid: str
+    gpu_count: int
+    start_utc: datetime
+    end_utc: datetime
+    end_reason: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
 # Preemption-risk forecast (GET /api/forecast/preemption-risk)
 # ---------------------------------------------------------------------------
 

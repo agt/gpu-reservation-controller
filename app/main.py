@@ -69,6 +69,7 @@ from .k8s_client import (
     get_pod_booking_reference,
     get_pod_creation_timestamp,
     get_pod_gpu_count,
+    get_pod_guarantee_status,
     get_pod_min_runtime_seconds,
     get_pod_phase,
     get_pod_usage_group,
@@ -94,6 +95,7 @@ from .schemas import (
     OnDemandAdmissionCandidate,
     OnDemandAdmissionRequest,
     OnDemandReservationRequest,
+    OverstayReportRequest,
     PreemptionCandidate,
     PreemptionRiskForecastResponse,
     PreemptionSelectionRequest,
@@ -1097,6 +1099,66 @@ async def _teardown_ondemand_lease(
             state.reservations = [r for r in state.reservations if r.id != booking_id]
 
 
+def _parse_guaranteed_until(value: Optional[str]) -> Optional[datetime]:
+    """Parse a ``horae/guaranteed-until`` annotation (``…Z`` UTC ISO-8601).
+
+    Returns a tz-aware UTC ``datetime`` or ``None`` if absent/unparseable.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+async def _report_overstay_if_any(
+    state: ControllerState,
+    client: ReservationClient,
+    config: Config,
+    pod,
+    now: datetime,
+    end_reason: str,
+) -> None:
+    """Best-effort: record an ended overstay for *pod* to the reservation app.
+
+    Called when a controller-admitted pod's life ends (deleted / terminated /
+    preempted) — the moment the full overstay duration is known.  The overstay
+    window is ``[guarantee-end, now)``: the start is the live chain-aware
+    ``guarantee_end`` when the reservation is still resolvable, else the pod's
+    frozen ``horae/guaranteed-until`` annotation (the reservation may already have
+    left ``state.reservations`` by teardown).  A pod that finished **within** its
+    guarantee (start unresolved, or ``now <= start``) is not an overstay and is
+    skipped, so nothing is reported for the common case.
+
+    Analysis-only and fully best-effort — gated behind ``OVERSTAY_REPORT_ENABLED``
+    (ships dark), the client swallows every error, and the app dedups on the pod
+    UID so a preempt + DELETED double-fire records a single row.
+    """
+    if not config.overstay_report_enabled or client is None:
+        return
+    reservation_id = parse_booking_reference(get_pod_booking_reference(pod))
+    if reservation_id is None:
+        return  # not a controller-admitted pod
+    start = state.guarantee_end(reservation_id, now=now)
+    if start is None:
+        # Reservation no longer active — fall back to the frozen annotation.
+        _, until_str = get_pod_guarantee_status(pod)
+        start = _parse_guaranteed_until(until_str)
+    if start is None or now <= start:
+        return  # unresolvable, or the pod stayed within its guarantee
+    await client.report_overstay(
+        reservation_id,
+        OverstayReportRequest(
+            pod_uid=pod.metadata.uid,
+            gpu_count=get_pod_gpu_count(pod),
+            start_utc=start,
+            end_utc=now,
+            end_reason=end_reason,
+        ),
+    )
+
+
 async def pod_watch_loop(
     state: ControllerState, client: ReservationClient, config: Config
 ) -> None:
@@ -1180,6 +1242,11 @@ async def pod_watch_loop(
             # placement being enabled (otherwise reserved-path budget leaks until
             # the next reconcile).
             state.release_pod(uid)
+            # Record any overstay before teardown removes the lease from
+            # state.reservations (so guarantee_end can still resolve the window).
+            await _report_overstay_if_any(
+                state, client, config, pod, datetime.now(timezone.utc), "deleted"
+            )
             # If this pod was admitted under a JIT on-demand lease, release the
             # lease too — it exists only to cover this pod (no-op for bookings).
             await _teardown_ondemand_lease(state, client, pod)
@@ -1196,6 +1263,11 @@ async def pod_watch_loop(
             if phase in TERMINAL_PHASES:
                 state.remove_ondemand_candidate(uid)
                 state.release_pod(uid)
+                # Record any overstay before teardown removes the lease from
+                # state.reservations (so guarantee_end can still resolve).
+                await _report_overstay_if_any(
+                    state, client, config, pod, datetime.now(timezone.utc), "pod-terminated"
+                )
                 # A pod that finished on its own no longer needs its JIT lease;
                 # cancel it if that's what admitted this pod (no-op otherwise).
                 await _teardown_ondemand_lease(state, client, pod)
@@ -1631,7 +1703,15 @@ def _preemption_message(
 
 
 async def _preempt_pod(
-    state: ControllerState, namespace: str, name: str, uid: str, message: str
+    state: ControllerState,
+    namespace: str,
+    name: str,
+    uid: str,
+    message: str,
+    *,
+    client: Optional[ReservationClient] = None,
+    config: Optional[Config] = None,
+    now: Optional[datetime] = None,
 ) -> None:
     """Delete an overstaying pod to recover capacity.
 
@@ -1639,13 +1719,24 @@ async def _preempt_pod(
     deleting (best-effort — a failed emit does not block the delete), then
     delete and release occupancy together (best-effort — if the delete fails,
     occupancy is left as-is since the pod may still be there).
+
+    When ``client``/``config`` are passed (and overstay reporting is enabled), an
+    overstay record is filed **before** the delete — a preempted pod is by
+    definition past its guarantee — so the ``"preempted"`` reason wins the
+    app-side dedup over the ``"deleted"`` report the pod's own DELETED watch event
+    files moments later.
     """
+    pod_obj = None
     try:
         pod_obj = await read_pod(name, namespace)
         await emit_preempted_event(pod_obj, name, namespace, message)
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "Could not emit Preempted event for pod %s/%s: %s", namespace, name, exc
+        )
+    if client is not None and config is not None and pod_obj is not None:
+        await _report_overstay_if_any(
+            state, client, config, pod_obj, now or datetime.now(timezone.utc), "preempted"
         )
     try:
         await delete_pod(name, namespace)
@@ -2188,7 +2279,10 @@ async def _run_preemption_sweep(
                 victim.gpu_count,
                 message,
             )
-            await _preempt_pod(state, victim.namespace, victim.name, victim.uid, message)
+            await _preempt_pod(
+                state, victim.namespace, victim.name, victim.uid, message,
+                client=client, config=config, now=now,
+            )
 
     # Reconcile warning annotations outside the lock — it is best-effort pod
     # patching that mutates no controller state.  Pods preempted this tick
