@@ -594,6 +594,52 @@ an older app).
 | 403 | Read-only key / non-admin JWT |
 | 422 | Malformed body (e.g. `gpu_count <= 0`) |
 
+### `POST /api/reservations/{id}/overstay`
+
+Record — **for analysis/reporting only** — that a controller-admitted pod ran
+past its runtime guarantee. Requires a `read_write` service key (or an admin
+JWT) — the same gate as the other controller endpoints. The controller calls
+this best-effort when an overstay **ends** (the pod is deleted, terminates on
+its own, or is preempted), so the full duration is known.
+
+`{id}` is the parent reservation the overstaying pod was admitted under (its
+`horae/booking-reference`). The GPU class, owner, and group are copied from that
+reservation (authoritative); the controller supplies only the pod's `gpu_count`,
+the overstay window in **UTC**, and a machine-readable `end_reason`.
+
+```json
+{
+  "pod_uid": "abc-123",
+  "gpu_count": 1,
+  "start_utc": "2026-07-19T17:00:00Z",
+  "end_utc": "2026-07-19T17:30:00Z",
+  "end_reason": "pod-terminated"
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `pod_uid` | Opaque pod identifier; the **dedup key** (a repeat returns the original record) |
+| `gpu_count` | GPUs the pod held (may be fewer than the reservation booked) |
+| `start_utc` | When the pod crossed into overstay (its guarantee-end instant), UTC |
+| `end_utc` | When the overstay ended (pod termination), UTC; must be after `start_utc` |
+| `end_reason` | `"pod-terminated"` \| `"preempted"` \| `"deleted"` (free-form, ≤32 chars) |
+
+The record is written to a dedicated `overstays` table and **never** touches
+`reservations` or any capacity / availability / budget / report / reservation-list
+query, so it can never be mistaken for a live capacity claim. The response is the
+stored `OverstayResponse` (with `start_utc`/`end_utc` echoed back and a computed
+`duration_seconds`).
+
+**Responses**
+
+| Code | Condition |
+|------|-----------|
+| 200 | Recorded (or the existing record, when `pod_uid` was already reported) |
+| 403 | Read-only key / non-admin JWT |
+| 404 | Unknown parent reservation `{id}` |
+| 422 | Malformed body (e.g. `end_utc <= start_utc`, `gpu_count <= 0`) |
+
 ### Reading the reservation time window
 
 Every `ReservationResponse` includes pre-computed UTC timestamps:
@@ -1125,6 +1171,46 @@ Returned by `GET /api/groups/{group_id}/members`.
 | `cancelled_by_id` | integer \| null | User ID of whoever cancelled; `null` for a controller (service-key) cancellation |
 | `cancel_reason` | `"no-show"` \| `"controller-revoked"` \| `"pod-terminated"` \| `"superseded"` \| null | Machine-readable reason recorded by `POST /api/reservations/{id}/cancel` (or `"superseded"` when a source was continued via `POST /api/reservations/{id}/continue`); `null` for human cancellations |
 | `continued_from_id` | integer \| null | Set on a booking minted via `POST /api/reservations/{id}/continue`: the id of the superseded source reservation whose pod it carries forward; `null` otherwise |
+
+---
+
+### OverstayResponse
+
+Returned by `POST /api/reservations/{id}/overstay` (see §4). Analysis/reporting
+only — not returned by any reservation-listing endpoint.
+
+```json
+{
+  "id": 12,
+  "reservation_id": 4412,
+  "gpu_class_id": 3,
+  "gpu_count": 1,
+  "user_id": 87,
+  "group_id": 5,
+  "start_dt": "2026-07-19T10:00:00",
+  "end_dt": "2026-07-19T10:30:00",
+  "end_reason": "pod-terminated",
+  "pod_uid": "abc-123",
+  "created_at": "2026-07-19T17:30:01Z",
+  "start_utc": "2026-07-19T17:00:00Z",
+  "end_utc": "2026-07-19T17:30:00Z",
+  "duration_seconds": 1800
+}
+```
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `id` | integer | Overstay record id |
+| `reservation_id` | integer | Parent reservation the pod was admitted under |
+| `gpu_class_id` | integer | Copied from the parent reservation |
+| `gpu_count` | integer | GPUs the pod held |
+| `user_id` / `group_id` | integer \| null | Copied from the parent reservation |
+| `start_dt` / `end_dt` | datetime (naive-local) | Overstay window as stored |
+| `start_utc` / `end_utc` | datetime (UTC, `Z`) | Same window in UTC |
+| `duration_seconds` | integer | Overstay length |
+| `end_reason` | string \| null | Why the overstay ended |
+| `pod_uid` | string | Controller pod UID (dedup key) |
+| `created_at` | datetime (UTC, `Z`) | When the record was written |
 
 ---
 

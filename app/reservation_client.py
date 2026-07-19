@@ -8,6 +8,7 @@ Implements only the endpoints the controller needs:
   - POST /api/reservations/ondemand-admission  — ask the app which pending pods to admit
   - POST /api/reservations/preemption-victims  — ask the app which overstay pods to preempt
   - POST /api/reservations/{id}/cancel  — cancel a reservation (no-show / revoke)
+  - POST /api/reservations/{id}/overstay  — report an ended overstay's duration (analysis-only)
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from .schemas import (
     OnDemandAdmissionRequest,
     OnDemandAdmissionResponse,
     OnDemandReservationRequest,
+    OverstayReportRequest,
     PreemptionSelectionRequest,
     PreemptionSelectionResponse,
     ReservationResponse,
@@ -292,6 +294,42 @@ class ReservationClient:
         except httpx.RequestError as exc:
             log.warning(
                 "Could not cancel reservation #%d (%s): %s", reservation_id, reason, exc
+            )
+            return False
+
+    async def report_overstay(
+        self, reservation_id: int, req: OverstayReportRequest
+    ) -> bool:
+        """Record an ended overstay against *reservation_id*; True on success.
+
+        Analysis-only and strictly best-effort: any failure (endpoint absent on
+        an older app, network error, non-2xx, unparseable) is logged and
+        swallowed so it never blocks pod teardown or preemption.  Idempotent
+        app-side on ``req.pod_uid`` — a repeat for the same terminating pod is a
+        harmless no-op.
+        """
+        try:
+            resp = await self._client.post(
+                f"/api/reservations/{reservation_id}/overstay",
+                json=req.model_dump(mode="json"),
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            return True
+        except httpx.HTTPStatusError as exc:
+            log.warning(
+                "Could not report overstay for reservation #%d (pod %s): HTTP %s",
+                reservation_id,
+                req.pod_uid,
+                exc.response.status_code,
+            )
+            return False
+        except httpx.RequestError as exc:
+            log.warning(
+                "Could not report overstay for reservation #%d (pod %s): %s",
+                reservation_id,
+                req.pod_uid,
+                exc,
             )
             return False
 

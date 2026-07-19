@@ -346,6 +346,37 @@ pod is best-effort (a failure logs and is retried next tick).
 permission, and the feature is always on (like the runtime-guarantee
 annotations it extends).
 
+### Overstay reporting
+
+For **offline analysis** of how far jobs run past their guarantee, the controller
+reports each ended overstay to the app (`OVERSTAY_REPORT_ENABLED`, default off —
+ships dark).  The report is filed when the overstay *ends* (the moment the full
+duration is known), never during the run.
+
+`main._report_overstay_if_any` is the single shared helper.  Given a pod at
+teardown it: resolves the reservation id from `horae/booking-reference`; takes the
+overstay **start** as the live chain-aware `guarantee_end` when the reservation is
+still resolvable, else the pod's frozen `horae/guaranteed-until` annotation (the
+reservation has often already left `state.reservations` by teardown); takes the
+**end** as now; and **skips** the pod unless that is a genuine overstay
+(`start` resolved and `now > start`) — a pod that finished within its guarantee
+files nothing.  It then calls `ReservationClient.report_overstay`
+(`POST /api/reservations/{id}/overstay`, write-scope key, modelled on
+`cancel_reservation`: best-effort, swallows every error, never raises).  The app
+copies GPU class / owner / group from the parent reservation, so the request
+carries only the pod's `gpu_count`, the UTC window, and an `end_reason`.
+
+Wired at the three sites a pod's life ends, adjacent to `release_pod`:
+`pod_watch_loop`'s **DELETED** branch (`end_reason="deleted"`, before
+`_teardown_ondemand_lease` removes the lease so `guarantee_end` can still resolve)
+and its **terminal-phase** branch (`"pod-terminated"`), and `_preempt_pod`
+(`"preempted"`, filed **before** the delete so it wins the app-side dedup over the
+`"deleted"` report the pod's own DELETED event files moments later).  The app is
+idempotent on `pod_uid`, so the preempt + DELETED double-fire records one row.
+
+**RBAC / config**: none new (reuses the existing outbound service key); the
+feature is off unless `OVERSTAY_REPORT_ENABLED` is set.
+
 ### Adopting overstay pods into a re-booked reservation
 
 Because pods may overrun, a user can book a **fresh** reservation (a new,
@@ -850,6 +881,7 @@ the claimed set and the grace re-arm path above applies.
 | `ONDEMAND_MERGE_ENABLED` | `true` | Merge a JIT on-demand lease's pod into the user's matching booking the moment that booking's window opens — re-link the pod and retire the lease penalty-exempt, without waiting for the lease guarantee to lapse (see **Merging a JIT lease into a matching booking**); `false` disables (the pod then converges lazily via adoption once past its lease guarantee) |
 | `TERMINATION_WARNING_ENABLED` | `true` | After each preemption sweep, stamp pods still at risk of preemption at an upcoming boundary with informational `horae/termination-warning-*` annotations — projected termination time, risk score, and a message (see **Termination-warning annotations**); `false` disables |
 | `TERMINATION_WARNING_LEAD_MINUTES` | `30` | How far ahead (minutes) the termination-warning look-ahead scans, decoupled from `PREEMPTION_LEAD_MINUTES` so a pod killed proactively at `boundary − lead` (a phase-A victim) is warned before its boundary enters the kill window; larger = more advance notice but more speculative warnings |
+| `OVERSTAY_REPORT_ENABLED` | `false` | When on, report each ended overstay's duration to the app for offline analysis (`POST /api/reservations/{id}/overstay`) — see **Overstay reporting**. Best-effort and analysis-only; ships dark (default off) |
 | `LOG_LEVEL` | `INFO` | Root Python logging level (parsed by `config.py`) |
 
 ---

@@ -95,6 +95,8 @@ spec:
               value: {{ .Values.config.terminationWarningLeadMinutes | quote }}
             - name: PREEMPTION_DELEGATE_SELECTION
               value: {{ .Values.config.preemptionDelegateSelection | quote }}
+            - name: OVERSTAY_REPORT_ENABLED
+              value: {{ .Values.config.overstayReportEnabled | quote }}
             {{- if .Values.inboundApiTokenSecret.name }}
             # Enables the inbound reservation-push API (POST /api/reservations/push).
             # Omit the secret to leave the endpoint disabled (returns 503).

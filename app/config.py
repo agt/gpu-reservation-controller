@@ -58,6 +58,7 @@ class Config:
     ondemand_horizon_minutes: int = 30    # JIT trigger: reserved-match horizon before requesting a lease
     ondemand_lease_buffer_minutes: int = 10  # added to a pod's minimum-runtime when sizing a JIT lease
     capacity_check_interval: int = 3600  # seconds between app-side vs physical capacity audits
+    overstay_report_enabled: bool = False  # report overstay durations to the app for analysis (ships dark)
     log_level: str = "INFO"        # root log level (LOG_LEVEL)
 
     @classmethod
@@ -124,5 +125,6 @@ class Config:
             capacity_check_interval=int(
                 os.environ.get("CAPACITY_CHECK_INTERVAL", "3600")
             ),
+            overstay_report_enabled=_env_bool("OVERSTAY_REPORT_ENABLED", False),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
         )
