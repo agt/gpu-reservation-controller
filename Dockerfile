@@ -6,11 +6,23 @@ COPY requirements.txt requirements-dev.txt ./
 RUN pip install --no-cache-dir -r requirements-dev.txt
 
 
+# Runs the full test suite.  A non-zero exit here fails the build, so a broken
+# commit cannot produce a deployable image.
+#
+# **This stage only runs when it is built explicitly** (`--target test`).  It is
+# not in the dependency graph of `final` below — nothing COPYs from it — so a
+# plain `docker build` prunes it and runs no tests at all.  The CI workflow
+# therefore has a dedicated `Run tests` step; keep the two in step, or the suite
+# silently stops gating releases.
 FROM deps AS test
 
 COPY app/ ./app/
 COPY tests/ ./tests/
 COPY pytest.ini .
+# tests/test_log_grammar.py asserts the log grammar against these two documents,
+# so they are part of the test inputs, not just prose.
+COPY docs/ ./docs/
+COPY OBSERVABILITY.md .
 
 RUN pytest --tb=short -q
 

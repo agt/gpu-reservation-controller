@@ -34,6 +34,8 @@ from typing import AsyncIterator, Callable, Optional, TypeVar
 from kubernetes import client as k8s_client, config as k8s_config, watch
 from kubernetes.client.rest import ApiException
 
+from .log_fields import kv
+
 log = logging.getLogger(__name__)
 
 # Initialised once by init_k8s(); used by all functions in this module.
@@ -50,10 +52,10 @@ def init_k8s(kubeconfig_path: Optional[str]) -> None:
     global _core_v1
     if kubeconfig_path:
         k8s_config.load_kube_config(config_file=kubeconfig_path)
-        log.info("Kubernetes: loaded kubeconfig from %s", kubeconfig_path)
+        log.info("%s", kv(event="k8s.auth", mode="kubeconfig", path=kubeconfig_path))
     else:
         k8s_config.load_incluster_config()
-        log.info("Kubernetes: using in-cluster service-account credentials")
+        log.info("%s", kv(event="k8s.auth", mode="in_cluster"))
     _core_v1 = k8s_client.CoreV1Api()
 
 
@@ -117,12 +119,11 @@ def get_pod_min_runtime_seconds(pod) -> Optional[int]:
         value = int(raw)
         return value if value > 0 else None
     except (ValueError, TypeError):
-        log.warning(
-            "Pod %s/%s has non-integer horae/minimum-runtime-seconds=%r; ignoring",
-            pod.metadata.namespace,
-            pod.metadata.name,
-            raw,
-        )
+        log.warning("%s", kv(
+            event="pod.annotation_invalid",
+            ns=pod.metadata.namespace, pod=pod.metadata.name,
+            annotation="horae/minimum-runtime-seconds", value=raw,
+        ))
         return None
 
 
@@ -326,7 +327,7 @@ async def _run(fn: Callable[..., _T], *args, **kwargs) -> _T:
 
 async def read_pod(name: str, namespace: str) -> "k8s_client.V1Pod":
     """Fetch the current pod object (re-read before patching to get fresh state)."""
-    log.debug("k8s: read_namespaced_pod %s/%s", namespace, name)
+    log.debug("%s", kv(event="k8s.read_pod", ns=namespace, pod=name))
     return await _run(_core_v1.read_namespaced_pod, name, namespace)
 
 
@@ -390,9 +391,7 @@ async def snapshot_tolerated_pods(
     an additional pod label whose value is captured into
     ``ToleratedPodInfo.group_label``; unset ⇒ the field stays None.
     """
-    log.debug(
-        "k8s: list_pod_for_all_namespaces selector=gpu-class (tolerated snapshot)"
-    )
+    log.debug("%s", kv(event="k8s.list_pods", selector="gpu-class", purpose="tolerated_snapshot"))
     pod_list = await _run(
         _core_v1.list_pod_for_all_namespaces, label_selector="gpu-class"
     )
@@ -428,7 +427,7 @@ async def snapshot_tolerated_pods(
                 guaranteed_until=guaranteed_until,
             )
         )
-    log.debug("k8s: tolerated snapshot returned %d pod(s)", len(out))
+    log.debug("%s", kv(event="k8s.list_pods_done", purpose="tolerated_snapshot", count=len(out)))
     return out
 
 
@@ -448,7 +447,7 @@ async def snapshot_node_gpu_inventory(
     per-node accounting (whether any *single* node can host a multi-GPU pod)
     reads the breakdown directly.
     """
-    log.debug("k8s: list_node (gpu inventory snapshot)")
+    log.debug("%s", kv(event="k8s.list_nodes", purpose="gpu_inventory"))
     node_list = await _run(_core_v1.list_node)
     inventory: dict[str, dict[str, int]] = {}
     for node in node_list.items:
@@ -465,16 +464,20 @@ async def snapshot_node_gpu_inventory(
         try:
             gpus = int(raw)
         except (ValueError, TypeError):
-            log.warning(
-                "Node %s has non-integer allocatable %s=%r; treating as 0",
-                node.metadata.name,
-                gpu_resource,
-                raw,
-            )
+            log.warning("%s", kv(
+                event="k8s.node_allocatable_invalid", node=node.metadata.name,
+                resource=gpu_resource, value=raw,
+            ))
             gpus = 0
         for gpu_class in classes:
             inventory.setdefault(gpu_class, {})[node.metadata.name] = gpus
-    log.debug("k8s: node gpu inventory snapshot: %s", inventory)
+    # The inventory is a nested map, so it is fanned out to one line per class
+    # rather than emitted as a dict inside a single field.
+    for _cls, _nodes in sorted(inventory.items()):
+        log.debug("%s", kv(
+            event="k8s.node_inventory", clabel=_cls,
+            nodes=len(_nodes), total=sum(_nodes.values()),
+        ))
     return inventory
 
 
@@ -536,19 +539,15 @@ async def apply_toleration(
         "metadata": {"annotations": {"horae/booking-reference": booking_reference}},
         "spec": {"tolerations": existing + [new_tol]},
     }
-    log.debug(
-        "k8s: patch_namespaced_pod %s/%s (add toleration %s=%s:NoSchedule, booking=%s)",
-        namespace, pod_name, tol_key, tol_value, booking_reference,
-    )
+    log.debug("%s", kv(
+        event="k8s.patch_pod", ns=namespace, pod=pod_name, patch="toleration",
+        tol_key=tol_key, tol_value=tol_value, booking_ref=booking_reference,
+    ))
     await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
-    log.info(
-        "Applied toleration %s=%s:NoSchedule to pod %s/%s (booking=%s)",
-        tol_key,
-        tol_value,
-        namespace,
-        pod_name,
-        booking_reference,
-    )
+    log.info("%s", kv(
+        event="pod.toleration_applied", ns=namespace, pod=pod_name,
+        tol_key=tol_key, tol_value=tol_value, booking_ref=booking_reference,
+    ))
 
 
 async def remove_scheduling_gate(
@@ -561,22 +560,20 @@ async def remove_scheduling_gate(
     """
     existing_gates = pod.spec.scheduling_gates or []
     if not any(g.name == gate_name for g in existing_gates):
-        log.debug(
-            "k8s: scheduling gate %r not present on pod %s/%s; skipping removal",
-            gate_name, namespace, pod_name,
-        )
+        log.debug("%s", kv(
+            event="pod.gate_absent", ns=namespace, pod=pod_name, gate=gate_name,
+        ))
         return
 
     patch = {"spec": {"schedulingGates": [{"name": gate_name, "$patch": "delete"}]}}
-    log.debug(
-        "k8s: removing scheduling gate %r from pod %s/%s",
-        gate_name, namespace, pod_name,
-    )
+    log.debug("%s", kv(
+        event="k8s.patch_pod", ns=namespace, pod=pod_name,
+        patch="gate_remove", gate=gate_name,
+    ))
     await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
-    log.info(
-        "Removed scheduling gate %r from pod %s/%s",
-        gate_name, namespace, pod_name,
-    )
+    log.info("%s", kv(
+        event="pod.gate_removed", ns=namespace, pod=pod_name, gate=gate_name,
+    ))
 
 
 async def annotate_runtime_guarantee(
@@ -596,10 +593,10 @@ async def annotate_runtime_guarantee(
     reservation state (``ControllerState.guarantee_end``).
     """
     until_str = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
-    log.debug(
-        "k8s: patch_namespaced_pod %s/%s (runtime guarantee: %ds, until %s)",
-        namespace, pod_name, seconds, until_str,
-    )
+    log.debug("%s", kv(
+        event="k8s.patch_pod", ns=namespace, pod=pod_name, patch="runtime_guarantee",
+        guarantee_s=seconds, until=until_str,
+    ))
     patch = {
         "metadata": {
             "annotations": {
@@ -610,13 +607,10 @@ async def annotate_runtime_guarantee(
         },
     }
     await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
-    log.info(
-        "Recorded runtime guarantee on pod %s/%s: %ds (until %s)",
-        namespace,
-        pod_name,
-        seconds,
-        until_str,
-    )
+    log.info("%s", kv(
+        event="pod.guarantee_recorded", ns=namespace, pod=pod_name,
+        guarantee_s=seconds, until=until_str,
+    ))
 
 
 async def annotate_guarantee_status(
@@ -640,13 +634,13 @@ async def annotate_guarantee_status(
         annotations["horae/guaranteed-until"] = guaranteed_until.strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
-    log.debug(
-        "k8s: patch_namespaced_pod %s/%s (guarantee status: %s)",
-        namespace, pod_name, status,
-    )
+    log.debug("%s", kv(
+        event="k8s.patch_pod", ns=namespace, pod=pod_name,
+        patch="guarantee_status", gstatus=status,
+    ))
     patch = {"metadata": {"annotations": annotations}}
     await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
-    log.info("Guarantee status on pod %s/%s: %s", namespace, pod_name, status)
+    log.info("%s", kv(event="pod.guarantee_status", ns=namespace, pod=pod_name, gstatus=status))
 
 
 async def annotate_termination_warning(
@@ -666,10 +660,10 @@ async def annotate_termination_warning(
     state); a widget should treat them as a best-effort heads-up.
     """
     at_str = terminate_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-    log.debug(
-        "k8s: patch_namespaced_pod %s/%s (termination warning: at %s, risk %s)",
-        namespace, pod_name, at_str, risk,
-    )
+    log.debug("%s", kv(
+        event="k8s.patch_pod", ns=namespace, pod=pod_name,
+        patch="termination_warning", at=at_str, risk=risk,
+    ))
     patch = {
         "metadata": {
             "annotations": {
@@ -680,13 +674,9 @@ async def annotate_termination_warning(
         },
     }
     await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
-    log.info(
-        "Termination warning on pod %s/%s: may be preempted at %s (risk %s)",
-        namespace,
-        pod_name,
-        at_str,
-        risk,
-    )
+    log.info("%s", kv(
+        event="pod.termination_warned", ns=namespace, pod=pod_name, at=at_str, risk=risk,
+    ))
 
 
 async def clear_termination_warning(pod_name: str, namespace: str) -> None:
@@ -697,10 +687,10 @@ async def clear_termination_warning(pod_name: str, namespace: str) -> None:
     would mislead.  Setting each annotation value to ``None`` in a strategic
     merge patch deletes the key.
     """
-    log.debug(
-        "k8s: patch_namespaced_pod %s/%s (clear termination warning)",
-        namespace, pod_name,
-    )
+    log.debug("%s", kv(
+        event="k8s.patch_pod", ns=namespace, pod=pod_name,
+        patch="termination_warning_clear",
+    ))
     patch = {
         "metadata": {
             "annotations": {
@@ -711,7 +701,7 @@ async def clear_termination_warning(pod_name: str, namespace: str) -> None:
         },
     }
     await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
-    log.info("Cleared termination warning on pod %s/%s", namespace, pod_name)
+    log.info("%s", kv(event="pod.termination_warning_cleared", ns=namespace, pod=pod_name))
 
 
 async def _emit_pod_event(
@@ -753,9 +743,9 @@ async def _emit_pod_event(
         reporting_component="gpu-reservation-controller",
         action=action,
     )
-    log.debug(
-        "k8s: create_namespaced_event %s (pod=%s, reason=%s)", namespace, pod_name, reason
-    )
+    log.debug("%s", kv(
+        event="k8s.create_event", ns=namespace, pod=pod_name, reason=reason,
+    ))
     await _run(_core_v1.create_namespaced_event, namespace, event)
 
 
@@ -788,13 +778,10 @@ async def emit_runtime_guaranteed_event(
             f"is needed."
         ),
     )
-    log.info(
-        "Emitted RuntimeGuaranteed event for pod %s/%s (guaranteed=%ds, until=%s)",
-        namespace,
-        pod_name,
-        seconds,
-        until_str,
-    )
+    log.info("%s", kv(
+        event="k8s.event_emitted", ns=namespace, pod=pod_name,
+        reason="RuntimeGuaranteed", guarantee_s=seconds, until=until_str,
+    ))
 
 
 async def delete_pod(name: str, namespace: str) -> None:
@@ -803,13 +790,13 @@ async def delete_pod(name: str, namespace: str) -> None:
     A 404 response is silently ignored — the pod may have already been removed
     by the time the controller processes the cancellation.
     """
-    log.debug("k8s: delete_namespaced_pod %s/%s", namespace, name)
+    log.debug("%s", kv(event="k8s.delete_pod", ns=namespace, pod=name))
     try:
         await _run(_core_v1.delete_namespaced_pod, name, namespace)
-        log.info("Deleted pod %s/%s", namespace, name)
+        log.info("%s", kv(event="pod.deleted", ns=namespace, pod=name))
     except ApiException as exc:
         if exc.status == 404:
-            log.debug("Pod %s/%s already gone (404)", namespace, name)
+            log.debug("%s", kv(event="pod.already_gone", ns=namespace, pod=name, status=404))
             return
         raise
 
@@ -835,11 +822,9 @@ async def emit_preempted_event(
         action="PreemptPod",
         message=message,
     )
-    log.info(
-        "Emitted Preempted event for pod %s/%s",
-        namespace,
-        pod_name,
-    )
+    log.info("%s", kv(
+        event="k8s.event_emitted", ns=namespace, pod=pod_name, reason="Preempted",
+    ))
 
 
 async def emit_reservation_cancelled_event(
@@ -858,11 +843,9 @@ async def emit_reservation_cancelled_event(
         action="EvictPod",
         message=f"Pod evicted: GPU reservation cancelled {cancelled_by_desc}.",
     )
-    log.info(
-        "Emitted ReservationCancelled event for pod %s/%s",
-        namespace,
-        pod_name,
-    )
+    log.info("%s", kv(
+        event="k8s.event_emitted", ns=namespace, pod=pod_name, reason="ReservationCancelled",
+    ))
 
 
 async def emit_reservation_reassigned_event(
@@ -885,11 +868,9 @@ async def emit_reservation_reassigned_event(
         action="EvictPod",
         message=f"Pod evicted: GPU reservation reassigned {new_owner_desc}.",
     )
-    log.info(
-        "Emitted ReservationReassigned event for pod %s/%s",
-        namespace,
-        pod_name,
-    )
+    log.info("%s", kv(
+        event="k8s.event_emitted", ns=namespace, pod=pod_name, reason="ReservationReassigned",
+    ))
 
 
 async def emit_overstay_relinked_event(
@@ -919,13 +900,10 @@ async def emit_overstay_relinked_event(
             f"overstay. GPU access guaranteed until {until_str}."
         ),
     )
-    log.info(
-        "Emitted OverstayRelinked event for pod %s/%s (reservation=#%d, until=%s)",
-        namespace,
-        pod_name,
-        reservation_id,
-        until_str,
-    )
+    log.info("%s", kv(
+        event="k8s.event_emitted", ns=namespace, pod=pod_name,
+        reason="OverstayRelinked", rid=reservation_id, until=until_str,
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -964,17 +942,18 @@ class PodWatcher:
                     w = watch.Watch()
 
                     # LIST first — surfaces pods that exist before we started.
-                    log.debug(
-                        "k8s: list_pod_for_all_namespaces selector=%s",
-                        self._label_selector,
-                    )
+                    log.debug("%s", kv(
+                        event="k8s.list_pods", selector=self._label_selector,
+                        purpose="watch_seed",
+                    ))
                     pod_list = _core_v1.list_pod_for_all_namespaces(
                         label_selector=self._label_selector
                     )
-                    log.debug(
-                        "k8s: list returned %d pod(s), resourceVersion=%s",
-                        len(pod_list.items), pod_list.metadata.resource_version,
-                    )
+                    log.debug("%s", kv(
+                        event="k8s.list_pods_done", purpose="watch_seed",
+                        count=len(pod_list.items),
+                        rv=pod_list.metadata.resource_version,
+                    ))
                     for pod in pod_list.items:
                         loop.call_soon_threadsafe(queue.put_nowait, ("ADDED", pod))
                     resource_version = pod_list.metadata.resource_version
@@ -983,11 +962,10 @@ class PodWatcher:
                     # timeout_seconds asks the API server to close the stream cleanly
                     # before any proxy/LB idle timeout fires, avoiding spurious
                     # "Response ended prematurely" errors on reconnect.
-                    log.debug(
-                        "k8s: watch list_pod_for_all_namespaces selector=%s"
-                        " resourceVersion=%s timeout_seconds=270",
-                        self._label_selector, resource_version,
-                    )
+                    log.debug("%s", kv(
+                        event="k8s.watch_open", selector=self._label_selector,
+                        rv=resource_version, timeout_s=270,
+                    ))
                     _fail_count = 0  # successful LIST+WATCH cycle; reset counter
                     for event in w.stream(
                         _core_v1.list_pod_for_all_namespaces,
@@ -999,12 +977,10 @@ class PodWatcher:
                             w.stop()
                             return
                         obj = event["object"]
-                        log.debug(
-                            "k8s: watch event %s pod %s/%s",
-                            event["type"],
-                            obj.metadata.namespace,
-                            obj.metadata.name,
-                        )
+                        log.debug("%s", kv(
+                            event="k8s.watch_event", watch_event=event["type"],
+                            ns=obj.metadata.namespace, pod=obj.metadata.name,
+                        ))
                         loop.call_soon_threadsafe(
                             queue.put_nowait, (event["type"], event["object"])
                         )
@@ -1012,16 +988,14 @@ class PodWatcher:
                 except Exception as exc:  # noqa: BLE001
                     _fail_count += 1
                     if _fail_count == 1 or _fail_count % 120 == 0:
-                        log.warning(
-                            "Pod watch stream error (failure #%d): %s; "
-                            "reconnecting in 5 s",
-                            _fail_count,
-                            exc,
-                        )
+                        log.warning("%s", kv(
+                            event="k8s.watch_error", fails=_fail_count, err=exc,
+                            retry_s=5,
+                        ))
                     else:
-                        log.debug(
-                            "Pod watch stream ended (%s); reconnecting in 5 s", exc
-                        )
+                        log.debug("%s", kv(
+                            event="k8s.watch_ended", err=exc, retry_s=5,
+                        ))
                     # Interruptible sleep: a set stop_event returns immediately.
                     if stop_event.wait(5):
                         return

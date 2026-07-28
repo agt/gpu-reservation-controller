@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Literal, NamedTuple, Optional
 
+from .log_fields import kv
 from .schemas import ReservationResponse
 
 log = logging.getLogger(__name__)
@@ -760,12 +761,9 @@ class ControllerState:
             else:
                 deadline = now + timedelta(minutes=grace_minutes)
             self.noshow_deadlines[r.id] = deadline
-            log.debug(
-                "No-show tracking (%s): reservation #%d deadline=%s",
-                reason,
-                r.id,
-                deadline.strftime("%Y-%m-%d %H:%M"),
-            )
+            log.debug("%s", kv(
+                event="noshow.armed", rid=r.id, reason=reason, deadline=deadline,
+            ))
 
     def reconcile_noshow(self) -> None:
         """Prune no-show state for reservations no longer in the active list.
@@ -780,15 +778,15 @@ class ControllerState:
         stale = [rid for rid in self.noshow_deadlines if rid not in active_ids]
         for rid in stale:
             self.noshow_deadlines.pop(rid)
-            log.debug("No-show deadline pruned: reservation #%d left active list", rid)
+            log.debug("%s", kv(event="noshow.deadline_pruned", rid=rid, reason="left_active_list"))
         stale_noshow = [rid for rid in self.noshow_reservation_ids if rid not in active_ids]
         for rid in stale_noshow:
             self.noshow_reservation_ids.discard(rid)
-            log.info("No-show reservation #%d removed: left active list", rid)
+            log.info("%s", kv(event="noshow.removed", rid=rid, reason="left_active_list"))
         stale_pending = [rid for rid in self.pending_noshow_cancels if rid not in active_ids]
         for rid in stale_pending:
             self.pending_noshow_cancels.discard(rid)
-            log.debug("Pending no-show cancel #%d pruned: left active list", rid)
+            log.debug("%s", kv(event="noshow.cancel_pruned", rid=rid, reason="left_active_list"))
 
     def check_noshow_deadlines(self, now: datetime) -> None:
         """Declare no-shows for any reservation whose deadline has passed.
@@ -815,23 +813,18 @@ class ControllerState:
             # never be re-booked anyway, so "capacity opened" would be a
             # misleading log line (CODE-REVIEW D9).  Just drop the deadline.
             if res is not None and slot_end(res) <= now:
-                log.debug(
-                    "No-show deadline for reservation #%d passed but window already "
-                    "ended; not declaring no-show",
-                    rid,
-                )
+                log.debug("%s", kv(
+                    event="noshow.skipped", rid=rid, reason="window_already_ended",
+                ))
                 continue
             self.noshow_reservation_ids.add(rid)
             self.pending_noshow_cancels.add(rid)
             user = res.user.username if (res and res.user) else "unknown"
             gpu_class = self.gpu_class_labels.get(res.gpu_class_id, "unknown") if res else "unknown"
-            log.info(
-                "Reservation #%d declared no-show (user=%s, gpu-class=%s): "
-                "no matching pod appeared before deadline; queued for cancellation",
-                rid,
-                user,
-                gpu_class,
-            )
+            log.info("%s", kv(
+                event="noshow.declared", rid=rid, user=user, clabel=gpu_class,
+                reason="no_pod_before_deadline",
+            ))
 
     def mark_pod_seen_for_noshow(
         self,
@@ -866,13 +859,10 @@ class ControllerState:
                 if self.noshow_deadlines.pop(rid, None) is not None
             ]
             if cleared:
-                log.debug(
-                    "No-show deadline(s) cleared for reservation(s) %s: holder pod "
-                    "admitted (namespace=%s, gpu-class=%s)",
-                    sorted(cleared),
-                    namespace,
-                    gpu_class_label,
-                )
+                log.debug("%s", kv(
+                    event="noshow.cleared", ids=sorted(cleared), ns=namespace,
+                    clabel=gpu_class_label, reason="holder_pod_admitted",
+                ))
             return
 
         candidates = [
@@ -889,13 +879,10 @@ class ControllerState:
             return
         best = min(candidates, key=slot_start)
         self.noshow_deadlines.pop(best.id, None)
-        log.debug(
-            "No-show deadline cleared for reservation #%d: "
-            "matching pod already admitted (namespace=%s, gpu-class=%s)",
-            best.id,
-            namespace,
-            gpu_class_label,
-        )
+        log.debug("%s", kv(
+            event="noshow.cleared", rid=best.id, ns=namespace,
+            clabel=gpu_class_label, reason="matching_pod_admitted",
+        ))
 
     def refresh_claimed_reservations(
         self,
@@ -1087,28 +1074,20 @@ class ControllerState:
             group_label=group_label,
         )
         self.task_queue[pod_uid] = entry
-        log.info(
-            "Enqueued pod %s/%s for reservation #%d "
-            "(window %s–%s, %d GPU(s) reserved, pod requests %d)",
-            pod_namespace,
-            pod_name,
-            reservation.id,
-            slot_start(reservation).strftime("%Y-%m-%d %H:%M"),
-            slot_end(reservation).strftime("%H:%M"),
-            reservation.gpu_count,
-            gpu_requested,
-        )
+        log.info("%s", kv(
+            event="pod.enqueued", ns=pod_namespace, pod=pod_name, rid=reservation.id,
+            start=slot_start(reservation), end=slot_end(reservation),
+            reserved=reservation.gpu_count, gpus=gpu_requested,
+        ))
 
     def dequeue_pod(self, pod_uid: str) -> None:
         """Remove a pod from the work queue (e.g. pod deleted, or toleration applied)."""
         if pod_uid in self.task_queue:
             entry = self.task_queue.pop(pod_uid)
-            log.debug(
-                "Dequeued pod %s/%s (uid=%s)",
-                entry.pod_namespace,
-                entry.pod_name,
-                pod_uid,
-            )
+            log.debug("%s", kv(
+                event="pod.dequeued", ns=entry.pod_namespace, pod=entry.pod_name,
+                poduid=pod_uid,
+            ))
 
     def _chain_for(
         self,
@@ -1283,22 +1262,17 @@ class ControllerState:
                     next_attempt_at=datetime.now(timezone.utc),
                     group_label=entry.group_label,
                 )
-                log.info(
-                    "Pod %s/%s re-queued: reservation #%d cancelled, "
-                    "now targeting reservation #%d",
-                    entry.pod_namespace,
-                    entry.pod_name,
-                    entry.reservation.id,
-                    new_res.id,
-                )
+                log.info("%s", kv(
+                    event="pod.requeued", ns=entry.pod_namespace, pod=entry.pod_name,
+                    reason="reservation_cancelled",
+                    **{"old.rid": entry.reservation.id, "new.rid": new_res.id},
+                ))
             else:
-                log.info(
-                    "Pod %s/%s removed from queue: reservation #%d cancelled "
-                    "and no replacement found",
-                    entry.pod_namespace,
-                    entry.pod_name,
-                    entry.reservation.id,
-                )
+                log.info("%s", kv(
+                    event="pod.queue_dropped", ns=entry.pod_namespace,
+                    pod=entry.pod_name, rid=entry.reservation.id,
+                    reason="reservation_cancelled_no_replacement",
+                ))
 
     # ------------------------------------------------------------------
     # On-demand candidate management
@@ -1344,28 +1318,20 @@ class ControllerState:
             usage_group=usage_group,
         )
         self.ondemand_candidates[pod_uid] = candidate
-        log.info(
-            "On-demand candidate: pod %s/%s (uid=%s, gpu-class=%s, "
-            "gpus=%d, min-runtime=%ds, group=%s)",
-            pod_namespace,
-            pod_name,
-            pod_uid,
-            gpu_class_label,
-            gpu_requested,
-            min_runtime_seconds,
-            usage_group,
-        )
+        log.info("%s", kv(
+            event="ondemand.candidate_added", ns=pod_namespace, pod=pod_name,
+            poduid=pod_uid, clabel=gpu_class_label, gpus=gpu_requested,
+            min_runtime_s=min_runtime_seconds, group=usage_group,
+        ))
 
     def remove_ondemand_candidate(self, pod_uid: str) -> None:
         """Remove a pod from the on-demand candidate list (e.g. pod deleted)."""
         if pod_uid in self.ondemand_candidates:
             c = self.ondemand_candidates.pop(pod_uid)
-            log.debug(
-                "Removed on-demand candidate %s/%s (uid=%s)",
-                c.pod_namespace,
-                c.pod_name,
-                pod_uid,
-            )
+            log.debug("%s", kv(
+                event="ondemand.candidate_removed", ns=c.pod_namespace,
+                pod=c.pod_name, poduid=pod_uid,
+            ))
 
     # ------------------------------------------------------------------
     # Occupancy: availability, placement, release, reconciliation
@@ -1422,14 +1388,11 @@ class ControllerState:
         if reservation_id not in self.occupancy:
             self.occupancy[reservation_id] = {}
         self.occupancy[reservation_id][pod_uid] = gpu_count
-        log.debug(
-            "Recorded placement: reservation #%d ← pod uid=%s (%d GPU(s)); %d/%d free",
-            reservation_id,
-            pod_uid,
-            gpu_count,
-            self.available_by_id(reservation_id),
-            self._reservation_gpu_count(reservation_id),
-        )
+        log.debug("%s", kv(
+            event="occupancy.placed", rid=reservation_id, poduid=pod_uid,
+            gpus=gpu_count, free=self.available_by_id(reservation_id),
+            reserved=self._reservation_gpu_count(reservation_id),
+        ))
 
     def release_pod(self, pod_uid: str) -> Optional[int]:
         """Remove *pod_uid* from whatever reservation it occupies.
@@ -1440,12 +1403,10 @@ class ControllerState:
         for reservation_id, occupants in self.occupancy.items():
             if pod_uid in occupants:
                 gpu_count = occupants.pop(pod_uid)
-                log.info(
-                    "Released capacity: reservation #%d ← pod uid=%s freed %d GPU(s)",
-                    reservation_id,
-                    pod_uid,
-                    gpu_count,
-                )
+                log.info("%s", kv(
+                    event="occupancy.released", rid=reservation_id, poduid=pod_uid,
+                    gpus=gpu_count,
+                ))
                 # Clean up empty dicts to keep the map tidy.
                 if not occupants:
                     del self.occupancy[reservation_id]
@@ -1626,18 +1587,14 @@ class ControllerState:
         new_total = sum(g for pods in rebuilt.values() for g in pods.values())
         n_res = len(rebuilt)
         if new_total != old_total:
-            log.info(
-                "Occupancy reconciled: %d reservation(s), %d GPU(s) in use (was %d)",
-                n_res,
-                new_total,
-                old_total,
-            )
+            log.info("%s", kv(
+                event="occupancy.reconciled", reservations=n_res,
+                **{"new.used": new_total, "old.used": old_total},
+            ))
         else:
-            log.debug(
-                "Occupancy reconciled: %d reservation(s), %d GPU(s) in use",
-                n_res,
-                new_total,
-            )
+            log.debug("%s", kv(
+                event="occupancy.reconciled", reservations=n_res, used=new_total,
+            ))
 
     # ------------------------------------------------------------------
     # Preemption planning (demand-driven capacity recovery)
@@ -1827,11 +1784,10 @@ class ControllerState:
                 continue
             label = self._effective_label(r)
             if label is None:
-                log.debug(
-                    "Boundary demand: reservation #%d has no resolvable "
-                    "gpu-class label; skipping",
-                    r.id,
-                )
+                log.debug("%s", kv(
+                    event="preempt.demand_skipped", rid=r.id,
+                    reason="no_resolvable_class_label",
+                ))
                 continue
             need = max(0, self.available(r) - chained_gpus.get(r.id, 0))
             if need:

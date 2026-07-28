@@ -32,6 +32,8 @@ from .schemas import (
     ReservationResponse,
 )
 
+from .log_fields import kv
+
 log = logging.getLogger(__name__)
 
 
@@ -95,13 +97,10 @@ class ReservationClient:
             offset += limit
 
         active = sum(1 for r in results if r.status == "active")
-        log.info(
-            "Fetched %d reservations (%d active, %d cancelled) (today + %d days)",
-            len(results),
-            active,
-            len(results) - active,
-            self._lookahead_days,
-        )
+        log.info("%s", kv(
+            event="api.reservations_fetched", count=len(results), active=active,
+            cancelled=len(results) - active, lookahead_days=self._lookahead_days,
+        ))
         return results
 
     async def fetch_gpu_class(self, gpu_class_id: int) -> Optional[GpuClassDetail]:
@@ -111,20 +110,19 @@ class ReservationClient:
             resp.raise_for_status()
             return GpuClassDetail.model_validate(resp.json())
         except httpx.HTTPStatusError as exc:
-            log.warning(
-                "Could not fetch GPU class %d: HTTP %s",
-                gpu_class_id,
-                exc.response.status_code,
-            )
+            log.warning("%s", kv(
+                event="api.gpu_class_fetch_failed", cid=gpu_class_id,
+                status=exc.response.status_code,
+            ))
             return None
         except httpx.RequestError as exc:
-            log.warning("Could not fetch GPU class %d: %s", gpu_class_id, exc)
+            log.warning("%s", kv(event="api.gpu_class_fetch_failed", cid=gpu_class_id, err=exc))
             return None
         except (ValidationError, ValueError) as exc:
             # Malformed / unparseable payload (ValueError covers JSONDecodeError):
             # honor the documented "None on error" contract instead of letting it
             # abort the whole refresh cycle (B9).
-            log.warning("Could not parse GPU class %d response: %s", gpu_class_id, exc)
+            log.warning("%s", kv(event="api.gpu_class_parse_failed", cid=gpu_class_id, err=exc))
             return None
 
     async def fetch_gpu_classes(self) -> Optional[list[GpuClassDetail]]:
@@ -141,13 +139,13 @@ class ReservationClient:
             resp.raise_for_status()
             return [GpuClassDetail.model_validate(c) for c in resp.json()]
         except httpx.HTTPStatusError as exc:
-            log.warning("Could not fetch GPU classes: HTTP %s", exc.response.status_code)
+            log.warning("%s", kv(event="api.gpu_classes_fetch_failed", status=exc.response.status_code))
             return None
         except httpx.RequestError as exc:
-            log.warning("Could not fetch GPU classes: %s", exc)
+            log.warning("%s", kv(event="api.gpu_classes_fetch_failed", err=exc))
             return None
         except (ValidationError, ValueError) as exc:
-            log.warning("Could not parse GPU classes response: %s", exc)
+            log.warning("%s", kv(event="api.gpu_classes_parse_failed", err=exc))
             return None
 
     async def create_ondemand_reservation(
@@ -168,25 +166,20 @@ class ReservationClient:
             resp.raise_for_status()
             return ReservationResponse.model_validate(resp.json())
         except httpx.HTTPStatusError as exc:
-            log.info(
-                "On-demand reservation request denied for pod uid=%s: HTTP %s",
-                req.idempotency_key,
-                exc.response.status_code,
-            )
+            log.info("%s", kv(
+                event="api.lease_denied", poduid=req.idempotency_key,
+                status=exc.response.status_code,
+            ))
             return None
         except httpx.RequestError as exc:
-            log.warning(
-                "On-demand reservation request failed for pod uid=%s: %s",
-                req.idempotency_key,
-                exc,
-            )
+            log.warning("%s", kv(
+                event="api.lease_failed", poduid=req.idempotency_key, err=exc,
+            ))
             return None
         except (ValidationError, ValueError) as exc:
-            log.warning(
-                "Could not parse on-demand reservation response for pod uid=%s: %s",
-                req.idempotency_key,
-                exc,
-            )
+            log.warning("%s", kv(
+                event="api.lease_parse_failed", poduid=req.idempotency_key, err=exc,
+            ))
             return None
 
     async def select_preemption_victims(
@@ -210,18 +203,15 @@ class ReservationClient:
             resp.raise_for_status()
             return PreemptionSelectionResponse.model_validate(resp.json()).victim_pod_uids
         except httpx.HTTPStatusError as exc:
-            log.warning(
-                "Preemption victim selection request failed: HTTP %s",
-                exc.response.status_code,
-            )
+            log.warning("%s", kv(
+                event="api.victim_selection_failed", status=exc.response.status_code,
+            ))
             return None
         except httpx.RequestError as exc:
-            log.warning("Preemption victim selection request failed: %s", exc)
+            log.warning("%s", kv(event="api.victim_selection_failed", err=exc))
             return None
         except (ValidationError, ValueError) as exc:
-            log.warning(
-                "Could not parse preemption victim selection response: %s", exc
-            )
+            log.warning("%s", kv(event="api.victim_selection_parse_failed", err=exc))
             return None
 
     async def select_ondemand_admissions(
@@ -246,18 +236,15 @@ class ReservationClient:
             resp.raise_for_status()
             return OnDemandAdmissionResponse.model_validate(resp.json()).granted_pod_uids
         except httpx.HTTPStatusError as exc:
-            log.warning(
-                "On-demand admission selection request failed: HTTP %s",
-                exc.response.status_code,
-            )
+            log.warning("%s", kv(
+                event="api.admission_selection_failed", status=exc.response.status_code,
+            ))
             return None
         except httpx.RequestError as exc:
-            log.warning("On-demand admission selection request failed: %s", exc)
+            log.warning("%s", kv(event="api.admission_selection_failed", err=exc))
             return None
         except (ValidationError, ValueError) as exc:
-            log.warning(
-                "Could not parse on-demand admission selection response: %s", exc
-            )
+            log.warning("%s", kv(event="api.admission_selection_parse_failed", err=exc))
             return None
 
     async def cancel_reservation(self, reservation_id: int, reason: str) -> bool:
@@ -275,26 +262,23 @@ class ReservationClient:
                 timeout=15.0,
             )
             if resp.status_code == 404:
-                log.info(
-                    "Cancel request for reservation #%d (%s): already gone",
-                    reservation_id,
-                    reason,
-                )
+                log.info("%s", kv(
+                    event="api.cancel_already_gone", rid=reservation_id,
+                    reason=reason, status=404,
+                ))
                 return True
             resp.raise_for_status()
             return True
         except httpx.HTTPStatusError as exc:
-            log.warning(
-                "Could not cancel reservation #%d (%s): HTTP %s",
-                reservation_id,
-                reason,
-                exc.response.status_code,
-            )
+            log.warning("%s", kv(
+                event="api.cancel_failed", rid=reservation_id, reason=reason,
+                status=exc.response.status_code,
+            ))
             return False
         except httpx.RequestError as exc:
-            log.warning(
-                "Could not cancel reservation #%d (%s): %s", reservation_id, reason, exc
-            )
+            log.warning("%s", kv(
+                event="api.cancel_failed", rid=reservation_id, reason=reason, err=exc,
+            ))
             return False
 
     async def report_overstay(
@@ -317,19 +301,15 @@ class ReservationClient:
             resp.raise_for_status()
             return True
         except httpx.HTTPStatusError as exc:
-            log.warning(
-                "Could not report overstay for reservation #%d (pod %s): HTTP %s",
-                reservation_id,
-                req.pod_uid,
-                exc.response.status_code,
-            )
+            log.warning("%s", kv(
+                event="api.overstay_report_failed", rid=reservation_id,
+                poduid=req.pod_uid, status=exc.response.status_code,
+            ))
             return False
         except httpx.RequestError as exc:
-            log.warning(
-                "Could not report overstay for reservation #%d (pod %s): %s",
-                reservation_id,
-                req.pod_uid,
-                exc,
-            )
+            log.warning("%s", kv(
+                event="api.overstay_report_failed", rid=reservation_id,
+                poduid=req.pod_uid, err=exc,
+            ))
             return False
 

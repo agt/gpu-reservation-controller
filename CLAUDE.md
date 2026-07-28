@@ -50,6 +50,7 @@ app/
 ├── config.py             Config dataclass populated from environment variables
 ├── schemas.py            Pydantic models mirroring RESERVATION-API.md §6
 ├── reservation_client.py httpx async client — fetches reservations + GPU classes; creates/cancels JIT on-demand reservations
+├── log_fields.py         kv() — renders log message bodies as key=value fields (see docs/LOG-FIELDS.md)
 ├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, annotate_runtime_guarantee, emit_preempted_event, snapshot_tolerated_pods / snapshot_node_gpu_inventory (per-node) / snapshot_node_gpu_capacity (per-class collapse of it)
 └── controller.py         ControllerState, QueueEntry, matching, window arithmetic, preemption planning, preemption-risk forecast
 ```
@@ -464,6 +465,39 @@ victim) and once per **queue-processor tick** — always **before** `_adopt_pods
 threading one shared view list so a just-merged pod is not re-processed by
 adoption.  **RBAC / config**: no new Kubernetes permissions (merge reuses the
 existing pod-patch + cancel paths).
+
+### Log field grammar
+
+Log lines are moving to a single `key=value` grammar — an `event=` noun followed
+by flat fields, one concept per field, with no parentheses, slashes (`pod
+ns/name` becomes `ns=… pod=…`), arrows or `a..b` ranges inside a value.
+`docs/LOG-FIELDS.md` is the canonical field dictionary and `app/log_fields.py`
+(`kv()`) is the only thing that renders it.
+
+Both are **duplicated verbatim in the reservation app**, the same arrangement
+`docs/RESERVATION-API.md` / the app's `API.md` already use — update the copies
+together.  Sharing the dictionary is the point: a controller line and an app line
+join on the same key (`rid`, `poduid`, `cid`), which the old vocabularies could
+not do (`uid=` meant the pod UID here and nothing there; a reservation was `#42`
+here and `id=42` there).
+
+`kv()` is also the **sanitisation chokepoint** — pod names, namespaces and
+annotation values come from whoever created the pod, and it scrubs every value of
+non-printable characters so no call site can forget.  Never pre-format such a
+value into the message string.
+
+**Every call site in this repo now emits it** — no prose log lines remain, and the
+`actor=controller` envelope field is constant here (unlike the app, this daemon has
+one principal).  `tests/test_log_grammar.py` fails the build if a new call site
+skips `kv()`, emits a field `docs/LOG-FIELDS.md` does not document, or adds an
+`event=` that `OBSERVABILITY.md` does not list — which is what stops that file
+drifting the way it did before.  `OBSERVABILITY.md` is the per-event inventory.
+
+Two renames the grammar forced, worth knowing when reading older lines:
+`phase=` now means the **pod lifecycle phase** (`Pending`/`Running`/`Succeeded`/…)
+and the preemption sweep's A/B is `sweep=`; and the per-class `demand=`/`free=`
+maps the sweep used to print as dicts are **fanned out to one line per GPU class**,
+so each class's shortfall is independently greppable.
 
 ### Timezone
 

@@ -17,6 +17,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Builds the Dockerfile's `test` stage, which ends in `RUN pytest`, so a
+      # failing suite fails the job. This step is required: `test` is not in the
+      # build graph of the default `final` target, so BuildKit prunes it and the
+      # push build below never runs a single test.
+      #
+      # Deliberately before the registry login — a broken commit should fail
+      # without the job ever authenticating, let alone publishing.
+      - name: Run tests
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: test
+          push: false
+
       - name: Log in to registry
         uses: docker/login-action@v3
         with:
