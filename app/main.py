@@ -105,7 +105,11 @@ from .schemas import (
 )
 
 logging.basicConfig(
-    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    # ``actor=`` is rendered here rather than at each call site because it is
+    # constant: unlike the app, this daemon has exactly one principal. Emitting
+    # it anyway means a line from either side of the pair parses under the one
+    # ``key=value`` grammar (see docs/LOG-FIELDS.md).
+    format="%(asctime)s %(levelname)-8s %(name)s: actor=controller %(message)s",
 )
 log = logging.getLogger(__name__)
 

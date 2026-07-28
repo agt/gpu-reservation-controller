@@ -1,12 +1,30 @@
 # Observability reference
 
-This document inventories every structured log point in the controller.
+This document inventories the log points in the controller.
 All timestamps are UTC.  Log level is controlled by the `LOG_LEVEL`
 environment variable (default `INFO`); set to `DEBUG` to enable the
 debug-level entries below.
 
 Entries marked **†** were added during the pod-lifecycle logging review
 session and were not present in the original codebase.
+
+> **Two caveats on this document.**
+>
+> 1. **It is behind the code.** Roughly 40 log points added since it was written
+>    — guarantee-status and termination-warning reconciliation, overstay
+>    reporting, JIT lease merge, owner-change eviction, per-node feasibility, the
+>    capacity audit, and the batch admission path that replaced the single-pod
+>    `_try_request_lease` — are not listed below.
+> 2. **The message column is the *old* prose format.** Log lines are moving to a
+>    flat `key=value` grammar; `docs/LOG-FIELDS.md` is the canonical field
+>    dictionary and `app/log_fields.py` (`kv()`) renders it. Phase 1 — the
+>    helper, the sanitisation chokepoint, and the `actor=controller` envelope —
+>    is landed; the call sites below are converted per area in later phases,
+>    after which this file is rewritten from the dictionary. New log lines should
+>    use `kv()`.
+>
+> Every line below now carries the `actor=controller` envelope field ahead of
+> the message shown.
 
 ---
 
