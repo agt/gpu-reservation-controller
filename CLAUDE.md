@@ -51,6 +51,7 @@ app/
 ├── schemas.py            Pydantic models mirroring RESERVATION-API.md §6
 ├── reservation_client.py httpx async client — fetches reservations + GPU classes; creates/cancels JIT on-demand reservations
 ├── log_fields.py         kv() — renders log message bodies as key=value fields (see docs/LOG-FIELDS.md)
+├── trace.py              Per-unit-of-work trace ids + X-Client-Trace propagation (see **Trace ids**)
 ├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, annotate_runtime_guarantee, emit_preempted_event, snapshot_tolerated_pods / snapshot_node_gpu_inventory (per-node) / snapshot_node_gpu_capacity (per-class collapse of it)
 └── controller.py         ControllerState, QueueEntry, matching, window arithmetic, preemption planning, preemption-risk forecast
 ```
@@ -498,6 +499,44 @@ Two renames the grammar forced, worth knowing when reading older lines:
 and the preemption sweep's A/B is `sweep=`; and the per-class `demand=`/`free=`
 maps the sweep used to print as dicts are **fanned out to one line per GPU class**,
 so each class's shortfall is independently greppable.
+
+### Trace ids
+
+Every log line carries two **envelope** fields the formatter writes, not the call
+site: `actor=controller` (constant — this daemon has one principal) and `trace=`,
+a correlation id for the **unit of work** that produced the line.  `app/trace.py`
+owns it; it is deliberately *not* part of `log_fields.py`, which must stay
+byte-identical to the app's copy.
+
+`rid` and `poduid` already join an app line to a controller line *about the same
+object*.  A trace joins the lines of one **operation**, including the ones with no
+object in common — "what did that JIT admission batch do, on both sides" becomes
+one grep rather than a reconstruction from timestamps across concurrent loops.
+
+- **Minted per unit of work**, via `with trace.scope(prefix)`: one fetch cycle
+  (`fetch-`), one queue-processor tick (`queue-`), one preemption sweep (`sweep-`),
+  one capacity audit (`audit-`), one JIT admission batch (`jit-`), one pod watch
+  event (`pod-`), and lifespan startup (`startup-`).  The id is
+  `<prefix>-<10 hex chars>`; `-` when nothing is in scope.  Each background loop is
+  its own asyncio task and a task gets a *copy* of the context, so one loop's trace
+  is invisible to the others; work fanned out *within* a scope inherits it.
+- **Propagated outbound** by an httpx `event_hooks={"request": ...}` hook on the
+  `ReservationClient` — the one chokepoint, so no call site passes the header and an
+  endpoint added later cannot forget it.  The header is `X-Client-Trace`, exactly the
+  one the app's `_RequestLoggingMiddleware` already reads, so a controller-initiated
+  request lands in the app's log under the controller's trace **with no app-side
+  change**.  Nothing is sent when no scope is in force (the literal `-` must never be
+  echoed as if it were an id).
+- **Adopted inbound** on both inbound endpoints via the `_bind_trace(prefix)` yield
+  dependency (`push-` / `forecast-`), so a pushed reservation update is logged under
+  the *app's* trace and the two sides of that call join.
+- **The inbound value is untrusted** and is whitelist-matched against `_TRACE_RE`
+  (`[A-Za-z0-9_-]{1,36}`, kept identical to the app's), never escaped — the formatter
+  interpolates it and cannot decide to quote it, so a crafted newline would otherwise
+  forge whole log lines.  A value that fails is dropped for a locally-minted one.
+  Minted ids are truncated to satisfy the same regex, because the app **silently
+  discards** a trace it cannot match — propagation would look fine from here while the
+  far end logged `trace=-`.
 
 ### Timezone
 
