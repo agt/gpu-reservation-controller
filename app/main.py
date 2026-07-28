@@ -32,6 +32,7 @@ from typing import AsyncIterator, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 
 from .config import Config
+from .log_fields import kv
 from .controller import (
     TOLERATION_KEY,
     BoundaryPreemptionNeed,
@@ -462,12 +463,9 @@ async def _record_guarantee(
             fresh_pod, pod_name, namespace, seconds, guaranteed_until
         )
     except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "Failed to record runtime guarantee on pod %s/%s: %s",
-            namespace,
-            pod_name,
-            exc,
-        )
+        log.warning("%s", kv(
+            event="pod.guarantee_record_failed", ns=namespace, pod=pod_name, err=exc,
+        ))
 
 
 async def _enforce_scheduling_gate_removal(
@@ -482,10 +480,10 @@ async def _enforce_scheduling_gate_removal(
     try:
         await remove_scheduling_gate(pod_name, namespace, fresh_pod, gate_name)
     except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "Failed to remove scheduling gate %r from pod %s/%s: %s",
-            gate_name, namespace, pod_name, exc,
-        )
+        log.warning("%s", kv(
+            event="pod.gate_remove_failed", ns=namespace, pod=pod_name,
+            gate=gate_name, err=exc,
+        ))
 
 
 async def _try_apply_toleration(
@@ -512,15 +510,11 @@ async def _try_apply_toleration(
     available = state.available(entry.reservation, exclude_uid=uid)
     if entry.gpu_requested > available:
         now = datetime.now(timezone.utc)
-        log.debug(
-            "Pod %s/%s: GPU budget full "
-            "(%d requested > %d available of %d reserved); retry later",
-            entry.pod_namespace,
-            entry.pod_name,
-            entry.gpu_requested,
-            available,
-            entry.reservation.gpu_count,
-        )
+        log.debug("%s", kv(
+            event="pod.budget_full", ns=entry.pod_namespace, pod=entry.pod_name,
+            rid=entry.reservation.id, gpus=entry.gpu_requested,
+            free=available, reserved=entry.reservation.gpu_count,
+        ))
         entry.next_attempt_at = _jittered_retry_at(now)
         return False
 
@@ -535,23 +529,20 @@ async def _try_apply_toleration(
         # terminal-phase drop, so a finished pod is never tolerated / stamped with
         # a guarantee (which would only fail into the warning path) (CODE-REVIEW D1c).
         if is_terminal_phase(fresh_pod):
-            log.info(
-                "Pod %s/%s is %s; dropping from queue",
-                entry.pod_namespace,
-                entry.pod_name,
-                get_pod_phase(fresh_pod),
-            )
+            log.info("%s", kv(
+                event="pod.queue_dropped", ns=entry.pod_namespace, pod=entry.pod_name,
+                phase=get_pod_phase(fresh_pod), reason="terminal_phase",
+            ))
             state.release_pod(uid)
             return True
 
         if pod_has_toleration(
             fresh_pod, TOLERATION_KEY, entry.gpu_class_label, "NoSchedule"
         ):
-            log.info(
-                "Pod %s/%s already has toleration; dequeuing",
-                entry.pod_namespace,
-                entry.pod_name,
-            )
+            log.info("%s", kv(
+                event="pod.dequeued", ns=entry.pod_namespace, pod=entry.pod_name,
+                reason="toleration_already_present",
+            ))
         else:
             await apply_toleration(
                 entry.pod_name,
@@ -569,30 +560,21 @@ async def _try_apply_toleration(
             await _enforce_scheduling_gate_removal(
                 entry.pod_name, entry.pod_namespace, fresh_pod, scheduling_gate_name
             )
-            log.info(
-                "Admitted pod %s/%s under reservation #%d "
-                "(gpu-class=%s, gpus=%d, %d/%d free after placement, "
-                "guaranteed until %s)",
-                entry.pod_namespace,
-                entry.pod_name,
-                entry.reservation.id,
-                entry.gpu_class_label,
-                entry.gpu_requested,
-                state.available(entry.reservation),
-                entry.reservation.gpu_count,
-                guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            )
+            log.info("%s", kv(
+                event="pod.admitted", ns=entry.pod_namespace, pod=entry.pod_name,
+                rid=entry.reservation.id, clabel=entry.gpu_class_label,
+                gpus=entry.gpu_requested, free=state.available(entry.reservation),
+                reserved=entry.reservation.gpu_count, until=guaranteed_until,
+            ))
         return True
 
     except Exception as exc:  # noqa: BLE001
         # Roll back the optimistic reservation so capacity is not leaked.
         state.release_pod(uid)
-        log.warning(
-            "Error processing pod %s/%s: %s; will retry",
-            entry.pod_namespace,
-            entry.pod_name,
-            exc,
-        )
+        log.warning("%s", kv(
+            event="pod.admission_error", ns=entry.pod_namespace, pod=entry.pod_name,
+            rid=entry.reservation.id, err=exc,
+        ))
         entry.next_attempt_at = _jittered_retry_at(datetime.now(timezone.utc))
         return False
 
@@ -1324,12 +1306,10 @@ async def pod_watch_loop(
                             slot_start(entry.reservation) <= now < slot_end(entry.reservation)
                             and now >= entry.next_attempt_at
                         ):
-                            log.info(
-                                "Pod %s/%s arrived inside reservation window; "
-                                "attempting immediate toleration",
-                                namespace,
-                                name,
-                            )
+                            log.info("%s", kv(
+                                event="pod.fast_path", ns=namespace, pod=name,
+                                rid=entry.reservation.id,
+                            ))
                             if await _try_apply_toleration(state, uid, entry, config.scheduling_gate_name):
                                 state.dequeue_pod(uid)
                 continue
@@ -1355,13 +1335,10 @@ async def pod_watch_loop(
                 if event_type == "ADDED":
                     ts = get_pod_creation_timestamp(pod)
                     pod_created_at = ts if ts is not None else now
-                    log.debug(
-                        "Pod %s/%s ADDED: no admittable reservation (gpu-class=%s); "
-                        "routing to JIT on-demand queue",
-                        namespace,
-                        name,
-                        gpu_class_label,
-                    )
+                    log.debug("%s", kv(
+                        event="pod.routed_jit", ns=namespace, pod=name,
+                        clabel=gpu_class_label, reason="no_admittable_reservation",
+                    ))
                     state.add_ondemand_candidate(
                         uid, name, namespace, gpu_class_label, gpu_count, min_rt,
                         pod_created_at, group_label, usage_group,
@@ -1398,12 +1375,9 @@ async def pod_watch_loop(
                     ):
                         candidate.awaiting_schedule_signal = False
                         candidate.next_attempt_at = datetime.now(timezone.utc)
-                        log.debug(
-                            "On-demand candidate %s/%s: scheduling verdict "
-                            "arrived; re-attempting immediately",
-                            namespace,
-                            name,
-                        )
+                        log.debug("%s", kv(
+                            event="ondemand.schedule_verdict", ns=namespace, pod=name,
+                        ))
                         await _run_ondemand_admission(state, client, config)
                 continue
 
@@ -1418,11 +1392,10 @@ async def pod_watch_loop(
                     uid, name, namespace, gpu_class_label, gpu_count, group_label
                 )
             elif event_type == "ADDED":
-                log.debug(
-                    "Pod %s/%s: no matching reservation and not JIT-eligible; left Pending",
-                    namespace,
-                    name,
-                )
+                log.debug("%s", kv(
+                    event="pod.left_pending", ns=namespace, pod=name,
+                    reason="no_match_not_jit_eligible",
+                ))
 
 
 async def _cancel_pending_noshows(
@@ -1631,12 +1604,11 @@ async def queue_processor_loop(
 
             # --- window expired ---
             if now > end:
-                log.info(
-                    "Reservation #%d window expired; removing pod %s/%s from queue",
-                    entry.reservation.id,
-                    entry.pod_namespace,
-                    entry.pod_name,
-                )
+                log.info("%s", kv(
+                    event="pod.queue_dropped", ns=entry.pod_namespace,
+                    pod=entry.pod_name, rid=entry.reservation.id,
+                    reason="window_expired",
+                ))
                 to_remove.append(uid)
                 continue
 
@@ -1735,9 +1707,10 @@ async def _preempt_pod(
         pod_obj = await read_pod(name, namespace)
         await emit_preempted_event(pod_obj, name, namespace, message)
     except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "Could not emit Preempted event for pod %s/%s: %s", namespace, name, exc
-        )
+        log.warning("%s", kv(
+            event="k8s.event_failed", ns=namespace, pod=name,
+            reason="Preempted", err=exc,
+        ))
     if client is not None and config is not None and pod_obj is not None:
         await _report_overstay_if_any(
             state, client, config, pod_obj, now or datetime.now(timezone.utc), "preempted"
@@ -1746,7 +1719,7 @@ async def _preempt_pod(
         await delete_pod(name, namespace)
         state.release_pod(uid)
     except Exception as exc:  # noqa: BLE001
-        log.warning("Could not delete pod %s/%s: %s", namespace, name, exc)
+        log.warning("%s", kv(event="pod.delete_failed", ns=namespace, pod=name, err=exc))
 
 
 def _termination_warning_message(at_str: str, risk_str: str) -> str:
@@ -1811,12 +1784,9 @@ async def _apply_termination_warnings(
             ):
                 await clear_termination_warning(p.name, p.namespace)
         except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Failed to reconcile termination warning on pod %s/%s: %s",
-                p.namespace,
-                p.name,
-                exc,
-            )
+            log.warning("%s", kv(
+                event="pod.termination_warning_failed", ns=p.namespace, pod=p.name, err=exc,
+            ))
 
 
 async def _apply_guarantee_status(
@@ -1864,12 +1834,9 @@ async def _apply_guarantee_status(
                     p.name, p.namespace, desired.status, None
                 )
         except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Failed to reconcile guarantee status on pod %s/%s: %s",
-                p.namespace,
-                p.name,
-                exc,
-            )
+            log.warning("%s", kv(
+                event="pod.guarantee_status_failed", ns=p.namespace, pod=p.name, err=exc,
+            ))
 
 
 async def _adopt_pods(
@@ -1909,13 +1876,10 @@ async def _adopt_pods(
                 booking_reference,
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Failed to re-link overstay pod %s/%s to reservation #%d: %s",
-                view.namespace,
-                view.name,
-                res_new.id,
-                exc,
-            )
+            log.warning("%s", kv(
+                event="pod.relink_failed", ns=view.namespace, pod=view.name,
+                rid=res_new.id, err=exc,
+            ))
             continue
 
         # Patch landed: re-home occupancy and refresh the in-memory view so the
@@ -1925,13 +1889,10 @@ async def _adopt_pods(
         pods[idx] = replace(view, reservation_id=res_new.id)
 
         guaranteed_until = state.compute_guaranteed_until(now, res_new)
-        log.info(
-            "Re-linked overstay pod %s/%s to reservation #%d (guaranteed until %s)",
-            view.namespace,
-            view.name,
-            res_new.id,
-            guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        )
+        log.info("%s", kv(
+            event="pod.relinked", ns=view.namespace, pod=view.name,
+            rid=res_new.id, until=guaranteed_until, reason="adoption",
+        ))
         await _record_guarantee(
             view.name, view.namespace, fresh_pod, guaranteed_until, now
         )
@@ -1940,12 +1901,10 @@ async def _adopt_pods(
                 fresh_pod, view.name, view.namespace, res_new.id, guaranteed_until
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Could not emit OverstayRelinked event for pod %s/%s: %s",
-                view.namespace,
-                view.name,
-                exc,
-            )
+            log.warning("%s", kv(
+                event="k8s.event_failed", ns=view.namespace, pod=view.name,
+                reason="OverstayRelinked", err=exc,
+            ))
 
 
 async def _merge_ondemand_into_bookings(
@@ -1994,13 +1953,10 @@ async def _merge_ondemand_into_bookings(
                 booking_reference,
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Failed to merge on-demand pod %s/%s into booking #%d: %s",
-                view.namespace,
-                view.name,
-                res_new.id,
-                exc,
-            )
+            log.warning("%s", kv(
+                event="pod.merge_failed", ns=view.namespace, pod=view.name,
+                rid=res_new.id, err=exc,
+            ))
             continue
 
         # Patch landed: re-home occupancy and refresh the in-memory view so the
@@ -2010,15 +1966,11 @@ async def _merge_ondemand_into_bookings(
         pods[idx] = replace(view, reservation_id=res_new.id)
 
         guaranteed_until = state.compute_guaranteed_until(now, res_new)
-        log.info(
-            "Merged on-demand pod %s/%s from lease #%s into booking #%d "
-            "(guaranteed until %s)",
-            view.namespace,
-            view.name,
-            lease_id,
-            res_new.id,
-            guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        )
+        log.info("%s", kv(
+            event="pod.relinked", ns=view.namespace, pod=view.name,
+            rid=res_new.id, until=guaranteed_until, reason="ondemand_merge",
+            **{"old.rid": lease_id},
+        ))
         await _record_guarantee(
             view.name, view.namespace, fresh_pod, guaranteed_until, now
         )
@@ -2027,12 +1979,10 @@ async def _merge_ondemand_into_bookings(
                 fresh_pod, view.name, view.namespace, res_new.id, guaranteed_until
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "Could not emit OverstayRelinked event for merged pod %s/%s: %s",
-                view.namespace,
-                view.name,
-                exc,
-            )
+            log.warning("%s", kv(
+                event="k8s.event_failed", ns=view.namespace, pod=view.name,
+                reason="OverstayRelinked", err=exc,
+            ))
 
         # Retire the now-superfluous lease (penalty-exempt: its future time is
         # re-covered by the booking).  Best-effort; parks for retry on failure.
@@ -2123,10 +2073,9 @@ def _map_selected_victims(
     for uid in uids:
         entry = by_uid.get(uid)
         if entry is None:
-            log.warning(
-                "Preemption victim selection returned unknown pod uid=%s; ignoring",
-                uid,
-            )
+            log.warning("%s", kv(
+                event="preempt.unknown_victim", poduid=uid,
+            ))
             continue
         if uid in seen:
             continue
@@ -2155,9 +2104,7 @@ async def _select_boundary_victims(
         uids = await client.select_preemption_victims(_build_selection_request(need))
         if uids is not None:
             return _map_selected_victims(need, uids)
-        log.warning(
-            "Preemption victim selection unavailable; using local random fallback"
-        )
+        log.warning("%s", kv(event="preempt.selection_unavailable", fallback="local_random"))
     return select_victims_locally(need)
 
 
@@ -2204,14 +2151,14 @@ async def _run_preemption_sweep(
             TOLERATION_KEY, config.required_group_label
         )
     except Exception as exc:  # noqa: BLE001
-        log.warning("Preemption sweep: failed to snapshot pods: %s", exc, exc_info=True)
+        log.warning("%s", kv(event="preempt.snapshot_failed", target="pods", err=exc), exc_info=True)
         return
     try:
         capacity = await snapshot_node_gpu_capacity(TOLERATION_KEY)
     except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "Preemption sweep: failed to snapshot node GPU capacity: %s", exc, exc_info=True
-        )
+        log.warning("%s", kv(
+            event="preempt.snapshot_failed", target="node_capacity", err=exc,
+        ), exc_info=True)
         return
 
     async with state.reservation_lock:
@@ -2241,24 +2188,24 @@ async def _run_preemption_sweep(
             else:
                 selected = {}
             plan = build_preemption_plan(need, selected)
-            if plan.demand_by_class:
-                log.info(
-                    "Preemption sweep boundary=%s phase=%s: demand=%s free=%s kills=%d",
-                    boundary.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    phase,
-                    plan.demand_by_class,
-                    plan.free_by_class,
-                    len(plan.victims),
-                )
-            for gpu_class, shortfall in plan.unmet_by_class.items():
-                log.warning(
-                    "Preemption sweep boundary=%s phase=%s: %d GPU(s) of gpu-class=%s "
-                    "still short after preempting all eligible overstayers",
-                    boundary.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    phase,
-                    shortfall,
-                    gpu_class,
-                )
+            # demand/free/kills are per-class maps, so they are fanned out to one
+            # line per class rather than emitted as dicts inside single fields —
+            # each class's shortfall is then independently greppable and alertable.
+            kills_by_class: dict[str, int] = {}
+            for victim in plan.victims:
+                kills_by_class[victim.gpu_class] = kills_by_class.get(victim.gpu_class, 0) + 1
+            for gpu_class, demand in sorted(plan.demand_by_class.items()):
+                log.info("%s", kv(
+                    event="preempt.boundary", boundary=boundary, sweep=phase,
+                    clabel=gpu_class, demand=demand,
+                    free=plan.free_by_class.get(gpu_class, 0),
+                    kills=kills_by_class.get(gpu_class, 0),
+                ))
+            for gpu_class, shortfall in sorted(plan.unmet_by_class.items()):
+                log.warning("%s", kv(
+                    event="preempt.unmet", boundary=boundary, sweep=phase,
+                    clabel=gpu_class, short=shortfall,
+                ))
             for victim in plan.victims:
                 doomed.add(victim.uid)
                 to_kill.append((victim, _preemption_message(state, victim, boundary, now)))
@@ -2275,14 +2222,10 @@ async def _run_preemption_sweep(
             )
 
         for victim, message in to_kill:
-            log.info(
-                "Preempting pod %s/%s (gpu-class=%s, gpus=%d): %s",
-                victim.namespace,
-                victim.name,
-                victim.gpu_class,
-                victim.gpu_count,
-                message,
-            )
+            log.info("%s", kv(
+                event="pod.preempting", ns=victim.namespace, pod=victim.name,
+                clabel=victim.gpu_class, gpus=victim.gpu_count, detail=message,
+            ))
             await _preempt_pod(
                 state, victim.namespace, victim.name, victim.uid, message,
                 client=client, config=config, now=now,
@@ -2309,7 +2252,7 @@ async def preemption_loop(
         try:
             await _run_preemption_sweep(state, config, client)
         except Exception as exc:  # noqa: BLE001
-            log.error("Preemption sweep failed: %s", exc, exc_info=True)
+            log.error("%s", kv(event="preempt.sweep_failed", err=exc), exc_info=True)
 
 
 # ---------------------------------------------------------------------------

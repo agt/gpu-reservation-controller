@@ -9,10 +9,13 @@ a line from either side can be joined on the same key.
 `app/log_fields.py` (also duplicated in both repos) is the only thing that
 renders this grammar.
 
-> **Status: phase 1.** The helper, the sanitisation chokepoint and the envelope
-> are in place; the ~284 existing call sites still emit their original prose and
-> are converted per area in later phases. A field marked *(planned)* below has a
-> dictionary entry but no emitter yet.
+> **Status: phase 2.** Converted so far — app: `auth`, `reservations`,
+> `availability`; controller: pod admission, preemption, and the Kubernetes
+> client. Still emitting the original prose (phase 3): app admin CRUD, settings,
+> SICAD, email, data-io, controller push; controller JIT lease requests, no-show
+> handling, reservation fetch, capacity audit, the API client, and the watch
+> stream. A field marked *(planned)* below has a dictionary entry but no emitter
+> yet.
 
 ---
 
@@ -239,6 +242,7 @@ older `password changed` and `[field changed]` conventions. A no-op update omits
 | `domain` | string | domain part checked against the allowlist |
 | `allowed` | comma list | configured domain allowlist |
 | `errors` | comma list | python3-saml validation error codes |
+| `acct_provider` | string | the account's *actual* `auth_provider`, on a `reason=wrong_provider` denial (`provider` stays the attempted path) |
 | `course_id` | string | SICAD/AWSEd courseID backing a roster sync |
 | `team` | string | SICAD team display name |
 | `team_key` | string | SICAD `uniqueName`, the stable team upsert key |
@@ -248,6 +252,24 @@ older `password changed` and `[field changed]` conventions. A no-op update omits
 | `selector` / `rv` / `timeout_s` | string / string / int | Kubernetes LIST+WATCH parameters |
 | `watch_event` | `ADDED` \| `MODIFIED` \| `DELETED` | raw watch event type |
 | `path` | string | filesystem path |
+| `patch` | string | which patch a `k8s.patch_pod` is applying (`toleration`, `runtime_guarantee`, `guarantee_status`, `termination_warning`, `termination_warning_clear`, `gate_remove`) |
+| `purpose` | string | why a LIST was issued (`tolerated_snapshot`, `gpu_inventory`) |
+| `tol_key` / `tol_value` | string | the toleration being applied |
+| `resource` / `value` | string / string | the Kubernetes resource name and the malformed value, on an unparseable allocatable |
+| `nodes` | int | nodes carrying a GPU class, in a node-inventory line |
+
+### Selection, counts and diagnostics
+
+| key | type | meaning |
+|---|---|---|
+| `candidates` | int | size of a pool offered for selection (preemption victims, on-demand admission) |
+| `selected` / `granted` | int | how many of them were chosen |
+| `reservations` | int | reservations in the occupancy map |
+| `fallback` | string | what was used instead when a delegated call was unavailable |
+| `target` | string | which snapshot failed (`pods`, `node_capacity`) |
+| `source_id` / `source_kind` | int / `booking` \| `on_demand` | the reservation a *continue* was carried forward from |
+| `superseded` | bool | whether that source still held future time and was cancelled penalty-exempt |
+| `guarantee_s` | int seconds | guaranteed duration, where it shares a line with another duration |
 
 ---
 

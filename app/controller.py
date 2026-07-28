@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Literal, NamedTuple, Optional
 
+from .log_fields import kv
 from .schemas import ReservationResponse
 
 log = logging.getLogger(__name__)
@@ -1087,28 +1088,20 @@ class ControllerState:
             group_label=group_label,
         )
         self.task_queue[pod_uid] = entry
-        log.info(
-            "Enqueued pod %s/%s for reservation #%d "
-            "(window %s–%s, %d GPU(s) reserved, pod requests %d)",
-            pod_namespace,
-            pod_name,
-            reservation.id,
-            slot_start(reservation).strftime("%Y-%m-%d %H:%M"),
-            slot_end(reservation).strftime("%H:%M"),
-            reservation.gpu_count,
-            gpu_requested,
-        )
+        log.info("%s", kv(
+            event="pod.enqueued", ns=pod_namespace, pod=pod_name, rid=reservation.id,
+            start=slot_start(reservation), end=slot_end(reservation),
+            reserved=reservation.gpu_count, gpus=gpu_requested,
+        ))
 
     def dequeue_pod(self, pod_uid: str) -> None:
         """Remove a pod from the work queue (e.g. pod deleted, or toleration applied)."""
         if pod_uid in self.task_queue:
             entry = self.task_queue.pop(pod_uid)
-            log.debug(
-                "Dequeued pod %s/%s (uid=%s)",
-                entry.pod_namespace,
-                entry.pod_name,
-                pod_uid,
-            )
+            log.debug("%s", kv(
+                event="pod.dequeued", ns=entry.pod_namespace, pod=entry.pod_name,
+                poduid=pod_uid,
+            ))
 
     def _chain_for(
         self,
@@ -1283,22 +1276,17 @@ class ControllerState:
                     next_attempt_at=datetime.now(timezone.utc),
                     group_label=entry.group_label,
                 )
-                log.info(
-                    "Pod %s/%s re-queued: reservation #%d cancelled, "
-                    "now targeting reservation #%d",
-                    entry.pod_namespace,
-                    entry.pod_name,
-                    entry.reservation.id,
-                    new_res.id,
-                )
+                log.info("%s", kv(
+                    event="pod.requeued", ns=entry.pod_namespace, pod=entry.pod_name,
+                    reason="reservation_cancelled",
+                    **{"old.rid": entry.reservation.id, "new.rid": new_res.id},
+                ))
             else:
-                log.info(
-                    "Pod %s/%s removed from queue: reservation #%d cancelled "
-                    "and no replacement found",
-                    entry.pod_namespace,
-                    entry.pod_name,
-                    entry.reservation.id,
-                )
+                log.info("%s", kv(
+                    event="pod.queue_dropped", ns=entry.pod_namespace,
+                    pod=entry.pod_name, rid=entry.reservation.id,
+                    reason="reservation_cancelled_no_replacement",
+                ))
 
     # ------------------------------------------------------------------
     # On-demand candidate management
@@ -1422,14 +1410,11 @@ class ControllerState:
         if reservation_id not in self.occupancy:
             self.occupancy[reservation_id] = {}
         self.occupancy[reservation_id][pod_uid] = gpu_count
-        log.debug(
-            "Recorded placement: reservation #%d ← pod uid=%s (%d GPU(s)); %d/%d free",
-            reservation_id,
-            pod_uid,
-            gpu_count,
-            self.available_by_id(reservation_id),
-            self._reservation_gpu_count(reservation_id),
-        )
+        log.debug("%s", kv(
+            event="occupancy.placed", rid=reservation_id, poduid=pod_uid,
+            gpus=gpu_count, free=self.available_by_id(reservation_id),
+            reserved=self._reservation_gpu_count(reservation_id),
+        ))
 
     def release_pod(self, pod_uid: str) -> Optional[int]:
         """Remove *pod_uid* from whatever reservation it occupies.
@@ -1440,12 +1425,10 @@ class ControllerState:
         for reservation_id, occupants in self.occupancy.items():
             if pod_uid in occupants:
                 gpu_count = occupants.pop(pod_uid)
-                log.info(
-                    "Released capacity: reservation #%d ← pod uid=%s freed %d GPU(s)",
-                    reservation_id,
-                    pod_uid,
-                    gpu_count,
-                )
+                log.info("%s", kv(
+                    event="occupancy.released", rid=reservation_id, poduid=pod_uid,
+                    gpus=gpu_count,
+                ))
                 # Clean up empty dicts to keep the map tidy.
                 if not occupants:
                     del self.occupancy[reservation_id]
@@ -1626,18 +1609,14 @@ class ControllerState:
         new_total = sum(g for pods in rebuilt.values() for g in pods.values())
         n_res = len(rebuilt)
         if new_total != old_total:
-            log.info(
-                "Occupancy reconciled: %d reservation(s), %d GPU(s) in use (was %d)",
-                n_res,
-                new_total,
-                old_total,
-            )
+            log.info("%s", kv(
+                event="occupancy.reconciled", reservations=n_res,
+                **{"new.used": new_total, "old.used": old_total},
+            ))
         else:
-            log.debug(
-                "Occupancy reconciled: %d reservation(s), %d GPU(s) in use",
-                n_res,
-                new_total,
-            )
+            log.debug("%s", kv(
+                event="occupancy.reconciled", reservations=n_res, used=new_total,
+            ))
 
     # ------------------------------------------------------------------
     # Preemption planning (demand-driven capacity recovery)

@@ -486,10 +486,18 @@ annotation values come from whoever created the pod, and it scrubs every value o
 non-printable characters so no call site can forget.  Never pre-format such a
 value into the message string.
 
-**Phase 1 is landed**: the helper, the chokepoint, and the `actor=controller`
-envelope field (constant here — unlike the app, this daemon has one principal).
-The existing ~162 call sites still emit their original prose and are converted per
-area in later phases; new log lines should use `kv()`.
+**Converted so far**: the `actor=controller` envelope (constant here — unlike the
+app, this daemon has one principal), plus pod admission, preemption, and the whole
+Kubernetes client (`app/k8s_client.py`).  The remaining areas — JIT lease requests,
+no-show handling, reservation fetch, the capacity audit, the API client and the
+watch stream — still emit their original prose and are converted in a later phase;
+new log lines must use `kv()`.
+
+Two renames the grammar forced, worth knowing when reading older lines:
+`phase=` now means the **pod lifecycle phase** (`Pending`/`Running`/`Succeeded`/…)
+and the preemption sweep's A/B is `sweep=`; and the per-class `demand=`/`free=`
+maps the sweep used to print as dicts are **fanned out to one line per GPU class**,
+so each class's shortfall is independently greppable.
 
 ### Timezone
 
