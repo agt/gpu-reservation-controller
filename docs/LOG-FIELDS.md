@@ -9,13 +9,12 @@ a line from either side can be joined on the same key.
 `app/log_fields.py` (also duplicated in both repos) is the only thing that
 renders this grammar.
 
-> **Status: phase 2.** Converted so far — app: `auth`, `reservations`,
-> `availability`; controller: pod admission, preemption, and the Kubernetes
-> client. Still emitting the original prose (phase 3): app admin CRUD, settings,
-> SICAD, email, data-io, controller push; controller JIT lease requests, no-show
-> handling, reservation fetch, capacity audit, the API client, and the watch
-> stream. A field marked *(planned)* below has a dictionary entry but no emitter
-> yet.
+> **Status: phase 3 — conversion complete.** Every log call site in both repos
+> (286 of them) now emits this grammar; nothing is left in the original prose
+> format. A field marked *(planned)* below has a dictionary entry but no emitter
+> yet. Still to come (phase 4): the AST enforcement test that keeps new call
+> sites conformant, and rewriting the controller's `OBSERVABILITY.md` from this
+> dictionary.
 
 ---
 
@@ -217,10 +216,17 @@ follow this grammar and are not expected to.
 | `chg` | comma list | which fields an update changed |
 | `old.<field>` / `new.<field>` | scalar | before/after value of one changed field |
 
+Rendered by `log_fields.changes({field: (old, new)})`, splatted into `kv()`.
+
 A redacted field (password, Quill-managed HTML, `logo_data`, SMTP password)
-appears in `chg=` with **no** `old.`/`new.` pair — this one rule replaces the
-older `password changed` and `[field changed]` conventions. A no-op update omits
-`chg=` entirely rather than emitting the literal `no-op`.
+appears in `chg=` with **no** `old.`/`new.` pair — pass `log_fields.REDACTED`
+instead of a tuple. This one rule replaces the older `password changed` and
+`[field changed]` conventions. A no-op update omits `chg=` entirely rather than
+emitting the literal `no-op`.
+
+Inside a change pair, `None` renders as `null` rather than being omitted — the
+one deliberate exception to rule 3. A field going from unset to set must show
+both sides, whereas everywhere else an absent value means "not known".
 
 ### Availability, bulk and counts
 
@@ -258,6 +264,22 @@ older `password changed` and `[field changed]` conventions. A no-op update omits
 | `resource` / `value` | string / string | the Kubernetes resource name and the malformed value, on an unparseable allocatable |
 | `nodes` | int | nodes carrying a GPU class, in a node-inventory line |
 
+### Entity naming and provenance
+
+| key | type | meaning |
+|---|---|---|
+| `name` | string | human-readable name of the entity `event=` names (group, cohort, class, date range, service key, …) |
+| `source` | string | which subsystem drove a mutation (`sicad` on roster-driven user/membership changes) |
+| `mode` | string | which variant of an operation ran (`kubeconfig` \| `in_cluster` for k8s auth) |
+| `section` | string | which part of a multi-part operation a line reports (config import/export) |
+| `guard` | int | which JIT admission guard held a candidate (1, 3, 4, 5) |
+| `annotation` | string | the annotation key a value was read from, on a parse failure |
+| `url` | string | outbound URL being fetched |
+| `level` | string | configured log level, at startup |
+| `path` | string | filesystem path, or the configured `ROOT_PATH` |
+| `headers` | comma list | header names a feature reads, on the test-harness warning |
+| `loops` | comma list | background loops started |
+
 ### Selection, counts and diagnostics
 
 | key | type | meaning |
@@ -270,6 +292,19 @@ older `password changed` and `[field changed]` conventions. A no-op update omits
 | `source_id` / `source_kind` | int / `booking` \| `on_demand` | the reservation a *continue* was carried forward from |
 | `superseded` | bool | whether that source still held future time and was cancelled penalty-exempt |
 | `guarantee_s` | int seconds | guaranteed duration, where it shares a line with another duration |
+| `created` / `updated` | int | rows created / updated by one section of a config import |
+| `propagated` | int | records re-dated by a date-range edit |
+| `queued` | int | entries in the reserved work queue |
+| `cancellations` / `owner_changes` / `upserts` | int | deltas applied by an inbound push |
+| `classes` / `reservations` | int | counts of GPU classes / reservations after a refresh |
+| `clabels` | comma list | GPU class labels entering or leaving the on-demand pause set |
+| `overcommitted` | bool | whether a capacity mismatch is app-side-over-physical (the direction that pauses admission) |
+| `max_gpus` | int | ceiling written by a group/cohort GPU limit |
+| `offset_min` | int | reminder-email offset, in minutes before the window |
+| `retry_s` | int seconds | how long until the next attempt |
+| `submitted` / `deleted` | ISO-8601 UTC | when a JIT candidate's pod was created / removed |
+| `date_ranges` / `gpu_classes` / `cohorts` / `usage_groups` / `discount_schedules` | int | per-section counts on a config export |
+| `lookahead_days` | int | calendar days ahead a reservation fetch covered |
 
 ---
 

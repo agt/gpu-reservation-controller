@@ -8,26 +8,20 @@ debug-level entries below.
 Entries marked **†** were added during the pod-lifecycle logging review
 session and were not present in the original codebase.
 
-> **Two caveats on this document.**
+> **This document is superseded and awaiting rewrite.**
 >
-> 1. **It is behind the code.** Roughly 40 log points added since it was written
+> 1. **Every message below is in the old prose format.** All 162 log call sites
+>    now emit a flat `key=value` grammar instead; `docs/LOG-FIELDS.md` is the
+>    canonical field dictionary and `app/log_fields.py` (`kv()`) renders it.
+>    Nothing in the *Message* column matches what the controller actually logs
+>    today — read it for the inventory of log *points*, not their text.
+> 2. **It is also incomplete.** Roughly 40 log points added since it was written
 >    — guarantee-status and termination-warning reconciliation, overstay
 >    reporting, JIT lease merge, owner-change eviction, per-node feasibility, the
 >    capacity audit, and the batch admission path that replaced the single-pod
->    `_try_request_lease` — are not listed below.
-> 2. **The message column is the *old* prose format, and much of it is already
->    stale.** Log lines are moving to a flat `key=value` grammar;
->    `docs/LOG-FIELDS.md` is the canonical field dictionary and
->    `app/log_fields.py` (`kv()`) renders it. **Already converted — so the
->    messages below no longer match what is emitted:** pod admission, preemption,
->    and every `app/k8s_client.py` line (the *Reserved-path pod admission*,
->    *Preemption sweep*, *Occupancy*, *Kubernetes API traces* and
->    *Scheduling-gate removal* sections). Still accurate: the JIT lease request,
->    no-show, reservation fetch and pod-watch-stream sections. This file is
->    rewritten from the dictionary once conversion completes.
+>    `_try_request_lease` — were never listed here.
 >
-> Every line below now carries the `actor=controller` envelope field ahead of
-> the message shown.
+> Rewriting this file from the dictionary is the remaining phase-4 task.
 
 ---
 

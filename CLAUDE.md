@@ -486,12 +486,9 @@ annotation values come from whoever created the pod, and it scrubs every value o
 non-printable characters so no call site can forget.  Never pre-format such a
 value into the message string.
 
-**Converted so far**: the `actor=controller` envelope (constant here — unlike the
-app, this daemon has one principal), plus pod admission, preemption, and the whole
-Kubernetes client (`app/k8s_client.py`).  The remaining areas — JIT lease requests,
-no-show handling, reservation fetch, the capacity audit, the API client and the
-watch stream — still emit their original prose and are converted in a later phase;
-new log lines must use `kv()`.
+**Every call site in this repo now emits it** — no prose log lines remain, and the
+`actor=controller` envelope field is constant here (unlike the app, this daemon has
+one principal).  New log lines must use `kv()`.
 
 Two renames the grammar forced, worth knowing when reading older lines:
 `phase=` now means the **pod lifecycle phase** (`Pending`/`Running`/`Succeeded`/…)

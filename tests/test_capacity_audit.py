@@ -108,7 +108,9 @@ class TestRunCapacityAudit:
 
         assert state.overcommitted_gpu_classes == {GPU_CLASS_LABEL}
         assert any(
-            "Capacity mismatch" in r.message and r.levelno == logging.WARNING
+            "event=capacity_audit.mismatch" in r.getMessage()
+            and "overcommitted=true" in r.getMessage()
+            and r.levelno == logging.WARNING
             for r in caplog.records
         )
 
@@ -122,7 +124,9 @@ class TestRunCapacityAudit:
             asyncio.run(m._run_capacity_audit(state, SimpleNamespace()))
 
         assert state.overcommitted_gpu_classes == set()
-        assert not any("Capacity mismatch" in r.message for r in caplog.records)
+        assert not any(
+            "event=capacity_audit.mismatch" in r.getMessage() for r in caplog.records
+        )
 
     def test_under_provisioned_warns_but_does_not_pause(self, monkeypatch, caplog):
         m = _main_module(monkeypatch)
@@ -134,7 +138,11 @@ class TestRunCapacityAudit:
             asyncio.run(m._run_capacity_audit(state, SimpleNamespace()))
 
         assert state.overcommitted_gpu_classes == set()
-        assert any("Capacity mismatch" in r.message for r in caplog.records)
+        assert any(
+            "event=capacity_audit.mismatch" in r.getMessage()
+            and "overcommitted=false" in r.getMessage()
+            for r in caplog.records
+        )
 
     def test_recovery_clears_pause(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -164,7 +172,9 @@ class TestRunCapacityAudit:
 
         assert state.overcommitted_gpu_classes == {GPU_CLASS_LABEL}
         assert any(
-            "failed to snapshot node GPU capacity" in r.message for r in caplog.records
+            "event=capacity_audit.snapshot_failed" in r.getMessage()
+            and "target=node_capacity" in r.getMessage()
+            for r in caplog.records
         )
 
     def test_only_affected_class_paused(self, monkeypatch):

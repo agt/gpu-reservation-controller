@@ -52,10 +52,10 @@ def init_k8s(kubeconfig_path: Optional[str]) -> None:
     global _core_v1
     if kubeconfig_path:
         k8s_config.load_kube_config(config_file=kubeconfig_path)
-        log.info("Kubernetes: loaded kubeconfig from %s", kubeconfig_path)
+        log.info("%s", kv(event="k8s.auth", mode="kubeconfig", path=kubeconfig_path))
     else:
         k8s_config.load_incluster_config()
-        log.info("Kubernetes: using in-cluster service-account credentials")
+        log.info("%s", kv(event="k8s.auth", mode="in_cluster"))
     _core_v1 = k8s_client.CoreV1Api()
 
 
@@ -119,12 +119,11 @@ def get_pod_min_runtime_seconds(pod) -> Optional[int]:
         value = int(raw)
         return value if value > 0 else None
     except (ValueError, TypeError):
-        log.warning(
-            "Pod %s/%s has non-integer horae/minimum-runtime-seconds=%r; ignoring",
-            pod.metadata.namespace,
-            pod.metadata.name,
-            raw,
-        )
+        log.warning("%s", kv(
+            event="pod.annotation_invalid",
+            ns=pod.metadata.namespace, pod=pod.metadata.name,
+            annotation="horae/minimum-runtime-seconds", value=raw,
+        ))
         return None
 
 
@@ -943,17 +942,18 @@ class PodWatcher:
                     w = watch.Watch()
 
                     # LIST first — surfaces pods that exist before we started.
-                    log.debug(
-                        "k8s: list_pod_for_all_namespaces selector=%s",
-                        self._label_selector,
-                    )
+                    log.debug("%s", kv(
+                        event="k8s.list_pods", selector=self._label_selector,
+                        purpose="watch_seed",
+                    ))
                     pod_list = _core_v1.list_pod_for_all_namespaces(
                         label_selector=self._label_selector
                     )
-                    log.debug(
-                        "k8s: list returned %d pod(s), resourceVersion=%s",
-                        len(pod_list.items), pod_list.metadata.resource_version,
-                    )
+                    log.debug("%s", kv(
+                        event="k8s.list_pods_done", purpose="watch_seed",
+                        count=len(pod_list.items),
+                        rv=pod_list.metadata.resource_version,
+                    ))
                     for pod in pod_list.items:
                         loop.call_soon_threadsafe(queue.put_nowait, ("ADDED", pod))
                     resource_version = pod_list.metadata.resource_version
@@ -962,11 +962,10 @@ class PodWatcher:
                     # timeout_seconds asks the API server to close the stream cleanly
                     # before any proxy/LB idle timeout fires, avoiding spurious
                     # "Response ended prematurely" errors on reconnect.
-                    log.debug(
-                        "k8s: watch list_pod_for_all_namespaces selector=%s"
-                        " resourceVersion=%s timeout_seconds=270",
-                        self._label_selector, resource_version,
-                    )
+                    log.debug("%s", kv(
+                        event="k8s.watch_open", selector=self._label_selector,
+                        rv=resource_version, timeout_s=270,
+                    ))
                     _fail_count = 0  # successful LIST+WATCH cycle; reset counter
                     for event in w.stream(
                         _core_v1.list_pod_for_all_namespaces,
@@ -978,12 +977,10 @@ class PodWatcher:
                             w.stop()
                             return
                         obj = event["object"]
-                        log.debug(
-                            "k8s: watch event %s pod %s/%s",
-                            event["type"],
-                            obj.metadata.namespace,
-                            obj.metadata.name,
-                        )
+                        log.debug("%s", kv(
+                            event="k8s.watch_event", watch_event=event["type"],
+                            ns=obj.metadata.namespace, pod=obj.metadata.name,
+                        ))
                         loop.call_soon_threadsafe(
                             queue.put_nowait, (event["type"], event["object"])
                         )
@@ -991,16 +988,14 @@ class PodWatcher:
                 except Exception as exc:  # noqa: BLE001
                     _fail_count += 1
                     if _fail_count == 1 or _fail_count % 120 == 0:
-                        log.warning(
-                            "Pod watch stream error (failure #%d): %s; "
-                            "reconnecting in 5 s",
-                            _fail_count,
-                            exc,
-                        )
+                        log.warning("%s", kv(
+                            event="k8s.watch_error", fails=_fail_count, err=exc,
+                            retry_s=5,
+                        ))
                     else:
-                        log.debug(
-                            "Pod watch stream ended (%s); reconnecting in 5 s", exc
-                        )
+                        log.debug("%s", kv(
+                            event="k8s.watch_ended", err=exc, retry_s=5,
+                        ))
                     # Interruptible sleep: a set stop_event returns immediately.
                     if stop_event.wait(5):
                         return

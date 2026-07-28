@@ -9,7 +9,7 @@ import datetime
 
 import pytest
 
-from app.log_fields import kv, scrub
+from app.log_fields import REDACTED, changes, kv, scrub
 
 
 # ---------------------------------------------------------------------------
@@ -200,3 +200,48 @@ def test_rendered_line_round_trips_through_a_naive_parser():
         "detail": "Not enough GPUs available (need 4)",
         "gpus": "4",
     }
+
+
+# ---------------------------------------------------------------------------
+# changes() — the chg= / old.<f> / new.<f> expansion
+# ---------------------------------------------------------------------------
+
+def test_changes_expands_to_chg_plus_old_new_pairs():
+    assert kv(event="user.updated", id=7, **changes({"role": ("user", "admin")})) == (
+        "event=user.updated id=7 chg=role old.role=user new.role=admin"
+    )
+
+
+def test_changes_lists_every_changed_field_in_chg():
+    line = kv(**changes({"role": ("user", "admin"), "is_active": (True, False)}))
+    assert line.startswith("chg=role,is_active ")
+
+
+def test_redacted_field_appears_in_chg_with_no_value():
+    # This one rule replaces the older `password changed` / `[field changed]`
+    # conventions — the field is named, the value never rendered.
+    line = kv(event="user.updated", **changes({"password": REDACTED}))
+    assert line == "event=user.updated chg=password"
+
+
+def test_redacted_and_normal_fields_coexist():
+    line = kv(**changes({"email": ("a@x", "b@x"), "password": REDACTED}))
+    assert line == "chg=email,password old.email=a@x new.email=b@x"
+
+
+def test_empty_change_map_contributes_nothing():
+    # A no-op update is a line with no chg= field, not the literal "no-op".
+    assert kv(event="user.updated", id=7, **changes({})) == "event=user.updated id=7"
+
+
+def test_none_inside_a_change_pair_renders_as_null():
+    # The deliberate exception to "absent means omitted": inside a change pair
+    # the value *is* the information, so unset->set must show both sides.
+    assert kv(**changes({"notes": (None, "hi")})) == "chg=notes old.notes=null new.notes=hi"
+    assert kv(**changes({"notes": ("hi", None)})) == "chg=notes old.notes=hi new.notes=null"
+
+
+def test_change_values_are_rendered_and_quoted_like_any_other_field():
+    line = kv(**changes({"is_active": (True, False), "name": ("a b", "c")}))
+    assert "old.is_active=true new.is_active=false" in line
+    assert 'old.name="a b" new.name=c' in line
