@@ -9,12 +9,13 @@ a line from either side can be joined on the same key.
 `app/log_fields.py` (also duplicated in both repos) is the only thing that
 renders this grammar.
 
-> **Status: phase 3 — conversion complete.** Every log call site in both repos
-> (286 of them) now emits this grammar; nothing is left in the original prose
-> format. A field marked *(planned)* below has a dictionary entry but no emitter
-> yet. Still to come (phase 4): the AST enforcement test that keeps new call
-> sites conformant, and rewriting the controller's `OBSERVABILITY.md` from this
-> dictionary.
+All 286 log call sites across the two repos emit this grammar, and
+`tests/test_log_grammar.py` (present in both) enforces it: every call must render
+through `kv()`, every field must appear in this dictionary, and every `event=`
+must appear in that repo's `OBSERVABILITY.md`. Adding a field or a log point
+without documenting it fails the suite.
+
+A field marked *(planned)* below has a dictionary entry but no emitter yet.
 
 ---
 
@@ -178,7 +179,11 @@ follow this grammar and are not expected to.
 | `until` | ISO-8601 UTC | runtime-guarantee end instant |
 | `at` | ISO-8601 UTC | projected termination-warning kill instant |
 | `locked_until` | ISO-8601 | account lockout expiry |
-| `dur_s` | int seconds | duration — disambiguate when two share a line: `min_runtime_s`, `lease_dur_s`, `waited_s`, `guarantee_s` |
+| `dur_s` | int seconds | duration, where a line carries only one |
+| `min_runtime_s` | int seconds | a pod's `horae/minimum-runtime-seconds` ask |
+| `lease_dur_s` | int seconds | granted JIT lease length (`min_runtime_s` + buffer) |
+| `waited_s` | int seconds | how long a JIT candidate waited before being deleted unplaced |
+| `guarantee_s` | int seconds | runtime-guarantee duration |
 
 ### Capacity
 
@@ -236,7 +241,10 @@ both sides, whereas everywhere else an absent value means "not known".
 | `privileged` | bool | whether admin/manager booking rules applied |
 | `n` | int | rows written by a bulk operation |
 | `ids` | comma list of int | ids affected in bulk |
-| `count` | int | fallback count — prefer a specific key (`active`, `cancelled`, `upserts`, `evicted`, `relinked`, `watched`, `preserved`) wherever the event distinguishes them |
+| `count` | int | fallback count — prefer a specific key wherever the event distinguishes them |
+| `active` / `cancelled` | int | reservations by status in a fetch result |
+| `watched` | int | reservations armed with a no-show deadline |
+| `pods` | comma list | pod identifiers a line is reporting about (`ns.name`) |
 | `fails` | int | consecutive failure counter (failed logins, watch-stream reconnects) |
 
 ### Auth, SICAD and Kubernetes traces
@@ -279,6 +287,7 @@ both sides, whereas everywhere else an absent value means "not known".
 | `path` | string | filesystem path, or the configured `ROOT_PATH` |
 | `headers` | comma list | header names a feature reads, on the test-harness warning |
 | `loops` | comma list | background loops started |
+| `groups` | comma list | usage-group names a sweep is about to process |
 
 ### Selection, counts and diagnostics
 
@@ -291,7 +300,6 @@ both sides, whereas everywhere else an absent value means "not known".
 | `target` | string | which snapshot failed (`pods`, `node_capacity`) |
 | `source_id` / `source_kind` | int / `booking` \| `on_demand` | the reservation a *continue* was carried forward from |
 | `superseded` | bool | whether that source still held future time and was cancelled penalty-exempt |
-| `guarantee_s` | int seconds | guaranteed duration, where it shares a line with another duration |
 | `created` / `updated` | int | rows created / updated by one section of a config import |
 | `propagated` | int | records re-dated by a date-range edit |
 | `queued` | int | entries in the reserved work queue |

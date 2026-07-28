@@ -1,6 +1,6 @@
 """Render log message bodies as flat ``key=value`` fields.
 
-Every log line in this repo is moving to a single grammar — an ``event=`` noun
+Every log line in this repo follows a single grammar — an ``event=`` noun
 followed by ``key=value`` pairs, one field per concept, with no parentheses,
 slashes, arrows or ``a..b`` ranges embedded in a value.  ``docs/LOG-FIELDS.md``
 is the canonical field dictionary and states the grammar in full; this module is

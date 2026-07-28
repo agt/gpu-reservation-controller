@@ -488,7 +488,10 @@ value into the message string.
 
 **Every call site in this repo now emits it** — no prose log lines remain, and the
 `actor=controller` envelope field is constant here (unlike the app, this daemon has
-one principal).  New log lines must use `kv()`.
+one principal).  `tests/test_log_grammar.py` fails the build if a new call site
+skips `kv()`, emits a field `docs/LOG-FIELDS.md` does not document, or adds an
+`event=` that `OBSERVABILITY.md` does not list — which is what stops that file
+drifting the way it did before.  `OBSERVABILITY.md` is the per-event inventory.
 
 Two renames the grammar forced, worth knowing when reading older lines:
 `phase=` now means the **pod lifecycle phase** (`Pending`/`Running`/`Succeeded`/…)
