@@ -110,12 +110,22 @@ Rendered by the logging formatter, not by call sites.
 |---|---|---|
 | timestamp / level / logger | `%(asctime)s %(levelname)s %(name)s` | same, level padded to 8 |
 | `actor` | from the **unverified** Bearer JWT `username` claim: a username, `imp:<target>:<impersonator>`, or `-` | constant `controller` |
-| `trace` | the `X-Client-Trace` header, whitelist-matched `[A-Za-z0-9_-]{1,36}`, else `-` | *(planned)* one per sweep/tick/batch, propagated outbound |
+| `trace` | the `X-Client-Trace` header, whitelist-matched `[A-Za-z0-9_-]{1,36}`, else `-` | one per unit of work (`fetch-`/`queue-`/`sweep-`/`audit-`/`jit-`/`pod-`/`startup-`), sent outbound on every app call; an inbound header is adopted |
 
 The actor is read before signature verification (a rejected login still logs),
 so it goes through `_sanitize_log_token`, which additionally replaces space,
 `=` and `"` — a formatter cannot decide to quote, so the value must be safe
 bare. `kv()` quotes instead, but only because it renders the message body.
+
+**The trace crosses the process boundary**, which is what makes an operation
+correlatable end to end rather than just an object. The controller mints one per
+unit of work (`app/trace.py`) and sends it as `X-Client-Trace` on every call to
+the app; the app's middleware already read that header, so no app-side change was
+needed. Inbound works the same in reverse — the controller adopts the header off
+a push. An inbound value is **whitelist-matched, not escaped**: it is
+interpolated by the formatter, which cannot quote it, so a crafted value
+containing a newline could otherwise forge log lines. Anything failing the
+pattern is dropped in favour of a locally minted id.
 
 Third-party loggers (uvicorn access lines, httpx, the Kubernetes client) do not
 follow this grammar and are not expected to.

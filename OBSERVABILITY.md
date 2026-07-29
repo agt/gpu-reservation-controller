@@ -17,27 +17,60 @@ arithmetic are UTC; `TZ` affects only how the timestamp column is rendered.
 ## Reading a line
 
 ```
-2026-07-28 14:03:11,204 INFO     app.main: actor=controller event=pod.admitted ns=jdoe pod=notebook-0 rid=42 clabel=h100 gpus=2 free=6 reserved=8 until=2026-07-28T16:00:00+00:00
+2026-07-28 14:03:11,204 INFO     app.main: actor=controller trace=pod-1a2b3c4d5e event=pod.admitted ns=jdoe pod=notebook-0 rid=42 clabel=h100 gpus=2 free=6 reserved=8 until=2026-07-28T16:00:00+00:00
 ```
 
 - **`actor=controller`** is constant — this daemon has one principal. The field
   exists so a controller line and an app line parse under the same grammar.
+- **`trace=`** is the unit of work — see below.
 - **`ns=` / `pod=`** identify the pod; **`poduid=`** is its Kubernetes UID.
 - **`rid=`** is the reservation. It is the same id space the app calls `id=` on
   its own `reservation.*` events.
 
+## Trace ids
+
+Every line carries a `trace=` naming the unit of work that produced it. The
+prefix says what kind:
+
+| prefix | unit of work |
+|---|---|
+| `fetch-` | one reservation refresh cycle |
+| `queue-` | one queue-processor tick (incl. the merge/adopt/lease work it fans out) |
+| `sweep-` | one preemption sweep |
+| `audit-` | one capacity audit |
+| `jit-` | one JIT admission pass (a coalesced re-run gets its own id) |
+| `pod-` | one pod watch event |
+| `startup-` | the synchronous startup sequence |
+| `push-` / `forecast-` | one inbound API request that supplied no id of its own |
+| `-` | no unit of work in scope |
+
+**The id crosses to the app.** It is sent as `X-Client-Trace` on every outbound
+call, and the app's request middleware already read that header — so the app
+logs its side of a controller-initiated operation under the *same* id. Inbound
+is symmetric: a push from the app carrying a trace is logged here under the
+app's id, so a user's cancel and the eviction it causes share one trace.
+
+Because a watch stream interleaves, the trace is what separates two concurrent
+pods' handling in the log; timestamps cannot.
+
 Cross-repo joins:
 
 ```bash
-# One pod's whole life, both sides.
+# Everything one operation did, on both sides — including lines sharing no object.
+grep 'trace=jit-1a2b3c4d5e' controller.log app.log
+
+# One pod's whole life.
 grep 'poduid=8f3a…' controller.log app.log
 
 # A reservation from booking through admission to preemption.
 grep -E 'event=reservation\.created id=42|rid=42' app.log controller.log
 ```
 
-`poduid` is the strongest join: a JIT lease's idempotency key **is** the pod UID,
-so `event=reservation.lease_created … poduid=X` in the app and
+`trace` joins an **operation**; `rid` and `poduid` join an **object**. Both
+matter: a JIT batch that grants three leases has one trace across six lines on
+two sides, while `rid=42` follows that one reservation for its whole life.
+`poduid` is the strongest object join — a JIT lease's idempotency key **is** the
+pod UID, so `event=reservation.lease_created … poduid=X` in the app and
 `event=lease.granted … ns=… pod=…` here refer to the same grant.
 
 ---

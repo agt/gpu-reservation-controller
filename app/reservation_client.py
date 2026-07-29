@@ -32,9 +32,21 @@ from .schemas import (
     ReservationResponse,
 )
 
+from . import trace
 from .log_fields import kv
 
 log = logging.getLogger(__name__)
+
+
+async def _attach_trace(request: httpx.Request) -> None:
+    """Add ``X-Client-Trace`` so the app logs this request under our trace.
+
+    The app's request middleware already reads this header, so nothing on its
+    side had to change for a controller-initiated call to become correlatable.
+    No header is sent when no unit of work is in scope.
+    """
+    for header, value in trace.outbound_headers().items():
+        request.headers[header] = value
 
 
 class ReservationClient:
@@ -47,6 +59,11 @@ class ReservationClient:
             base_url=config.reservation_api_url,
             headers={"X-API-Key": config.reservation_api_key},
             timeout=httpx.Timeout(10.0),
+            # Stamp the in-scope trace onto every outbound request from one
+            # place rather than at each of the eight call sites — the same
+            # chokepoint reasoning as kv() scrubbing values. A hook also cannot
+            # be forgotten by an endpoint added later.
+            event_hooks={"request": [_attach_trace]},
         )
 
     async def aclose(self) -> None:
