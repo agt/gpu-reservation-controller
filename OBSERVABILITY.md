@@ -96,6 +96,7 @@ pod UID, so `event=reservation.lease_created … poduid=X` in the app and
 |---|---|---|---|
 | DEBUG | `fetch.start` | — | Confirms the loop is alive between INFO events. |
 | INFO | `api.reservations_fetched` | `count active cancelled lookahead_days` | Paginated `status=all` fetch. |
+| WARNING | `api.reservations_fetch_retry` | `attempt err retry_s` | A page of the paginated fetch hit a network error or 5xx; retrying (max 3 attempts). A 4xx is not retried. Persisting past the last attempt raises and aborts the cycle. |
 | INFO | `class.resolved` | `cid class clabel` | Per-id fallback resolved a class missing from the bulk list. |
 | WARNING | `class.unresolvable` | `cid reason` | No `label_value` — **pods for this class can never be matched** until it is configured. |
 | INFO | `lease.preserved` | `count ids reason` | Locally-granted leases re-added because the snapshot predated the grant. |
@@ -149,7 +150,7 @@ pod UID, so `event=reservation.lease_created … poduid=X` in the app and
 | INFO | `ondemand.candidate_dropped` | `ns pod reason` (+ `phase` \| `detail`) | Terminal phase, or Pending for a non-GPU reason. |
 | DEBUG/INFO/WARNING | `ondemand.candidate_held` | `guard reason ns pod` (+ `clabel gpus node_free`) | **The guard number is the field** — see below. |
 | DEBUG | `ondemand.schedule_verdict` | `ns pod` | Scheduler verdict arrived; re-attempting immediately. |
-| INFO | `lease.denied` | `ns pod clabel gpus` | App refused (409); cooldown 2–5 min. |
+| INFO | `lease.denied` | `ns pod clabel gpus reason` | No lease produced. `reason=denied` (app refused, typically 409) and `reason=malformed` cool down 2–5 min; `reason=unavailable` (network error or 5xx) takes the 30 s short retry instead. |
 | INFO | `lease.granted` | `rid ns pod clabel gpus lease_dur_s` | |
 | WARNING | `lease.admission_failed` | `rid ns pod detail` | Grant landed but admission did not — a compensating cancel follows. |
 | INFO | `lease.teardown` | `rid class reason` | The lease's pod went away; the lease is cancelled. |

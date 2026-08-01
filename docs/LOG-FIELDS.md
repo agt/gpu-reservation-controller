@@ -173,6 +173,7 @@ follow this grammar and are not expected to.
 `wrong_provider`, `account_locked`, `bad_password`, `deactivated` ·
 `reservation.cancelled` → `no-show`, `controller-revoked`, `pod-terminated`,
 `superseded` · `overstay.recorded` → `pod-terminated`, `preempted`, `deleted` ·
+`lease.denied` → `denied`, `unavailable`, `malformed` ·
 `k8s.event` → `RuntimeGuaranteed`, `Preempted`, `ReservationCancelled`,
 `ReservationReassigned`, `OverstayRelinked`.
 
@@ -320,6 +321,7 @@ both sides, whereas everywhere else an absent value means "not known".
 | `max_gpus` | int | ceiling written by a group/cohort GPU limit |
 | `offset_min` | int | reminder-email offset, in minutes before the window |
 | `retry_s` | int seconds | how long until the next attempt |
+| `attempt` | int | 1-based attempt number of a bounded retry |
 | `submitted` / `deleted` | ISO-8601 UTC | when a JIT candidate's pod was created / removed |
 | `date_ranges` / `gpu_classes` / `cohorts` / `usage_groups` / `discount_schedules` | int | per-section counts on a config export |
 | `lookahead_days` | int | calendar days ahead a reservation fetch covered |

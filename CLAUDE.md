@@ -49,7 +49,7 @@ app/
 ├── main.py               Entry point — FastAPI app, lifespan, four background tasks
 ├── config.py             Config dataclass populated from environment variables
 ├── schemas.py            Pydantic models mirroring RESERVATION-API.md §6
-├── reservation_client.py httpx async client — fetches reservations + GPU classes; creates/cancels JIT on-demand reservations
+├── reservation_client.py httpx async client — fetches reservations (each page with a bounded transient retry) + GPU classes; creates/cancels JIT on-demand reservations
 ├── log_fields.py         kv() — renders log message bodies as key=value fields (see docs/LOG-FIELDS.md)
 ├── trace.py              Per-unit-of-work trace ids + X-Client-Trace propagation (see **Trace ids**)
 ├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, annotate_runtime_guarantee, emit_preempted_event, snapshot_tolerated_pods / snapshot_node_gpu_inventory (per-node) / snapshot_node_gpu_capacity (per-class collapse of it)
@@ -647,8 +647,12 @@ two-step **preflight → delegate → grant** pipeline.
 - **Grant** (`_grant_and_admit`, per granted pod): calls `POST /api/reservations`
   with `on_demand=True` (the app relaxes policy limits — SU, caps, minimum
   duration — never physical calendar capacity), **idempotent by the pod's UID**
-  (`idempotency_key`).  A **denial** (409 / error → `None`) cools the candidate
-  down 2–5 min.  On **grant** the lease is upserted into `state.reservations`
+  (`idempotency_key`).  The call returns a `LeaseResult` whose `outcome`
+  distinguishes a **denial** (4xx — the app answered "no") and a **malformed**
+  2xx body, which cool the candidate down 2–5 min, from an **unavailable** app
+  (network error or 5xx), which takes the 30 s short retry instead — the app may
+  answer differently the moment it is reachable, and re-asking is safe because
+  the request is idempotent on the pod UID.  On **grant** the lease is upserted into `state.reservations`
   (`apply_push_to_active`) and the pod is admitted immediately
   (`_try_apply_toleration`) — the existing admission path, so it stamps
   `res-<id>`, records the guarantee, and emits `RuntimeGuaranteed`.  **If
@@ -702,6 +706,38 @@ independently.
 **RBAC / config**: no new Kubernetes permissions (admission reuses the
 existing pod-patch path); `ONDEMAND_HORIZON_MINUTES` and
 `ONDEMAND_LEASE_BUFFER_MINUTES` tune the routing horizon and lease sizing.
+
+### Transient-failure retry policy
+
+The controller is a **level-triggered reconciler**, so the general answer to a
+failure is "re-evaluate on the next tick from live state", not "retry the call".
+That is why the eleven `next_attempt_at` sites in `main.py` are requeue delays
+(mostly after a *guard denial*, where nothing failed and there is no call to
+re-drive) rather than call-retry loops, and why they intentionally have **no
+attempt cap** — a pod waiting for capacity must be re-evaluated indefinitely, and
+giving up would strand it.  Adding a retry library here would not fit: `tenacity`
+et al. retry a callable that raised, which is not what these sites do.
+
+Two places are genuine exceptions, where the next tick is too late or too blunt:
+
+- **`fetch_reservations` pagination** (`_get_reservations_page`) retries a
+  network error or 5xx up to 3 times with a 1 s / 2 s backoff.  Without it a blip
+  on page 3 of 5 aborts the whole refresh cycle, leaving the controller on stale
+  reservation state for a full `RESERVATION_FETCH_INTERVAL` (300 s default).  A
+  **4xx is not retried** (a bad key or filter will not fix itself), and a failure
+  outliving the retries still **raises** — that fail-safe is load-bearing, since
+  acting on a partial page set would wholesale-replace `state.reservations` with
+  an under-count.
+- **`create_ondemand_reservation`** returns a `LeaseResult` rather than a bare
+  `None`, so the caller can tell an app that *decided* against the lease from one
+  it could not reach, and pick the matching cooldown (see **Just-in-time (JIT)
+  on-demand leases** → Grant).
+
+Note the cooldown split is bounded by the queue-processor tick: `next_attempt_at`
+only gates *eligibility*, so at the default `QUEUE_PROCESSOR_INTERVAL` (300 s) a
+30 s and a 2–5 min cooldown often both resolve to "next tick".  The distinction
+bites when the interval is tuned down, and on the ADDED-triggered admission
+batches that run between ticks.
 
 ### App-side vs physical capacity reconciliation
 
