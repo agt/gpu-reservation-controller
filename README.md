@@ -38,7 +38,8 @@ system is designed to accommodate greater values in the future.)
            │ updates in-memory reservation list
            ▼
 ┌──────────────────────────────────────────────────────┐
-│ 2. Pod watch  (LIST at startup, then WATCH stream)   │
+│ 2. Pod watch  (LIST at startup + periodic resync,    │
+│                then WATCH resumed by resourceVersion)│
 │    Pods with label gpu-class=<X> are routed:         │
 │      a. A reservation is open now, or opens within   │
 │         ONDEMAND_HORIZON_MINUTES, with budget         │

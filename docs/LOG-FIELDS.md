@@ -277,7 +277,8 @@ both sides, whereas everywhere else an absent value means "not known".
 | `watch_event` | `ADDED` \| `MODIFIED` \| `DELETED` | raw watch event type |
 | `path` | string | filesystem path |
 | `patch` | string | which patch a `k8s.patch_pod` is applying (`toleration`, `runtime_guarantee`, `guarantee_status`, `termination_warning`, `termination_warning_clear`, `gate_remove`) |
-| `purpose` | string | why a LIST was issued (`tolerated_snapshot`, `gpu_inventory`) |
+| `purpose` | string | why a LIST was issued (`watch_seed`, `tolerated_snapshot`, `gpu_inventory`) |
+| `dropped` | int | watch events discarded so far by the bounded queue (running total) |
 | `tol_key` / `tol_value` | string | the toleration being applied |
 | `resource` / `value` | string / string | the Kubernetes resource name and the malformed value, on an unparseable allocatable |
 | `nodes` | int | nodes carrying a GPU class, in a node-inventory line |
@@ -288,7 +289,7 @@ both sides, whereas everywhere else an absent value means "not known".
 |---|---|---|
 | `name` | string | human-readable name of the entity `event=` names (group, cohort, class, date range, service key, …) |
 | `source` | string | which subsystem drove a mutation (`sicad` on roster-driven user/membership changes) |
-| `mode` | string | which variant of an operation ran (`kubeconfig` \| `in_cluster` for k8s auth) |
+| `mode` | string | which variant of an operation ran (`kubeconfig` \| `in_cluster` for k8s auth; `seed` \| `resume` for a watch open) |
 | `section` | string | which part of a multi-part operation a line reports (config import/export) |
 | `guard` | int | which JIT admission guard held a candidate (1, 3, 4, 5) |
 | `annotation` | string | the annotation key a value was read from, on a parse failure |

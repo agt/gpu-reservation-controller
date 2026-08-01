@@ -27,6 +27,7 @@ import functools
 import logging
 import re
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import AsyncIterator, Callable, Optional, TypeVar
@@ -911,6 +912,14 @@ async def emit_overstay_relinked_event(
 # ---------------------------------------------------------------------------
 
 
+# Watch-loop tuning.  Module constants (not env vars) like the values they
+# replace; the PodWatcher constructor takes keyword overrides as test seams.
+_WATCH_TIMEOUT_S = 270          # server-side clean close, beats LB idle timeouts
+_WATCH_RESYNC_INTERVAL_S = 600  # full re-LIST cadence (routing self-heal)
+_WATCH_QUEUE_MAXSIZE = 4096     # backpressure bound; must exceed labeled-pod count
+_WATCH_RETRY_DELAY_S = 5        # fixed backoff between failed cycles
+
+
 class PodWatcher:
     """Async-generator source of pod watch events for all namespaces.
 
@@ -919,6 +928,21 @@ class PodWatcher:
     ``loop.call_soon_threadsafe``.  The watch thread automatically reconnects
     after any error.
 
+    Reconnect protocol: the thread tracks the ``resourceVersion`` of every
+    event (bookmarks included, requested via ``allow_watch_bookmarks``), so a
+    clean stream close — the server honouring ``timeout_seconds`` every ~4.5
+    min — *resumes* the watch where it left off instead of re-LISTing and
+    replaying the world as ADDED.  A full LIST+replay happens only at start,
+    after an error, on HTTP 410 (resourceVersion expired — immediate, no
+    backoff), and every ``_WATCH_RESYNC_INTERVAL_S`` as a deliberate resync:
+    the periodic replay is the self-heal for a pod whose ADDED was never seen
+    (nothing else discovers unrouted pods), and consumers treat replays
+    idempotently (see the fast-path cooldown guard, B8).
+
+    The event queue is bounded; if the consumer stalls, the *oldest* event is
+    dropped (newest state supersedes it, and the next resync heals the gap)
+    rather than growing without limit.
+
     Usage::
 
         watcher = PodWatcher(label_selector="gpu-class")
@@ -926,78 +950,181 @@ class PodWatcher:
             ...  # event_type is "ADDED", "MODIFIED", or "DELETED"
     """
 
-    def __init__(self, label_selector: str = "gpu-class") -> None:
+    def __init__(
+        self,
+        label_selector: str = "gpu-class",
+        *,
+        resync_interval_s: float = _WATCH_RESYNC_INTERVAL_S,
+        queue_maxsize: int = _WATCH_QUEUE_MAXSIZE,
+        watch_timeout_s: int = _WATCH_TIMEOUT_S,
+        retry_delay_s: float = _WATCH_RETRY_DELAY_S,
+    ) -> None:
         self._label_selector = label_selector
+        self._resync_interval_s = resync_interval_s
+        self._queue_maxsize = queue_maxsize
+        self._watch_timeout_s = watch_timeout_s
+        self._retry_delay_s = retry_delay_s
+        self._watch: Optional[watch.Watch] = None
+        self._dropped = 0
+
+    def _log_watch_failure(self, fail_count: int, exc: Exception) -> None:
+        """Throttled failure logging: WARNING on the first failure and every
+        120th (~10 min at the 5 s retry), DEBUG in between."""
+        if fail_count == 1 or fail_count % 120 == 0:
+            log.warning("%s", kv(
+                event="k8s.watch_error", fails=fail_count, err=exc,
+                retry_s=self._retry_delay_s,
+            ))
+        else:
+            log.debug("%s", kv(
+                event="k8s.watch_ended", err=exc, retry_s=self._retry_delay_s,
+            ))
 
     async def events(self) -> AsyncIterator[tuple[str, object]]:
         loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+        queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue(
+            maxsize=self._queue_maxsize
+        )
         stop_event = threading.Event()
 
+        def _offer(item: tuple[str, object]) -> None:
+            # Runs on the event-loop thread only (always via
+            # call_soon_threadsafe), so the full/drop/put triple cannot
+            # interleave with the consumer's get.
+            if queue.full():
+                try:
+                    queue.get_nowait()  # drop the OLDEST event
+                except asyncio.QueueEmpty:  # pragma: no cover — full ⇒ non-empty
+                    pass
+                self._dropped += 1
+                if self._dropped == 1 or self._dropped % 100 == 0:
+                    log.warning("%s", kv(
+                        event="k8s.watch_dropped", dropped=self._dropped,
+                    ))
+            queue.put_nowait(item)
+
         def _run_watch() -> None:
-            """Blocking watch loop; runs in a dedicated daemon thread."""
-            _fail_count = 0
+            """Blocking LIST/WATCH loop; runs in a dedicated daemon thread."""
+            fail_count = 0
+            rv: Optional[str] = None    # None ⇒ the next cycle must LIST
+            relist_reason = "start"
+            last_list = 0.0             # time.monotonic() of the last LIST
             while not stop_event.is_set():
                 try:
-                    w = watch.Watch()
-
-                    # LIST first — surfaces pods that exist before we started.
-                    log.debug("%s", kv(
-                        event="k8s.list_pods", selector=self._label_selector,
-                        purpose="watch_seed",
-                    ))
-                    pod_list = _core_v1.list_pod_for_all_namespaces(
-                        label_selector=self._label_selector
+                    resync_due = rv is not None and (
+                        time.monotonic() - last_list >= self._resync_interval_s
                     )
-                    log.debug("%s", kv(
-                        event="k8s.list_pods_done", purpose="watch_seed",
-                        count=len(pod_list.items),
-                        rv=pod_list.metadata.resource_version,
-                    ))
-                    for pod in pod_list.items:
-                        loop.call_soon_threadsafe(queue.put_nowait, ("ADDED", pod))
-                    resource_version = pod_list.metadata.resource_version
+                    if rv is None or resync_due:
+                        if resync_due:
+                            relist_reason = "resync"
+                        # LIST — surfaces pods that exist before we started (or
+                        # whose events a gap swallowed) by replaying them as ADDED.
+                        log.debug("%s", kv(
+                            event="k8s.list_pods", selector=self._label_selector,
+                            purpose="watch_seed", reason=relist_reason,
+                        ))
+                        pod_list = _core_v1.list_pod_for_all_namespaces(
+                            label_selector=self._label_selector
+                        )
+                        log.debug("%s", kv(
+                            event="k8s.list_pods_done", purpose="watch_seed",
+                            count=len(pod_list.items),
+                            rv=pod_list.metadata.resource_version,
+                        ))
+                        for pod in pod_list.items:
+                            loop.call_soon_threadsafe(_offer, ("ADDED", pod))
+                        rv = pod_list.metadata.resource_version
+                        last_list = time.monotonic()
+                        mode = "seed"
+                    else:
+                        # Clean close with a live rv: resume exactly where the
+                        # last stream left off — no LIST, no replay.
+                        mode = "resume"
 
-                    # WATCH — stream incremental events from where the list left off.
-                    # timeout_seconds asks the API server to close the stream cleanly
-                    # before any proxy/LB idle timeout fires, avoiding spurious
-                    # "Response ended prematurely" errors on reconnect.
+                    w = watch.Watch()
+                    self._watch = w
+                    # WATCH — stream incremental events from rv onward.
+                    # timeout_seconds asks the API server to close the stream
+                    # cleanly before any proxy/LB idle timeout fires; it also
+                    # disables the client's internal silent retry, which is what
+                    # guarantees a 410 surfaces here as ApiException rather than
+                    # being swallowed (do not remove it).
                     log.debug("%s", kv(
                         event="k8s.watch_open", selector=self._label_selector,
-                        rv=resource_version, timeout_s=270,
+                        rv=rv, timeout_s=self._watch_timeout_s, mode=mode,
                     ))
-                    _fail_count = 0  # successful LIST+WATCH cycle; reset counter
+                    progressed = False
                     for event in w.stream(
                         _core_v1.list_pod_for_all_namespaces,
                         label_selector=self._label_selector,
-                        resource_version=resource_version,
-                        timeout_seconds=270,
+                        resource_version=rv,
+                        timeout_seconds=self._watch_timeout_s,
+                        allow_watch_bookmarks=True,
                     ):
                         if stop_event.is_set():
                             w.stop()
                             return
+                        if not isinstance(event, dict):
+                            # Newer clients can yield None for undecodable lines.
+                            continue
+                        if not progressed:
+                            # The stream demonstrably works — only now reset the
+                            # failure counter.  (Resetting right after the LIST,
+                            # as before, defeated the throttle whenever the LIST
+                            # succeeded but the stream kept failing.)
+                            progressed = True
+                            fail_count = 0
+                        if event.get("type") == "BOOKMARK":
+                            # Bookmark objects are raw dicts (never deserialized,
+                            # so no model attributes); they exist purely to
+                            # advance rv and are not forwarded to the consumer.
+                            new_rv = (
+                                (event.get("raw_object") or {})
+                                .get("metadata", {})
+                                .get("resourceVersion")
+                            )
+                            if new_rv:
+                                rv = new_rv
+                            log.debug("%s", kv(event="k8s.watch_bookmark", rv=rv))
+                            continue
                         obj = event["object"]
+                        new_rv = getattr(
+                            getattr(obj, "metadata", None), "resource_version", None
+                        )
+                        if new_rv:
+                            rv = new_rv
                         log.debug("%s", kv(
                             event="k8s.watch_event", watch_event=event["type"],
                             ns=obj.metadata.namespace, pod=obj.metadata.name,
                         ))
-                        loop.call_soon_threadsafe(
-                            queue.put_nowait, (event["type"], event["object"])
-                        )
+                        loop.call_soon_threadsafe(_offer, (event["type"], obj))
+                    # Clean close: the server honoured timeout_seconds.  A
+                    # healthy cycle even if it carried no events.
+                    fail_count = 0
 
-                except Exception as exc:  # noqa: BLE001
-                    _fail_count += 1
-                    if _fail_count == 1 or _fail_count % 120 == 0:
-                        log.warning("%s", kv(
-                            event="k8s.watch_error", fails=_fail_count, err=exc,
-                            retry_s=5,
-                        ))
-                    else:
-                        log.debug("%s", kv(
-                            event="k8s.watch_ended", err=exc, retry_s=5,
-                        ))
+                except ApiException as exc:
+                    if exc.status == 410:
+                        # resourceVersion expired — the standard protocol signal
+                        # to re-LIST immediately.  Not a fault: no backoff, no
+                        # failure count.
+                        log.info("%s", kv(event="k8s.watch_expired", rv=rv))
+                        rv = None
+                        relist_reason = "expired"
+                        continue
+                    fail_count += 1
+                    rv = None  # rv provenance is not trustworthy after a failure
+                    relist_reason = "error"
+                    self._log_watch_failure(fail_count, exc)
                     # Interruptible sleep: a set stop_event returns immediately.
-                    if stop_event.wait(5):
+                    if stop_event.wait(self._retry_delay_s):
+                        return
+                except Exception as exc:  # noqa: BLE001
+                    fail_count += 1
+                    rv = None  # rv provenance is not trustworthy after a failure
+                    relist_reason = "error"
+                    self._log_watch_failure(fail_count, exc)
+                    # Interruptible sleep: a set stop_event returns immediately.
+                    if stop_event.wait(self._retry_delay_s):
                         return
 
         # Run the blocking watch in a dedicated daemon thread rather than the
@@ -1015,3 +1142,13 @@ class PodWatcher:
                 yield event_type, pod
         finally:
             stop_event.set()
+            # Best-effort prompt unblock: on newer kubernetes clients
+            # Watch.stop() shuts the socket down and the thread exits at once;
+            # on v29 it is a flag write and a quiet stream parks the thread
+            # until the server timeout — harmless, it is a daemon thread.
+            w = self._watch
+            if w is not None:
+                try:
+                    w.stop()
+                except Exception:  # noqa: BLE001 — teardown must never raise
+                    pass

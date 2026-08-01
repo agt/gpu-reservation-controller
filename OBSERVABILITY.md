@@ -292,7 +292,7 @@ DEBUG only, unless noted.
 | Level | `event=` | Fields |
 |---|---|---|
 | DEBUG | `k8s.read_pod` | `ns pod` |
-| DEBUG | `k8s.list_pods` / `k8s.list_pods_done` | `selector purpose` / `purpose count` (+ `rv`) |
+| DEBUG | `k8s.list_pods` / `k8s.list_pods_done` | `selector purpose` (+ `reason`) / `purpose count` (+ `rv`) — `reason` (watch seed only) is why a full re-LIST ran: `start`, `error`, `expired`, or `resync` |
 | DEBUG | `k8s.list_nodes` | `purpose` |
 | DEBUG | `k8s.node_inventory` | `clabel nodes total` — one line per class |
 | DEBUG | `k8s.patch_pod` | `ns pod patch` + the patch's own fields |
@@ -300,7 +300,10 @@ DEBUG only, unless noted.
 | DEBUG | `pod.already_gone` | `ns pod status` (404 on delete) |
 | WARNING | `k8s.node_allocatable_invalid` | `node resource value` — treated as 0 |
 | WARNING | `pod.annotation_invalid` | `ns pod annotation value` — malformed `horae/minimum-runtime-seconds` |
-| DEBUG | `k8s.watch_open` / `k8s.watch_event` | `selector rv timeout_s` / `watch_event ns pod` |
+| DEBUG | `k8s.watch_open` / `k8s.watch_event` | `selector rv timeout_s mode` / `watch_event ns pod` — `mode=seed` after a LIST, `mode=resume` when continuing from the last resourceVersion (no LIST, no replay) |
+| DEBUG | `k8s.watch_bookmark` | `rv` — server bookmark advanced the resourceVersion; never forwarded as a pod event |
+| INFO | `k8s.watch_expired` | `rv` — HTTP 410: the resourceVersion expired server-side; re-LISTing immediately (no backoff) |
+| WARNING | `k8s.watch_dropped` | `dropped` — bounded event queue was full; the oldest event was discarded (first drop and every 100th; the periodic resync re-LIST heals the gap) |
 | WARNING | `k8s.watch_error` | `fails err retry_s` — **first failure and every 120th**, to bound spam during a sustained disconnect |
 | DEBUG | `k8s.watch_ended` | `err retry_s` |
 

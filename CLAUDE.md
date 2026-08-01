@@ -880,6 +880,18 @@ a LIST of all current pods before entering the WATCH stream.  This ensures that
 pods created before the controller was running (e.g. during a restart) are not
 missed.
 
+The watch itself maintains **resourceVersion continuity** (bookmarks enabled):
+a clean stream close — the server honouring the ~4.5 min `timeout_seconds` —
+*resumes* from the last seen resourceVersion with no LIST and no replay.  A
+full re-LIST (replaying every matching pod as ADDED — safe, replays are
+idempotent and the fast path honors retry cooldowns) happens only at start,
+after a stream error, on HTTP 410 (resourceVersion expired — immediate, no
+backoff), and every ~10 min as a deliberate **resync**, which is the self-heal
+for a pod whose ADDED event was never seen (nothing else discovers unrouted
+pods).  The watch-to-consumer queue is **bounded** (drop-oldest with a
+warning; the next resync heals any gap), so a stalled consumer can no longer
+grow memory without limit.
+
 ### In-memory state only
 
 No database.  If the controller restarts, it rebuilds all state from the
