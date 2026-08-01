@@ -13,8 +13,11 @@ Implements only the endpoints the controller needs:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Optional
 
 import httpx
@@ -36,6 +39,53 @@ from . import trace
 from .log_fields import kv
 
 log = logging.getLogger(__name__)
+
+
+# Bounded retry for the *paginated* reservation fetch only.  A blip on page 3 of
+# 5 otherwise aborts the whole refresh cycle, leaving the controller on stale
+# reservation state for a full RESERVATION_FETCH_INTERVAL (300 s default).  This
+# narrows that blast radius; it deliberately does **not** become a general retry
+# policy for the client, and the raise on final failure stays load-bearing (see
+# ``fetch_reservations``) — acting on a partial page set would wholesale-replace
+# ``state.reservations`` with an under-count.
+_FETCH_MAX_ATTEMPTS = 3
+_FETCH_RETRY_BACKOFF_SECONDS = (1, 2)
+
+
+class LeaseOutcome(str, Enum):
+    """Why a JIT lease request did or did not produce a lease.
+
+    Splits what used to be a single ``None`` return: the caller's cooldown
+    depends on whether the app *decided* against the lease or simply could not
+    be reached, and those two want very different retry timing.
+    """
+
+    GRANTED = "granted"
+    DENIED = "denied"            # the app answered "no" (4xx, typically 409)
+    UNAVAILABLE = "unavailable"  # transient: network error or 5xx
+    MALFORMED = "malformed"      # 2xx whose body would not parse
+
+
+@dataclass(frozen=True)
+class LeaseResult:
+    """Outcome of ``create_ondemand_reservation``, plus the lease when granted."""
+
+    outcome: LeaseOutcome
+    lease: Optional[ReservationResponse] = None
+
+    @property
+    def granted(self) -> bool:
+        return self.outcome is LeaseOutcome.GRANTED
+
+    @property
+    def transient(self) -> bool:
+        """True when the failure may clear on its own, so retry sooner.
+
+        Only ``UNAVAILABLE`` qualifies.  A ``DENIED`` is a real answer and a
+        ``MALFORMED`` body is likely deterministic — hammering either one buys
+        nothing, so both keep the slower jittered cooldown.
+        """
+        return self.outcome is LeaseOutcome.UNAVAILABLE
 
 
 async def _attach_trace(request: httpx.Request) -> None:
@@ -74,14 +124,53 @@ class ReservationClient:
     # Public interface
     # ------------------------------------------------------------------
 
+    async def _get_reservations_page(self, params: dict) -> httpx.Response:
+        """GET one page of ``/api/reservations``, retrying transient failures.
+
+        Retries a network error or a 5xx up to ``_FETCH_MAX_ATTEMPTS`` times with
+        a short fixed backoff.  A **4xx propagates immediately**: a bad key or a
+        bad filter is a deliberate answer that will not fix itself, and retrying
+        it only delays the cycle's failure.  The final failure still raises, so
+        the caller's fail-safe (abort rather than act on partial data) is intact.
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, _FETCH_MAX_ATTEMPTS + 1):
+            try:
+                resp = await self._client.get(
+                    "/api/reservations", params=params, timeout=15.0
+                )
+                resp.raise_for_status()
+                return resp
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code < 500:
+                    raise
+                last_exc = exc
+            except httpx.RequestError as exc:
+                last_exc = exc
+            if attempt == _FETCH_MAX_ATTEMPTS:
+                break
+            delay = _FETCH_RETRY_BACKOFF_SECONDS[attempt - 1]
+            log.warning("%s", kv(
+                event="api.reservations_fetch_retry", attempt=attempt,
+                err=last_exc, retry_s=delay,
+            ))
+            await asyncio.sleep(delay)
+        assert last_exc is not None  # only reachable via an except branch
+        raise last_exc
+
     async def fetch_reservations(self) -> list[ReservationResponse]:
         """Return all reservations (active and cancelled) from today through lookahead window.
 
+        Each page is fetched with a bounded transient retry
+        (``_get_reservations_page``) so one blip mid-pagination does not cost a
+        whole refresh interval of staleness.
+
         Raises:
-            httpx.HTTPStatusError / httpx.RequestError: on API or network failure.
-                Unlike ``fetch_gpu_class`` (which degrades to ``None``), a failed
-                reservation fetch propagates so the refresh cycle aborts rather
-                than acting on an empty reservation list.
+            httpx.HTTPStatusError / httpx.RequestError: on API or network failure
+                that outlives the retries.  Unlike ``fetch_gpu_class`` (which
+                degrades to ``None``), a failed reservation fetch propagates so
+                the refresh cycle aborts rather than acting on an empty or
+                partial reservation list.
         """
         # UTC everywhere: date.today() would use the process TZ and drop
         # currently-open reservations east of UTC (see CODE-REVIEW-2026-07 B2).
@@ -95,18 +184,13 @@ class ReservationClient:
         limit = 200
 
         while True:
-            resp = await self._client.get(
-                "/api/reservations",
-                params={
-                    "status": "all",
-                    "date_start": start.isoformat(),
-                    "date_end": end.isoformat(),
-                    "limit": limit,
-                    "offset": offset,
-                },
-                timeout=15.0,
-            )
-            resp.raise_for_status()
+            resp = await self._get_reservations_page({
+                "status": "all",
+                "date_start": start.isoformat(),
+                "date_end": end.isoformat(),
+                "limit": limit,
+                "offset": offset,
+            })
             page = [ReservationResponse.model_validate(r) for r in resp.json()]
             results.extend(page)
             if len(page) < limit:
@@ -167,12 +251,19 @@ class ReservationClient:
 
     async def create_ondemand_reservation(
         self, req: OnDemandReservationRequest
-    ) -> Optional[ReservationResponse]:
-        """Request a JIT on-demand booking; None on denial (409) or error.
+    ) -> LeaseResult:
+        """Request a JIT on-demand booking; a ``LeaseResult`` either way.
 
         Idempotent by ``req.idempotency_key`` (the admitting pod's UID): the
         app returns the original reservation for a repeated key rather than a
-        duplicate, so the caller can safely retry with the same request.
+        duplicate, so the caller can safely retry with the same request.  That
+        is what makes an ``UNAVAILABLE`` retry safe even when the request did in
+        fact reach the app — a lease created behind a lost response is handed
+        back on the retry instead of being duplicated.
+
+        Unlike the other degrading calls this does **not** collapse to ``None``:
+        a 409 denial and an unreachable app are different situations and get
+        different cooldowns at the call site (see ``LeaseResult.transient``).
         """
         try:
             resp = await self._client.post(
@@ -181,23 +272,31 @@ class ReservationClient:
                 timeout=15.0,
             )
             resp.raise_for_status()
-            return ReservationResponse.model_validate(resp.json())
+            return LeaseResult(
+                LeaseOutcome.GRANTED, ReservationResponse.model_validate(resp.json())
+            )
         except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            # 5xx is the app failing, not the app deciding — treat it as
+            # transient so the candidate comes back on the short retry.
+            transient = status >= 500
             log.info("%s", kv(
                 event="api.lease_denied", poduid=req.idempotency_key,
-                status=exc.response.status_code,
+                status=status,
             ))
-            return None
+            return LeaseResult(
+                LeaseOutcome.UNAVAILABLE if transient else LeaseOutcome.DENIED
+            )
         except httpx.RequestError as exc:
             log.warning("%s", kv(
                 event="api.lease_failed", poduid=req.idempotency_key, err=exc,
             ))
-            return None
+            return LeaseResult(LeaseOutcome.UNAVAILABLE)
         except (ValidationError, ValueError) as exc:
             log.warning("%s", kv(
                 event="api.lease_parse_failed", poduid=req.idempotency_key, err=exc,
             ))
-            return None
+            return LeaseResult(LeaseOutcome.MALFORMED)
 
     async def select_preemption_victims(
         self, req: PreemptionSelectionRequest

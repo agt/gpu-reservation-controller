@@ -12,8 +12,9 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+from app import reservation_client
 from app.config import Config
-from app.reservation_client import ReservationClient
+from app.reservation_client import LeaseOutcome, ReservationClient
 from app.schemas import (
     OnDemandAdmissionCandidate,
     OnDemandAdmissionRequest,
@@ -88,6 +89,136 @@ def test_fetch_reservations_date_start_is_utc_and_widened():
     assert captured["date_end"] in expected_ends
     assert captured["status"] == "all"
 
+    asyncio.run(client.aclose())
+
+
+# ---------------------------------------------------------------------------
+# fetch_reservations — bounded transient retry per page
+#
+# Without it, one blip mid-pagination aborts the whole refresh cycle and leaves
+# the controller on stale reservation state for a full RESERVATION_FETCH_INTERVAL.
+# ---------------------------------------------------------------------------
+
+
+def _no_backoff(monkeypatch) -> None:
+    """Keep the retry path instant so these tests don't sleep for real."""
+    monkeypatch.setattr(reservation_client, "_FETCH_RETRY_BACKOFF_SECONDS", (0, 0))
+
+
+def test_fetch_reservations_retries_a_transient_page_failure(monkeypatch):
+    _no_backoff(monkeypatch)
+    now = datetime.now(timezone.utc)
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ConnectTimeout("blip", request=request)
+        return httpx.Response(
+            200,
+            json=[_reservation(1, start_utc=now, end_utc=now + timedelta(hours=1))
+                  .model_dump(mode="json")],
+        )
+
+    client = _client_with_handler(_config(), handler)
+    results = asyncio.run(client.fetch_reservations())
+    assert len(calls) == 2
+    assert [r.id for r in results] == [1]
+    asyncio.run(client.aclose())
+
+
+def test_fetch_reservations_retries_a_5xx_page(monkeypatch):
+    _no_backoff(monkeypatch)
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(503, json={"detail": "unavailable"})
+        return httpx.Response(200, json=[])
+
+    client = _client_with_handler(_config(), handler)
+    assert asyncio.run(client.fetch_reservations()) == []
+    assert len(calls) == 2
+    asyncio.run(client.aclose())
+
+
+def test_fetch_reservations_retry_preserves_earlier_pages(monkeypatch):
+    """The headline case: a blip on page 2 must not lose page 1.
+
+    Page 1 returns a full ``limit`` (200) so pagination continues; page 2 fails
+    once, is retried, and the accumulated results span both pages.
+    """
+    _no_backoff(monkeypatch)
+    now = datetime.now(timezone.utc)
+    page1 = [
+        _reservation(i, start_utc=now, end_utc=now + timedelta(hours=1)).model_dump(mode="json")
+        for i in range(1, 201)
+    ]
+    page2 = [
+        _reservation(201, start_utc=now, end_utc=now + timedelta(hours=1)).model_dump(mode="json")
+    ]
+    seen_offsets: list[str] = []
+    failed_once = {"done": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        offset = request.url.params["offset"]
+        seen_offsets.append(offset)
+        if offset == "0":
+            return httpx.Response(200, json=page1)
+        if not failed_once["done"]:
+            failed_once["done"] = True
+            raise httpx.ReadTimeout("blip on page 2", request=request)
+        return httpx.Response(200, json=page2)
+
+    client = _client_with_handler(_config(), handler)
+    results = asyncio.run(client.fetch_reservations())
+    assert [r.id for r in results] == list(range(1, 202))
+    # Page 2 was re-requested at the same offset — the retry resumes, it does
+    # not restart pagination from zero.
+    assert seen_offsets == ["0", "200", "200"]
+    asyncio.run(client.aclose())
+
+
+def test_fetch_reservations_does_not_retry_a_4xx(monkeypatch):
+    """A bad key or bad filter will not fix itself — fail fast, don't retry."""
+    _no_backoff(monkeypatch)
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(403, json={"detail": "forbidden"})
+
+    client = _client_with_handler(_config(), handler)
+    try:
+        asyncio.run(client.fetch_reservations())
+        raise AssertionError("expected HTTPStatusError")
+    except httpx.HTTPStatusError as exc:
+        assert exc.response.status_code == 403
+    assert len(calls) == 1
+    asyncio.run(client.aclose())
+
+
+def test_fetch_reservations_raises_after_exhausting_attempts(monkeypatch):
+    """The fail-safe is intact: a persistent failure still aborts the cycle.
+
+    Acting on a partial page set would wholesale-replace state.reservations with
+    an under-count, so raising remains the correct outcome.
+    """
+    _no_backoff(monkeypatch)
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        raise httpx.ConnectError("down", request=request)
+
+    client = _client_with_handler(_config(), handler)
+    try:
+        asyncio.run(client.fetch_reservations())
+        raise AssertionError("expected RequestError")
+    except httpx.RequestError:
+        pass
+    assert len(calls) == reservation_client._FETCH_MAX_ATTEMPTS == 3
     asyncio.run(client.aclose())
 
 
@@ -188,26 +319,60 @@ def test_create_ondemand_reservation_201_returns_reservation():
 
     client = _client_with_handler(_config(), handler)
     result = asyncio.run(client.create_ondemand_reservation(_ondemand_request()))
-    assert result is not None and result.id == 7
+    assert result.granted and result.lease is not None and result.lease.id == 7
+    assert result.transient is False
     asyncio.run(client.aclose())
 
 
-def test_create_ondemand_reservation_409_returns_none():
-    """A capacity/policy denial must degrade to None, not raise."""
+def test_create_ondemand_reservation_409_is_denied_not_transient():
+    """A capacity/policy denial is a real answer: no lease, and not transient."""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(409, json={"detail": "no capacity"})
 
     client = _client_with_handler(_config(), handler)
-    assert asyncio.run(client.create_ondemand_reservation(_ondemand_request())) is None
+    result = asyncio.run(client.create_ondemand_reservation(_ondemand_request()))
+    assert result.outcome is LeaseOutcome.DENIED
+    assert result.granted is False and result.lease is None
+    # The distinction that matters at the call site: a denial keeps the slow
+    # jittered cooldown rather than the 30 s short retry.
+    assert result.transient is False
     asyncio.run(client.aclose())
 
 
-def test_create_ondemand_reservation_timeout_returns_none():
+def test_create_ondemand_reservation_timeout_is_transient():
+    """An unreachable app is transient — the caller retries sooner than a denial."""
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectTimeout("timed out", request=request)
 
     client = _client_with_handler(_config(), handler)
-    assert asyncio.run(client.create_ondemand_reservation(_ondemand_request())) is None
+    result = asyncio.run(client.create_ondemand_reservation(_ondemand_request()))
+    assert result.outcome is LeaseOutcome.UNAVAILABLE
+    assert result.granted is False and result.lease is None
+    assert result.transient is True
+    asyncio.run(client.aclose())
+
+
+def test_create_ondemand_reservation_5xx_is_transient():
+    """A 5xx is the app failing, not the app deciding."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"detail": "unavailable"})
+
+    client = _client_with_handler(_config(), handler)
+    result = asyncio.run(client.create_ondemand_reservation(_ondemand_request()))
+    assert result.outcome is LeaseOutcome.UNAVAILABLE
+    assert result.transient is True
+    asyncio.run(client.aclose())
+
+
+def test_create_ondemand_reservation_malformed_body_is_not_transient():
+    """A 2xx we cannot parse is likely deterministic — keep the slow cooldown."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, content=b"not json")
+
+    client = _client_with_handler(_config(), handler)
+    result = asyncio.run(client.create_ondemand_reservation(_ondemand_request()))
+    assert result.outcome is LeaseOutcome.MALFORMED
+    assert result.granted is False and result.transient is False
     asyncio.run(client.aclose())
 
 

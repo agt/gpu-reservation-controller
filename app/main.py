@@ -796,14 +796,22 @@ async def _grant_and_admit(
         idempotency_key=uid,
         notes=f"on-demand lease for pod {candidate.pod_namespace}/{candidate.pod_name}",
     )
-    lease = await client.create_ondemand_reservation(request)
-    if lease is None:
+    result = await client.create_ondemand_reservation(request)
+    if not result.granted:
         log.info("%s", kv(
             event="lease.denied", ns=candidate.pod_namespace, pod=candidate.pod_name,
             clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
+            reason=result.outcome.value,
         ))
-        candidate.next_attempt_at = _jittered_retry_at(now)
+        # A reachable app that said "no" gets the full jittered cooldown; an app
+        # we simply could not reach comes back on the short retry, since the
+        # answer may differ the moment it is back. Retrying is safe either way —
+        # the request is idempotent on the pod UID.
+        candidate.next_attempt_at = (
+            _short_retry_at(now) if result.transient else _jittered_retry_at(now)
+        )
         return False
+    lease = result.lease
 
     log.info("%s", kv(
         event="lease.granted", rid=lease.id, ns=candidate.pod_namespace,

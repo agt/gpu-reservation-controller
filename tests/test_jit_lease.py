@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from app.controller import ControllerState, OnDemandCandidate, slot_start
+from app.reservation_client import LeaseOutcome, LeaseResult
 
 from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, GROUP_NAME, USERNAME
 from tests.conftest import make_state as _state
@@ -306,7 +307,10 @@ def _state_ready() -> ControllerState:
 
 
 class _FakeClient:
-    def __init__(self, *, lease=None, leases=None, cancel_result=True, select_response=None):
+    def __init__(
+        self, *, lease=None, leases=None, cancel_result=True, select_response=None,
+        fail_outcome=LeaseOutcome.DENIED,
+    ):
         self._lease = lease
         # Per-uid leases (keyed by idempotency_key = pod uid) so a batch grant
         # gives each pod its own reservation id; falls back to ``lease``.
@@ -315,13 +319,20 @@ class _FakeClient:
         # Return value for select_ondemand_admissions: a list of granted uids,
         # or None to simulate an unavailable endpoint (fallback to grant-all).
         self._select_response = select_response
+        # Which non-granted outcome a "no lease" result carries. Defaults to
+        # DENIED (the app said no), which is what most tests mean; a test
+        # exercising the transient path passes UNAVAILABLE.
+        self._fail_outcome = fail_outcome
         self.create_requests: list = []
         self.cancel_calls: list = []
         self.select_requests: list = []
 
     async def create_ondemand_reservation(self, req):
         self.create_requests.append(req)
-        return self._leases.get(req.idempotency_key, self._lease)
+        lease = self._leases.get(req.idempotency_key, self._lease)
+        if lease is None:
+            return LeaseResult(self._fail_outcome)
+        return LeaseResult(LeaseOutcome.GRANTED, lease)
 
     async def cancel_reservation(self, reservation_id, reason):
         self.cancel_calls.append((reservation_id, reason))
@@ -402,6 +413,44 @@ class TestTryRequestLease:
         assert result is False
         assert candidate.next_attempt_at > before
         assert state.reservations == []
+
+    def _cooldown_seconds_for(self, monkeypatch, outcome) -> float:
+        """Run one lease attempt that yields *outcome*; return the cooldown set."""
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=None, fail_outcome=outcome)
+        state = _state_ready()
+        candidate = _candidate("uid-1")
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_gpu_only_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+
+        config = SimpleNamespace(
+            ondemand_horizon_minutes=30, ondemand_lease_buffer_minutes=10,
+            scheduling_gate_name=None,
+        )
+        before = datetime.now(timezone.utc)
+        assert asyncio.run(
+            m._try_request_lease(state, client, config, "uid-1", candidate)
+        ) is False
+        return (candidate.next_attempt_at - before).total_seconds()
+
+    def test_transient_failure_uses_the_short_retry_not_the_denial_cooldown(self, monkeypatch):
+        """An unreachable app must come back sooner than an app that said no.
+
+        Both used to collapse to the same 2-5 min jittered cooldown because the
+        client returned a bare None for either case.
+        """
+        unavailable = self._cooldown_seconds_for(monkeypatch, LeaseOutcome.UNAVAILABLE)
+        # SHORT_RETRY_SECONDS is 30; RETRY_JITTER_RANGE starts at 120.
+        assert unavailable <= 31
+
+    def test_denial_and_malformed_keep_the_jittered_cooldown(self, monkeypatch):
+        """A real "no", and an unparseable body, both stay on the slow path."""
+        for outcome in (LeaseOutcome.DENIED, LeaseOutcome.MALFORMED):
+            cooldown = self._cooldown_seconds_for(monkeypatch, outcome)
+            assert 119 <= cooldown <= 301, f"{outcome} got {cooldown}s"
 
     def test_admission_failure_issues_compensating_cancel(self, monkeypatch):
         m = _main_module(monkeypatch)
