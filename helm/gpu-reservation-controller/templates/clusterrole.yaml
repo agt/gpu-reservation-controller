@@ -23,3 +23,10 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list"]
+  # acquire_singleton_lease / renew_singleton_lease hold a coordination Lease
+  # so a second controller instance refuses to run (duplicate-instance guard,
+  # not leader election).  Without this rule the controller logs a warning and
+  # runs unguarded — it does not fail to start.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]

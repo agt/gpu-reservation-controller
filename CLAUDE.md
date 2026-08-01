@@ -61,10 +61,19 @@ app/
 | Task | Cadence | Responsibility |
 |------|---------|----------------|
 | `reservation_fetch_loop` | every `RESERVATION_FETCH_INTERVAL` s (default 300) | Re-fetches active reservations; refreshes `gpu_class_id ↔ label_value` maps; reconciles stale queue entries |
-| `pod_watch_loop` | continuous (LIST + WATCH) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease; **fast-path**: applies toleration immediately when a new pod arrives inside an open window |
+| `pod_watch_loop` | continuous (WATCH resumed by `resourceVersion`; LIST at start and every ~10 min resync) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease; **fast-path**: applies toleration immediately when a new pod arrives inside an open window.  Each event is handled under its own try/except, so one bad event cannot kill the consumer |
 | `queue_processor_loop` | every `QUEUE_PROCESSOR_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
 | `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee, only when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**) |
 | `capacity_audit_loop` | every `CAPACITY_CHECK_INTERVAL` s (default 3600) | Compares app-side per-class GPU capacity (`total_gpus`) against physical cluster capacity; logs any difference as a WARNING and pauses on-demand admission for over-committed classes (see **App-side vs physical capacity reconciliation**) |
+| `lease_guard_loop` | every 20 s (only when `SINGLETON_LEASE_ENABLED`) | Renews the singleton `coordination.k8s.io` Lease; terminates the process if another live instance takes it (see **Singleton lease guard**) |
+
+Every task is **supervised**: `_on_task_done` records an unhandled exception in
+`_task_health` and logs it CRITICAL (`task.crashed`), and `GET /health` — which
+backs the liveness probe, the readiness probe, *and* the container HEALTHCHECK —
+returns 503 while any task is dead, so Kubernetes restarts the pod.  There is
+deliberately no in-process restart: all state rebuilds from the cluster and the
+reservation API on startup, and a half-dead controller silently not admitting
+pods is the failure this replaces.
 
 ---
 
@@ -892,6 +901,41 @@ pods).  The watch-to-consumer queue is **bounded** (drop-oldest with a
 warning; the next resync heals any gap), so a stalled consumer can no longer
 grow memory without limit.
 
+### Singleton lease guard
+
+The controller must run as exactly one instance — two would issue duplicate
+toleration patches against the same pods — which the chart states as
+`replicas: 1`.  That alone is not enough: the Deployment's default
+RollingUpdate strategy surges the new pod to Ready *before* terminating the
+old one, so every upgrade transiently ran two controllers.  Two defences,
+both added together:
+
+- **`strategy: Recreate`** in the chart (and the README's manual manifest), so
+  a rollout stops the old pod first.
+- **A `coordination.k8s.io` Lease** (`SINGLETON_LEASE_ENABLED`, default on),
+  named `gpu-reservation-controller` in the controller's own namespace,
+  claimed in `lifespan` before any work starts and renewed every 20 s by
+  `lease_guard_loop` (duration 60 s — two renewals may fail before anyone
+  considers it expired).
+
+This is a **duplicate-instance guard, not leader election**: there is no
+waiting to take over, no standby.  If another live instance holds the lease,
+startup raises, which aborts the FastAPI lifespan and exits non-zero — the
+kubelet's crash-backoff then paces retries until the other lease expires.  An
+**expired** lease is taken over (the previous holder crashed) and our **own**
+lease is simply refreshed, so a container restart of the same pod recovers at
+once rather than waiting out the duration.  Losing the lease mid-life
+(`singleton.lost`) terminates the process immediately via `os._exit`.
+
+**Fail-open on API errors.**  If `coordination.k8s.io` is unreachable — most
+plausibly a 403 on an image-only upgrade whose ClusterRole predates the
+`leases` rule — the controller logs a warning and runs unguarded rather than
+refusing to start.  Only an affirmative "another live holder" answer stops it;
+a blip is not evidence of a duplicate, and a controller that stops admitting
+pods over a coordination hiccup is the worse outcome.  **RBAC**: `get`,
+`create`, `update` on `coordination.k8s.io/leases` (optional, per the
+fail-open behaviour above).
+
 ### In-memory state only
 
 No database.  If the controller restarts, it rebuilds all state from the
@@ -967,6 +1011,9 @@ the claimed set and the grace re-arm path above applies.
 | `TERMINATION_WARNING_ENABLED` | `true` | After each preemption sweep, stamp pods still at risk of preemption at an upcoming boundary with informational `horae/termination-warning-*` annotations — projected termination time, risk score, and a message (see **Termination-warning annotations**); `false` disables |
 | `TERMINATION_WARNING_LEAD_MINUTES` | `30` | How far ahead (minutes) the termination-warning look-ahead scans, decoupled from `PREEMPTION_LEAD_MINUTES` so a pod killed proactively at `boundary − lead` (a phase-A victim) is warned before its boundary enters the kill window; larger = more advance notice but more speculative warnings |
 | `OVERSTAY_REPORT_ENABLED` | `false` | When on, report each ended overstay's duration to the app for offline analysis (`POST /api/reservations/{id}/overstay`) — see **Overstay reporting**. Best-effort and analysis-only; ships dark (default off) |
+| `SINGLETON_LEASE_ENABLED` | `true` | Hold a `coordination.k8s.io` Lease so a second controller instance refuses to run (see **Singleton lease guard**); `false` disables |
+| `POD_NAME` | *(hostname)* | This pod's name (downward API) — the Lease holder identity; falls back to `HOSTNAME`, then the system hostname |
+| `POD_NAMESPACE` | *(SA namespace)* | Namespace the Lease lives in (downward API); falls back to the service-account namespace file, then `default` |
 | `LOG_LEVEL` | `INFO` | Root Python logging level (parsed by `config.py`) |
 
 ---

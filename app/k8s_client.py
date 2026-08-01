@@ -18,6 +18,7 @@ snapshot_node_gpu_inventory(taint_key)       — one LIST → allocatable GPUs p
 snapshot_node_gpu_capacity(taint_key)        — per-class collapse of the inventory (preemption planning)
 apply_toleration(...)                        — PATCH a pod to add toleration + booking annotation
 PodWatcher                                   — async-generator based pod event stream
+acquire_singleton_lease / renew_singleton_lease — coordination Lease duplicate-instance guard
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ log = logging.getLogger(__name__)
 
 # Initialised once by init_k8s(); used by all functions in this module.
 _core_v1: Optional[k8s_client.CoreV1Api] = None
+_coordination_v1: Optional[k8s_client.CoordinationV1Api] = None
 
 
 # ---------------------------------------------------------------------------
@@ -49,8 +51,8 @@ _core_v1: Optional[k8s_client.CoreV1Api] = None
 
 
 def init_k8s(kubeconfig_path: Optional[str]) -> None:
-    """Load Kubernetes credentials and create the CoreV1Api client."""
-    global _core_v1
+    """Load Kubernetes credentials and create the API clients."""
+    global _core_v1, _coordination_v1
     if kubeconfig_path:
         k8s_config.load_kube_config(config_file=kubeconfig_path)
         log.info("%s", kv(event="k8s.auth", mode="kubeconfig", path=kubeconfig_path))
@@ -58,6 +60,7 @@ def init_k8s(kubeconfig_path: Optional[str]) -> None:
         k8s_config.load_incluster_config()
         log.info("%s", kv(event="k8s.auth", mode="in_cluster"))
     _core_v1 = k8s_client.CoreV1Api()
+    _coordination_v1 = k8s_client.CoordinationV1Api()
 
 
 # ---------------------------------------------------------------------------
@@ -1152,3 +1155,145 @@ class PodWatcher:
                     w.stop()
                 except Exception:  # noqa: BLE001 — teardown must never raise
                     pass
+
+
+# ---------------------------------------------------------------------------
+# Singleton lease — duplicate-instance guard (not leader election)
+# ---------------------------------------------------------------------------
+
+#: Name of the coordination Lease every controller instance contends for.  One
+#: controller per namespace: the chart deploys exactly one release per
+#: namespace, so a fixed name needs no configuration.
+LEASE_NAME = "gpu-reservation-controller"
+
+
+@dataclass(frozen=True)
+class LeaseOutcome:
+    """Result of a singleton-lease acquire/renew attempt.
+
+    Errors are returned, never raised: every caller's response to an API
+    failure is the same fail-open "keep running and retry", and a result type
+    makes that impossible to forget.
+    """
+
+    status: str  # "acquired" | "held_by_other" | "lost" | "error"
+    holder: Optional[str] = None  # the other instance's identity, when known
+    age_s: Optional[int] = None   # seconds since the holder last renewed
+    mode: Optional[str] = None    # "created" | "reacquired" | "takeover" | "renewed"
+    err: Optional[str] = None
+
+
+def _lease_age_seconds(lease, now: datetime) -> Optional[int]:
+    """Seconds since *lease* was last renewed, or None if it never was."""
+    renewed = getattr(lease.spec, "renew_time", None)
+    if renewed is None:
+        return None
+    if renewed.tzinfo is None:  # defensive: the client returns aware datetimes
+        renewed = renewed.replace(tzinfo=timezone.utc)
+    return int((now - renewed).total_seconds())
+
+
+def _lease_body(holder: str, duration_s: int, now: datetime, *, acquire: bool,
+                transitions: int = 0):
+    """Build a Lease object claiming (or renewing) the singleton lock."""
+    spec = k8s_client.V1LeaseSpec(
+        holder_identity=holder,
+        lease_duration_seconds=duration_s,
+        renew_time=now,
+        lease_transitions=transitions,
+    )
+    if acquire:
+        spec.acquire_time = now
+    return k8s_client.V1Lease(
+        metadata=k8s_client.V1ObjectMeta(name=LEASE_NAME), spec=spec
+    )
+
+
+async def acquire_singleton_lease(
+    namespace: str, holder: str, duration_s: int
+) -> LeaseOutcome:
+    """Claim the singleton Lease for *holder*, or report who holds it.
+
+    Returns ``held_by_other`` only when another identity holds an **unexpired**
+    lease — the affirmative "a second controller is running" signal.  An
+    expired lease is taken over (the previous holder crashed), and our own
+    lease is simply refreshed, so a container restart of the same pod recovers
+    immediately rather than waiting out the duration.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        try:
+            lease = await _run(
+                _coordination_v1.read_namespaced_lease, LEASE_NAME, namespace
+            )
+        except ApiException as exc:
+            if exc.status != 404:
+                raise
+            await _run(
+                _coordination_v1.create_namespaced_lease,
+                namespace,
+                _lease_body(holder, duration_s, now, acquire=True),
+            )
+            log.debug("%s", kv(event="k8s.lease_write", name=LEASE_NAME, mode="created"))
+            return LeaseOutcome(status="acquired", holder=holder, mode="created")
+
+        current = getattr(lease.spec, "holder_identity", None)
+        age = _lease_age_seconds(lease, now)
+        expiry = getattr(lease.spec, "lease_duration_seconds", None) or duration_s
+        transitions = getattr(lease.spec, "lease_transitions", 0) or 0
+
+        if current == holder:
+            mode = "reacquired"
+        elif age is None or age > expiry:
+            mode = "takeover"
+            transitions += 1
+        else:
+            return LeaseOutcome(status="held_by_other", holder=current, age_s=age)
+
+        await _run(
+            _coordination_v1.replace_namespaced_lease,
+            LEASE_NAME,
+            namespace,
+            _lease_body(holder, duration_s, now, acquire=True, transitions=transitions),
+        )
+        log.debug("%s", kv(event="k8s.lease_write", name=LEASE_NAME, mode=mode))
+        return LeaseOutcome(
+            status="acquired", holder=holder, mode=mode,
+            age_s=age if mode == "takeover" else None,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail open, the caller keeps running
+        return LeaseOutcome(status="error", err=str(exc))
+
+
+async def renew_singleton_lease(
+    namespace: str, holder: str, duration_s: int
+) -> LeaseOutcome:
+    """Refresh our hold on the Lease.
+
+    ``lost`` means another live instance has taken the lease from us — the
+    caller must terminate.  A transient API failure is ``error``: the caller
+    keeps running and retries, since a renewal blip is not evidence of a
+    duplicate.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        lease = await _run(
+            _coordination_v1.read_namespaced_lease, LEASE_NAME, namespace
+        )
+        current = getattr(lease.spec, "holder_identity", None)
+        if current is not None and current != holder:
+            age = _lease_age_seconds(lease, now)
+            expiry = getattr(lease.spec, "lease_duration_seconds", None) or duration_s
+            if age is not None and age <= expiry:
+                return LeaseOutcome(status="lost", holder=current, age_s=age)
+        transitions = getattr(lease.spec, "lease_transitions", 0) or 0
+        await _run(
+            _coordination_v1.replace_namespaced_lease,
+            LEASE_NAME,
+            namespace,
+            _lease_body(holder, duration_s, now, acquire=False, transitions=transitions),
+        )
+        log.debug("%s", kv(event="k8s.lease_write", name=LEASE_NAME, mode="renewed"))
+        return LeaseOutcome(status="acquired", holder=holder, mode="renewed")
+    except Exception as exc:  # noqa: BLE001 — fail open, the caller keeps running
+        return LeaseOutcome(status="error", err=str(exc))

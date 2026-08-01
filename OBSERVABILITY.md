@@ -89,6 +89,21 @@ pod UID, so `event=reservation.lease_created … poduid=X` in the app and
 | INFO | `shutdown.start` / `shutdown.complete` | — | |
 | INFO | `k8s.auth` | `mode` (+ `path`) | `mode=kubeconfig` or `in_cluster`. |
 
+### Singleton lease — duplicate-instance guard (`SINGLETON_LEASE_ENABLED`)
+
+Not leader election: the lease exists so a *second* controller refuses to run, because two instances would issue duplicate toleration patches.
+
+| Level | `event=` | Fields | Notes |
+|---|---|---|---|
+| INFO | `singleton.acquired` | `name ns holder mode` (+ `age_s`) | `mode=created` \| `reacquired` (same pod, container restart) \| `takeover` (previous holder's lease expired — `age_s` is how stale it was). |
+| INFO | `singleton.disabled` | — | The guard is switched off; nothing stops a duplicate instance. |
+| WARNING | `singleton.acquire_failed` | `err` | Could not reach coordination.k8s.io (e.g. a 403 on an upgrade that predates the leases RBAC rule). **Fail-open**: the controller runs unguarded and keeps retrying. |
+| CRITICAL | `singleton.held_by_other` | `name ns holder age_s` | Another live instance holds the lease; startup aborts and the process exits non-zero so crash-backoff paces the retry. |
+| DEBUG | `singleton.renewed` | `name` | Routine renewal, every 20 s. |
+| WARNING | `singleton.renew_failed` | `fails err` | First failure and every 30th (~10 min); the controller keeps running. |
+| CRITICAL | `singleton.lost` | `name ns holder` (+ `age_s`) | Another instance took the lease — this one terminates immediately. |
+| DEBUG | `k8s.lease_write` | `name mode` | The coordination API write behind the above. |
+
 ---
 
 ## 2. Reservation fetch — `app/main.py`, `app/reservation_client.py`

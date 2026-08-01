@@ -9,6 +9,13 @@ spec:
   # The controller holds in-memory queue state; running more than one replica
   # would result in duplicate toleration patches.  Always keep this at 1.
   replicas: 1
+  # Recreate, not the RollingUpdate default: with replicas: 1 the default
+  # surge starts the new pod and waits for it to become Ready *before*
+  # terminating the old one, so every upgrade would transiently run the two
+  # controllers the comment above forbids.  The controller also guards itself
+  # at runtime with a coordination Lease (SINGLETON_LEASE_ENABLED).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "gpu-reservation-controller.selectorLabels" . | nindent 6 }}
@@ -97,6 +104,18 @@ spec:
               value: {{ .Values.config.preemptionDelegateSelection | quote }}
             - name: OVERSTAY_REPORT_ENABLED
               value: {{ .Values.config.overstayReportEnabled | quote }}
+            - name: SINGLETON_LEASE_ENABLED
+              value: {{ .Values.config.singletonLeaseEnabled | quote }}
+
+            # --- Downward API: identity for the singleton Lease ---
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             {{- if .Values.inboundApiTokenSecret.name }}
             # Enables the inbound reservation-push API (POST /api/reservations/push).
             # Omit the secret to leave the endpoint disabled (returns 503).

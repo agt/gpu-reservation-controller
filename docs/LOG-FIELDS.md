@@ -289,7 +289,7 @@ both sides, whereas everywhere else an absent value means "not known".
 |---|---|---|
 | `name` | string | human-readable name of the entity `event=` names (group, cohort, class, date range, service key, …) |
 | `source` | string | which subsystem drove a mutation (`sicad` on roster-driven user/membership changes) |
-| `mode` | string | which variant of an operation ran (`kubeconfig` \| `in_cluster` for k8s auth; `seed` \| `resume` for a watch open) |
+| `mode` | string | which variant of an operation ran (`kubeconfig` \| `in_cluster` for k8s auth; `seed` \| `resume` for a watch open; `created` \| `reacquired` \| `takeover` \| `renewed` for a singleton-lease write) |
 | `section` | string | which part of a multi-part operation a line reports (config import/export) |
 | `guard` | int | which JIT admission guard held a candidate (1, 3, 4, 5) |
 | `annotation` | string | the annotation key a value was read from, on a parse failure |
@@ -310,6 +310,8 @@ both sides, whereas everywhere else an absent value means "not known".
 | `fallback` | string | what was used instead when a delegated call was unavailable |
 | `target` | string | which snapshot failed (`pods`, `node_capacity`) |
 | `task` | string | asyncio background-task name (`pod-watch`, `queue-processor`, …) on a supervision line |
+| `holder` | string | a coordination Lease's `holderIdentity` (the controller pod claiming singleton status) |
+| `age_s` | int seconds | how long ago a Lease was last renewed |
 | `source_id` / `source_kind` | int / `booking` \| `on_demand` | the reservation a *continue* was carried forward from |
 | `superseded` | bool | whether that source still held future time and was cancelled penalty-exempt |
 | `created` / `updated` | int | rows created / updated by one section of a config import |

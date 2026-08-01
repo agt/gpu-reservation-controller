@@ -15,6 +15,12 @@ bypasses the queue-processor polling interval (QUEUE_PROCESSOR_INTERVAL,
 default 300 s) and attempts to apply the toleration immediately, minimising
 scheduler delay for the user.
 
+A sixth task, lease_guard_loop, runs unless SINGLETON_LEASE_ENABLED is off:
+it holds a coordination Lease so a *second* controller instance refuses to
+run (two would issue duplicate toleration patches).  This is a
+duplicate-instance guard, not leader election — there is no waiting to take
+over — and it fails open if coordination.k8s.io is unreachable.
+
 Every task is supervised (``_on_task_done``): an unhandled exception is
 logged CRITICAL and recorded in ``_task_health``, and GET /health — the
 liveness, readiness, and container health probe — turns 503 so Kubernetes
@@ -26,8 +32,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import secrets
+import socket
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -60,8 +68,10 @@ from .controller import (
     slot_start,
 )
 from .k8s_client import (
+    LEASE_NAME,
     TERMINAL_PHASES,
     PodWatcher,
+    acquire_singleton_lease,
     annotate_guarantee_status,
     annotate_runtime_guarantee,
     annotate_termination_warning,
@@ -89,6 +99,7 @@ from .k8s_client import (
     pod_has_toleration,
     read_pod,
     remove_scheduling_gate,
+    renew_singleton_lease,
     snapshot_node_gpu_capacity,
     snapshot_node_gpu_inventory,
     snapshot_tolerated_pods,
@@ -202,6 +213,48 @@ class TaskHealth:
 
 
 _task_health = TaskHealth()
+
+# Singleton-lease timings.  A 60 s duration renewed every 20 s tolerates two
+# consecutive failed renewals before any observer can consider us expired.
+LEASE_DURATION_SECONDS = 60
+LEASE_RENEW_INTERVAL_SECONDS = 20
+
+
+def _terminate_process() -> None:
+    """Exit immediately, non-zero, so the kubelet restarts (or backs off).
+
+    ``os._exit`` skips atexit handlers deliberately: the CRITICAL line
+    explaining why is already flushed (logging's StreamHandler flushes per
+    record), and a controller that has lost the singleton lease must stop
+    patching pods *now*, not after a graceful unwind.  Single seam so tests
+    can monkeypatch it.
+    """
+    os._exit(1)
+
+
+def _lease_namespace(config: Config) -> str:
+    """Namespace the singleton Lease lives in.
+
+    POD_NAMESPACE (downward API) in-cluster; otherwise the service-account
+    namespace file; otherwise "default" for out-of-cluster development.  The
+    runtime fallbacks live here rather than in Config, which stays
+    environment-only.
+    """
+    if config.pod_namespace:
+        return config.pod_namespace
+    try:
+        with open(
+            "/var/run/secrets/kubernetes.io/serviceaccount/namespace",
+            encoding="utf-8",
+        ) as handle:
+            return handle.read().strip() or "default"
+    except OSError:
+        return "default"
+
+
+def _lease_holder(config: Config) -> str:
+    """Identity claimed in the Lease — the pod name, else the hostname."""
+    return config.pod_name or socket.gethostname()
 
 
 def _on_task_done(task: asyncio.Task) -> None:
@@ -2379,6 +2432,97 @@ async def capacity_audit_loop(
 
 
 # ---------------------------------------------------------------------------
+# Background loop 6: singleton lease renewal
+# ---------------------------------------------------------------------------
+
+
+async def lease_guard_loop(config: Config, *, held: bool) -> None:
+    """Hold the singleton Lease for this instance's lifetime.
+
+    Not leader election: there is no waiting to take over.  The one job is to
+    notice that a *second* controller is running and get this one out of the
+    way, since two instances would issue duplicate toleration patches.
+
+    - Renewal lost to another live holder → CRITICAL and terminate.
+    - Renewal failed (API error) → keep running and retry.  A blip is not
+      evidence of a duplicate, and a controller that stops admitting pods
+      because coordination.k8s.io was briefly unreachable is a worse outcome
+      than a small risk of overlap (the same fail-open reasoning as startup).
+    - Not held at startup because acquisition *errored* → keep retrying; an
+      affirmative ``held_by_other`` at any point is the duplicate signal.
+    """
+    namespace = _lease_namespace(config)
+    holder = _lease_holder(config)
+    fails = 0
+    while True:
+        await asyncio.sleep(LEASE_RENEW_INTERVAL_SECONDS)
+        if held:
+            outcome = await renew_singleton_lease(
+                namespace, holder, LEASE_DURATION_SECONDS
+            )
+        else:
+            outcome = await acquire_singleton_lease(
+                namespace, holder, LEASE_DURATION_SECONDS
+            )
+
+        if outcome.status == "lost" or outcome.status == "held_by_other":
+            log.critical("%s", kv(
+                event="singleton.lost", name=LEASE_NAME, ns=namespace,
+                holder=outcome.holder, age_s=outcome.age_s,
+            ))
+            _terminate_process()
+            return
+        if outcome.status == "error":
+            fails += 1
+            if fails == 1 or fails % 30 == 0:  # ~every 10 min at 20 s ticks
+                log.warning("%s", kv(
+                    event="singleton.renew_failed", fails=fails, err=outcome.err,
+                ))
+            continue
+        if not held:
+            log.info("%s", kv(
+                event="singleton.acquired", name=LEASE_NAME, ns=namespace,
+                holder=holder, mode=outcome.mode, age_s=outcome.age_s,
+            ))
+            held = True
+        else:
+            log.debug("%s", kv(event="singleton.renewed", name=LEASE_NAME))
+        fails = 0
+
+
+async def _claim_singleton_lease(config: Config) -> bool:
+    """Claim the Lease at startup; raise if another instance holds it.
+
+    Returns whether the lease is held (False = acquisition errored and we are
+    running unguarded, fail-open).  Raising on ``held_by_other`` aborts the
+    FastAPI lifespan, which exits the process non-zero so the kubelet's
+    crash-backoff paces retries until the other instance's lease expires.
+    """
+    namespace = _lease_namespace(config)
+    holder = _lease_holder(config)
+    outcome = await acquire_singleton_lease(namespace, holder, LEASE_DURATION_SECONDS)
+    if outcome.status == "held_by_other":
+        log.critical("%s", kv(
+            event="singleton.held_by_other", name=LEASE_NAME, ns=namespace,
+            holder=outcome.holder, age_s=outcome.age_s,
+        ))
+        raise RuntimeError(
+            f"another controller instance holds the {LEASE_NAME} lease "
+            f"in namespace {namespace}"
+        )
+    if outcome.status == "error":
+        # Fail open: an image-only upgrade whose ClusterRole lacks the new
+        # leases rule (403) must not brick the controller.
+        log.warning("%s", kv(event="singleton.acquire_failed", err=outcome.err))
+        return False
+    log.info("%s", kv(
+        event="singleton.acquired", name=LEASE_NAME, ns=namespace,
+        holder=holder, mode=outcome.mode, age_s=outcome.age_s,
+    ))
+    return True
+
+
+# ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 
@@ -2401,6 +2545,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Initialise Kubernetes client.
     init_k8s(config.kubeconfig_path)
+
+    # Claim the singleton lease before doing any work: two controllers would
+    # issue duplicate toleration patches.  Raises (aborting startup, non-zero
+    # exit) if another instance holds it; fail-open on any API error.
+    lease_held = False
+    if config.singleton_lease_enabled:
+        lease_held = await _claim_singleton_lease(config)
+    else:
+        log.info("%s", kv(event="singleton.disabled"))
 
     # Perform the first reservation fetch synchronously so that the pod-watch
     # loop has data to match against from the moment it starts.
@@ -2455,6 +2608,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             capacity_audit_loop(state, config), name="capacity-audit"
         ),
     ]
+    if config.singleton_lease_enabled:
+        tasks.append(
+            asyncio.create_task(
+                lease_guard_loop(config, held=lease_held), name="lease-renew"
+            )
+        )
     for task in tasks:
         task.add_done_callback(_on_task_done)
     log.info("%s", kv(event="startup.ready", loops=[t.get_name() for t in tasks]))

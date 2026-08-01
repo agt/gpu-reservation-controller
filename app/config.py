@@ -59,6 +59,9 @@ class Config:
     ondemand_lease_buffer_minutes: int = 10  # added to a pod's minimum-runtime when sizing a JIT lease
     capacity_check_interval: int = 3600  # seconds between app-side vs physical capacity audits
     overstay_report_enabled: bool = False  # report overstay durations to the app for analysis (ships dark)
+    singleton_lease_enabled: bool = True  # hold a coordination Lease so a duplicate instance refuses to run
+    pod_name: Optional[str] = None  # this pod's name (downward API); lease holder identity
+    pod_namespace: Optional[str] = None  # this pod's namespace (downward API); where the Lease lives
     log_level: str = "INFO"        # root log level (LOG_LEVEL)
 
     @classmethod
@@ -126,5 +129,10 @@ class Config:
                 os.environ.get("CAPACITY_CHECK_INTERVAL", "3600")
             ),
             overstay_report_enabled=_env_bool("OVERSTAY_REPORT_ENABLED", False),
+            singleton_lease_enabled=_env_bool("SINGLETON_LEASE_ENABLED", True),
+            # POD_NAME comes from the downward API in-cluster; HOSTNAME is the
+            # pod name inside a container anyway, so it is a natural fallback.
+            pod_name=os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or None,
+            pod_namespace=os.environ.get("POD_NAMESPACE") or None,
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
         )
