@@ -84,7 +84,8 @@ pod UID, so `event=reservation.lease_created … poduid=X` in the app and
 | INFO | `startup.noshow_armed` | `watched` | No-show deadlines armed. |
 | ERROR | `startup.initial_fetch_failed` | `err retry_s` | Controller continues degraded; pod matching is delayed until a retry succeeds. |
 | WARNING | `startup.capacity_audit_failed` | `err` | The synchronous first audit failed. |
-| INFO | `startup.ready` | — | All five background loops running. |
+| INFO | `startup.ready` | `loops` | All background loops running, named. |
+| CRITICAL | `task.crashed` | `task err` | A supervised background loop died with an unhandled exception; `GET /health` turns 503 so the liveness probe restarts the pod. No in-process restart. |
 | INFO | `shutdown.start` / `shutdown.complete` | — | |
 | INFO | `k8s.auth` | `mode` (+ `path`) | `mode=kubeconfig` or `in_cluster`. |
 
@@ -126,6 +127,7 @@ pod UID, so `event=reservation.lease_created … poduid=X` in the app and
 | WARNING | `pod.gate_remove_failed` | `ns pod gate err` | Also best-effort. |
 | DEBUG | `pod.routed_jit` | `ns pod clabel reason` | No admittable reservation → JIT queue. |
 | DEBUG | `pod.left_pending` | `ns pod reason` | No match and not JIT-eligible (missing group label or minimum-runtime annotation). |
+| ERROR | `pod.event_failed` | `watch_event ns pod err` | Handling one watch event raised; the event is skipped and the watch loop keeps consuming (`ns`/`pod` omitted when the object was too malformed to name). |
 
 ---
 
@@ -224,6 +226,7 @@ were deliberately given different keys.
 | Level | `event=` | Fields | Notes |
 |---|---|---|---|
 | DEBUG | `queue.tick` | `queued candidates` | |
+| ERROR | `queue.tick_failed` | `err` | The whole tick raised; state from partial work stands and the loop retries next interval (same guard shape as the fetch/preemption/audit loops). |
 | WARNING | `queue.snapshot_failed` | `target err` | `target=pods` or `node_inventory`; prior state kept. |
 | WARNING | `interlock.activated` | `clabel guard count pods` | Guard-3 interlock on; JIT held for that class. |
 | INFO | `interlock.cleared` | `clabel guard` | |

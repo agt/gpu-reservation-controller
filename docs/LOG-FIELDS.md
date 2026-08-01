@@ -308,6 +308,7 @@ both sides, whereas everywhere else an absent value means "not known".
 | `reservations` | int | reservations in the occupancy map |
 | `fallback` | string | what was used instead when a delegated call was unavailable |
 | `target` | string | which snapshot failed (`pods`, `node_capacity`) |
+| `task` | string | asyncio background-task name (`pod-watch`, `queue-processor`, …) on a supervision line |
 | `source_id` / `source_kind` | int / `booking` \| `on_demand` | the reservation a *continue* was carried forward from |
 | `superseded` | bool | whether that source still held future time and was cancelled penalty-exempt |
 | `created` / `updated` | int | rows created / updated by one section of a config import |
