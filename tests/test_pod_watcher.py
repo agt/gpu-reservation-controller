@@ -285,36 +285,47 @@ def test_periodic_resync_forces_relist(monkeypatch, caplog):
     )
 
 
-def test_bounded_queue_drops_oldest_when_consumer_stalls(monkeypatch, caplog):
-    h = _Harness(
-        monkeypatch,
-        [("yield", [_ev(uid="e1"), _ev(uid="e2"), _ev(uid="e3")])],
-    )
+def test_bounded_queue_drops_oldest_when_consumer_stalls(caplog):
+    """``_offer`` is the drop-oldest seam, driven directly.
+
+    Going through the watch thread would make this a race: whether all three
+    offers land before the woken consumer task resumes is up to the scheduler,
+    so the assertion held locally and failed in CI.  ``_offer`` always runs on
+    the event-loop thread, so calling it directly is both deterministic and
+    faithful to how the producer reaches it.
+    """
     watcher = PodWatcher(queue_maxsize=2)
 
     async def _scenario():
-        agen = watcher.events()
-        try:
-            # Let the producer run to exhaustion before consuming anything, so
-            # all three offers hit the queue while it can hold only two.
-            await asyncio.get_running_loop().run_in_executor(
-                None, lambda: h.exhausted.wait(timeout=5)
-            )
-            await asyncio.sleep(0.05)  # drain pending call_soon_threadsafe callbacks
-            return [
-                await asyncio.wait_for(agen.__anext__(), 2),
-                await asyncio.wait_for(agen.__anext__(), 2),
-            ]
-        finally:
-            await agen.aclose()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=2)
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            for uid in ("e1", "e2", "e3"):
+                watcher._offer(queue, ("ADDED", _pod(uid)))
+        return [queue.get_nowait(), queue.get_nowait()]
 
-    with caplog.at_level(logging.WARNING, logger=LOGGER):
-        events = asyncio.run(_scenario())
+    events = asyncio.run(_scenario())
 
-    # e1 (the oldest) was dropped; newest state won.
+    # e1 (the oldest) was dropped; newest state won, and nothing blocked.
     assert [p.metadata.uid for _, p in events] == ["e2", "e3"]
     dropped = [r for r in caplog.records if "k8s.watch_dropped" in r.getMessage()]
     assert len(dropped) == 1 and "dropped=1" in dropped[0].getMessage()
+
+
+def test_drop_warning_is_throttled(caplog):
+    """First drop and every 100th warn; the rest are silent."""
+    watcher = PodWatcher(queue_maxsize=1)
+
+    async def _scenario():
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            for i in range(101):  # 1 fill + 100 drops
+                watcher._offer(queue, ("ADDED", _pod(f"e{i}")))
+
+    asyncio.run(_scenario())
+
+    dropped = [r.getMessage() for r in caplog.records if "k8s.watch_dropped" in r.getMessage()]
+    assert len(dropped) == 2
+    assert "dropped=1" in dropped[0] and "dropped=100" in dropped[1]
 
 
 def test_consumer_close_stops_current_watch(monkeypatch):

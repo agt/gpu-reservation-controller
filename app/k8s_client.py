@@ -970,6 +970,27 @@ class PodWatcher:
         self._watch: Optional[watch.Watch] = None
         self._dropped = 0
 
+    def _offer(self, queue: "asyncio.Queue", item: tuple[str, object]) -> None:
+        """Enqueue *item*, dropping the oldest event if the queue is full.
+
+        Always invoked on the event-loop thread (via ``call_soon_threadsafe``),
+        so the full/drop/put triple cannot interleave with the consumer's get.
+        Dropping the *oldest* is right for a level-triggered consumer — newer
+        state for a pod supersedes older — and the periodic resync re-LIST
+        heals whatever a drop lost.
+        """
+        if queue.full():
+            try:
+                queue.get_nowait()  # drop the OLDEST event
+            except asyncio.QueueEmpty:  # pragma: no cover — full ⇒ non-empty
+                pass
+            self._dropped += 1
+            if self._dropped == 1 or self._dropped % 100 == 0:
+                log.warning("%s", kv(
+                    event="k8s.watch_dropped", dropped=self._dropped,
+                ))
+        queue.put_nowait(item)
+
     def _log_watch_failure(self, fail_count: int, exc: Exception) -> None:
         """Throttled failure logging: WARNING on the first failure and every
         120th (~10 min at the 5 s retry), DEBUG in between."""
@@ -989,22 +1010,6 @@ class PodWatcher:
             maxsize=self._queue_maxsize
         )
         stop_event = threading.Event()
-
-        def _offer(item: tuple[str, object]) -> None:
-            # Runs on the event-loop thread only (always via
-            # call_soon_threadsafe), so the full/drop/put triple cannot
-            # interleave with the consumer's get.
-            if queue.full():
-                try:
-                    queue.get_nowait()  # drop the OLDEST event
-                except asyncio.QueueEmpty:  # pragma: no cover — full ⇒ non-empty
-                    pass
-                self._dropped += 1
-                if self._dropped == 1 or self._dropped % 100 == 0:
-                    log.warning("%s", kv(
-                        event="k8s.watch_dropped", dropped=self._dropped,
-                    ))
-            queue.put_nowait(item)
 
         def _run_watch() -> None:
             """Blocking LIST/WATCH loop; runs in a dedicated daemon thread."""
@@ -1035,7 +1040,7 @@ class PodWatcher:
                             rv=pod_list.metadata.resource_version,
                         ))
                         for pod in pod_list.items:
-                            loop.call_soon_threadsafe(_offer, ("ADDED", pod))
+                            loop.call_soon_threadsafe(self._offer, queue, ("ADDED", pod))
                         rv = pod_list.metadata.resource_version
                         last_list = time.monotonic()
                         mode = "seed"
@@ -1100,7 +1105,7 @@ class PodWatcher:
                             event="k8s.watch_event", watch_event=event["type"],
                             ns=obj.metadata.namespace, pod=obj.metadata.name,
                         ))
-                        loop.call_soon_threadsafe(_offer, (event["type"], obj))
+                        loop.call_soon_threadsafe(self._offer, queue, (event["type"], obj))
                     # Clean close: the server honoured timeout_seconds.  A
                     # healthy cycle even if it carried no events.
                     fail_count = 0
