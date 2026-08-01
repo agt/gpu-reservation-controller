@@ -34,6 +34,10 @@ _CONFIG_ENV = [
     "POD_SCHEDULING_GATE_NAME",
     "PREEMPTION_LEAD_MINUTES",
     "PREEMPTION_CHECK_INTERVAL",
+    "SINGLETON_LEASE_ENABLED",
+    "POD_NAME",
+    "POD_NAMESPACE",
+    "HOSTNAME",
     "LOG_LEVEL",
 ]
 
@@ -136,6 +140,38 @@ class TestConfigFromEnv:
         monkeypatch.setenv("RESERVATION_API_KEY", "k")
         monkeypatch.setenv("ONDEMAND_DELEGATE_ADMISSION", value)
         assert Config.from_env().ondemand_delegate_admission is expected
+
+    def test_singleton_lease_defaults_on(self, monkeypatch):
+        from app.config import Config
+
+        self._base_env(monkeypatch)
+        c = Config.from_env()
+        assert c.singleton_lease_enabled is True
+        assert c.pod_name is None and c.pod_namespace is None
+
+    @pytest.mark.parametrize("value,expected", [
+        ("false", False), ("0", False), ("off", False),
+        ("true", True), ("anything-else", True),
+    ])
+    def test_singleton_lease_flag_parsing(self, monkeypatch, value, expected):
+        from app.config import Config
+
+        self._base_env(monkeypatch)
+        monkeypatch.setenv("SINGLETON_LEASE_ENABLED", value)
+        assert Config.from_env().singleton_lease_enabled is expected
+
+    def test_pod_identity_prefers_downward_api_over_hostname(self, monkeypatch):
+        from app.config import Config
+
+        self._base_env(monkeypatch)
+        monkeypatch.setenv("HOSTNAME", "container-host")
+        assert Config.from_env().pod_name == "container-host"  # fallback
+
+        monkeypatch.setenv("POD_NAME", "controller-7d9f")
+        monkeypatch.setenv("POD_NAMESPACE", "gpu-system")
+        c = Config.from_env()
+        assert c.pod_name == "controller-7d9f"
+        assert c.pod_namespace == "gpu-system"
 
 
 # ---------------------------------------------------------------------------

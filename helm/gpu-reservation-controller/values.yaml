@@ -155,6 +155,16 @@ config:
   # pull.  Ships dark: leave false unless you want the reporting.
   overstayReportEnabled: false
 
+  # Hold a coordination.k8s.io Lease so a second controller instance refuses to
+  # run — two would issue duplicate toleration patches.  A duplicate-instance
+  # guard, not leader election: there is no waiting to take over, and if the
+  # coordination API is unreachable (e.g. an upgrade predating the leases RBAC
+  # rule) the controller logs a warning and runs unguarded.  The holder
+  # identity and namespace come from the downward API (POD_NAME /
+  # POD_NAMESPACE), which the Deployment wires directly — they are plumbing,
+  # not tunables, so they are deliberately not exposed here.
+  singletonLeaseEnabled: true
+
 # ---------------------------------------------------------------------------
 # ServiceAccount and RBAC
 # ---------------------------------------------------------------------------

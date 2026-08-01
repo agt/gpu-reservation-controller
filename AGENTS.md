@@ -59,7 +59,7 @@ curl http://localhost:8000/health
 | `config.py` | All environment-variable parsing; add new settings here |
 | `schemas.py` | Pydantic models for the reservation API; mirror RESERVATION-API.md §6 |
 | `reservation_client.py` | All HTTP calls to the reservation management API |
-| `k8s_client.py` | All Kubernetes API calls (watch, list, patch); no business logic |
+| `k8s_client.py` | All Kubernetes API calls (watch, list, patch, singleton Lease); no business logic |
 | `controller.py` | Business logic: matching, time-window arithmetic, queue management |
 | `main.py` | Wiring only: creates state, starts tasks, owns the FastAPI app |
 

@@ -84,9 +84,25 @@ pod UID, so `event=reservation.lease_created … poduid=X` in the app and
 | INFO | `startup.noshow_armed` | `watched` | No-show deadlines armed. |
 | ERROR | `startup.initial_fetch_failed` | `err retry_s` | Controller continues degraded; pod matching is delayed until a retry succeeds. |
 | WARNING | `startup.capacity_audit_failed` | `err` | The synchronous first audit failed. |
-| INFO | `startup.ready` | — | All five background loops running. |
+| INFO | `startup.ready` | `loops` | All background loops running, named. |
+| CRITICAL | `task.crashed` | `task err` | A supervised background loop died with an unhandled exception; `GET /health` turns 503 so the liveness probe restarts the pod. No in-process restart. |
 | INFO | `shutdown.start` / `shutdown.complete` | — | |
 | INFO | `k8s.auth` | `mode` (+ `path`) | `mode=kubeconfig` or `in_cluster`. |
+
+### Singleton lease — duplicate-instance guard (`SINGLETON_LEASE_ENABLED`)
+
+Not leader election: the lease exists so a *second* controller refuses to run, because two instances would issue duplicate toleration patches.
+
+| Level | `event=` | Fields | Notes |
+|---|---|---|---|
+| INFO | `singleton.acquired` | `name ns holder mode` (+ `age_s`) | `mode=created` \| `reacquired` (same pod, container restart) \| `takeover` (previous holder's lease expired — `age_s` is how stale it was). |
+| INFO | `singleton.disabled` | — | The guard is switched off; nothing stops a duplicate instance. |
+| WARNING | `singleton.acquire_failed` | `err` | Could not reach coordination.k8s.io (e.g. a 403 on an upgrade that predates the leases RBAC rule). **Fail-open**: the controller runs unguarded and keeps retrying. |
+| CRITICAL | `singleton.held_by_other` | `name ns holder age_s` | Another live instance holds the lease; startup aborts and the process exits non-zero so crash-backoff paces the retry. |
+| DEBUG | `singleton.renewed` | `name` | Routine renewal, every 20 s. |
+| WARNING | `singleton.renew_failed` | `fails err` | First failure and every 30th (~10 min); the controller keeps running. |
+| CRITICAL | `singleton.lost` | `name ns holder` (+ `age_s`) | Another instance took the lease — this one terminates immediately. |
+| DEBUG | `k8s.lease_write` | `name mode` | The coordination API write behind the above. |
 
 ---
 
@@ -126,6 +142,7 @@ pod UID, so `event=reservation.lease_created … poduid=X` in the app and
 | WARNING | `pod.gate_remove_failed` | `ns pod gate err` | Also best-effort. |
 | DEBUG | `pod.routed_jit` | `ns pod clabel reason` | No admittable reservation → JIT queue. |
 | DEBUG | `pod.left_pending` | `ns pod reason` | No match and not JIT-eligible (missing group label or minimum-runtime annotation). |
+| ERROR | `pod.event_failed` | `watch_event ns pod err` | Handling one watch event raised; the event is skipped and the watch loop keeps consuming (`ns`/`pod` omitted when the object was too malformed to name). |
 
 ---
 
@@ -224,6 +241,7 @@ were deliberately given different keys.
 | Level | `event=` | Fields | Notes |
 |---|---|---|---|
 | DEBUG | `queue.tick` | `queued candidates` | |
+| ERROR | `queue.tick_failed` | `err` | The whole tick raised; state from partial work stands and the loop retries next interval (same guard shape as the fetch/preemption/audit loops). |
 | WARNING | `queue.snapshot_failed` | `target err` | `target=pods` or `node_inventory`; prior state kept. |
 | WARNING | `interlock.activated` | `clabel guard count pods` | Guard-3 interlock on; JIT held for that class. |
 | INFO | `interlock.cleared` | `clabel guard` | |
@@ -289,7 +307,7 @@ DEBUG only, unless noted.
 | Level | `event=` | Fields |
 |---|---|---|
 | DEBUG | `k8s.read_pod` | `ns pod` |
-| DEBUG | `k8s.list_pods` / `k8s.list_pods_done` | `selector purpose` / `purpose count` (+ `rv`) |
+| DEBUG | `k8s.list_pods` / `k8s.list_pods_done` | `selector purpose` (+ `reason`) / `purpose count` (+ `rv`) — `reason` (watch seed only) is why a full re-LIST ran: `start`, `error`, `expired`, or `resync` |
 | DEBUG | `k8s.list_nodes` | `purpose` |
 | DEBUG | `k8s.node_inventory` | `clabel nodes total` — one line per class |
 | DEBUG | `k8s.patch_pod` | `ns pod patch` + the patch's own fields |
@@ -297,7 +315,10 @@ DEBUG only, unless noted.
 | DEBUG | `pod.already_gone` | `ns pod status` (404 on delete) |
 | WARNING | `k8s.node_allocatable_invalid` | `node resource value` — treated as 0 |
 | WARNING | `pod.annotation_invalid` | `ns pod annotation value` — malformed `horae/minimum-runtime-seconds` |
-| DEBUG | `k8s.watch_open` / `k8s.watch_event` | `selector rv timeout_s` / `watch_event ns pod` |
+| DEBUG | `k8s.watch_open` / `k8s.watch_event` | `selector rv timeout_s mode` / `watch_event ns pod` — `mode=seed` after a LIST, `mode=resume` when continuing from the last resourceVersion (no LIST, no replay) |
+| DEBUG | `k8s.watch_bookmark` | `rv` — server bookmark advanced the resourceVersion; never forwarded as a pod event |
+| INFO | `k8s.watch_expired` | `rv` — HTTP 410: the resourceVersion expired server-side; re-LISTing immediately (no backoff) |
+| WARNING | `k8s.watch_dropped` | `dropped` — bounded event queue was full; the oldest event was discarded (first drop and every 100th; the periodic resync re-LIST heals the gap) |
 | WARNING | `k8s.watch_error` | `fails err retry_s` — **first failure and every 120th**, to bound spam during a sustained disconnect |
 | DEBUG | `k8s.watch_ended` | `err retry_s` |
 

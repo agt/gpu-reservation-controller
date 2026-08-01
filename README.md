@@ -38,7 +38,8 @@ system is designed to accommodate greater values in the future.)
            │ updates in-memory reservation list
            ▼
 ┌──────────────────────────────────────────────────────┐
-│ 2. Pod watch  (LIST at startup, then WATCH stream)   │
+│ 2. Pod watch  (LIST at startup + periodic resync,    │
+│                then WATCH resumed by resourceVersion)│
 │    Pods with label gpu-class=<X> are routed:         │
 │      a. A reservation is open now, or opens within   │
 │         ONDEMAND_HORIZON_MINUTES, with budget         │
@@ -384,6 +385,9 @@ All settings are supplied via environment variables.
 | `TERMINATION_WARNING_ENABLED` | no | `true` | After each preemption sweep, stamp pods still at risk of preemption at an upcoming boundary with informational `horae/termination-warning-*` annotations (projected kill instant, risk score, message). Purely informational — nothing is enforced. Set to `false` to disable |
 | `TERMINATION_WARNING_LEAD_MINUTES` | no | `30` | How far ahead (minutes) the termination-warning look-ahead scans, decoupled from `PREEMPTION_LEAD_MINUTES` so a pod killed proactively at `boundary − lead` (a phase-A victim) is warned before its boundary enters the kill window; larger = more advance notice but more speculative warnings |
 | `REQUIRED_GROUP_LABEL` | no | *(absent)* | Pod label naming the usage group a pod belongs to (e.g. `dsmlp/course`). When set, the pod's value for this label must equal the reservation's group name — an additional match constraint alongside `gpu-class` — before the controller admits it, adopts it, or chain-extends its guarantee; a pod without the label is also never JIT-eligible. Unset disables the group constraint |
+| `SINGLETON_LEASE_ENABLED` | no | `true` | Hold a `coordination.k8s.io` Lease so a **second** controller instance refuses to run (two would issue duplicate toleration patches). A duplicate-instance guard, not leader election: there is no waiting to take over. Startup aborts (non-zero exit, kubelet backs off and retries) if another live instance holds the lease; if the coordination API is unreachable — e.g. an upgrade whose ClusterRole predates the leases rule — the controller logs a warning and runs unguarded. Set to `false` to disable |
+| `POD_NAME` | no | *(hostname)* | This pod's name, from the downward API; used as the singleton Lease holder identity. Falls back to `HOSTNAME`, then the system hostname |
+| `POD_NAMESPACE` | no | *(service-account namespace)* | Namespace the singleton Lease is created in, from the downward API. Falls back to the in-cluster service-account namespace, then `default` |
 | `LOG_LEVEL` | no | `INFO` | Python logging level for the controller |
 
 > **Security note:** The controller needs a **`read_write`**-scoped service
@@ -566,8 +570,12 @@ kubectl create secret generic gpu-reservation-api-key \
 The controller needs read access to pods across all namespaces, write access
 (PATCH) to pods in namespaces where reservations are active, `delete` on pods
 so it can evict pods whose reservation is cancelled mid-window or whose
-runtime guarantee has elapsed and capacity is needed, and `get`/`list` on
-nodes so the preemption sweep can compute physical GPU capacity per class.
+runtime guarantee has elapsed and capacity is needed, `get`/`list` on
+nodes so the preemption sweep can compute physical GPU capacity per class,
+and `get`/`create`/`update` on `coordination.k8s.io` leases for the
+singleton guard that stops a second instance from running.  The lease rule is
+the only optional one: without it the controller logs a warning and runs
+unguarded rather than failing to start.
 
 ```yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -584,6 +592,9 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -608,7 +619,13 @@ metadata:
   name: gpu-reservation-controller
   namespace: gpu-system
 spec:
+  # The controller holds in-memory queue state; running more than one replica
+  # would result in duplicate toleration patches.  Keep this at 1, and use
+  # Recreate so a rollout does not transiently run two (the default
+  # RollingUpdate surge starts the new pod before stopping the old one).
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: gpu-reservation-controller
@@ -633,6 +650,15 @@ spec:
                   key: api-key
             - name: TZ
               value: "America/Los_Angeles"
+            # Identity for the singleton Lease (SINGLETON_LEASE_ENABLED).
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           livenessProbe:
             httpGet:
               path: /health
