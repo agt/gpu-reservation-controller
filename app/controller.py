@@ -1111,7 +1111,21 @@ class ControllerState:
         if reservation.user is None:
             return []
         namespace = reservation.user.username
-        gpu_class_label = self.gpu_class_labels.get(reservation.gpu_class_id)
+        # Both sides of the class comparison are resolved here, unlike the
+        # ``find_*`` matchers where the left side is the pod's own label (always
+        # a real string).  A bare ``gpu_class_labels.get()`` therefore yields
+        # ``None == None`` for two *different* classes whose labels are both
+        # unresolvable, chaining a guarantee across them.  ``_effective_label``
+        # is the resolver that falls back to the label embedded in the
+        # reservation; an unresolvable anchor chains nothing at all, matching
+        # how ``boundary_demand`` skips a reservation it cannot classify.
+        gpu_class_label = self._effective_label(reservation)
+        if gpu_class_label is None:
+            log.debug("%s", kv(
+                event="guarantee.chain_skipped", rid=reservation.id,
+                reason="no_resolvable_class_label",
+            ))
+            return []
         gpu_count = reservation.gpu_count
 
         candidates = sorted(
@@ -1122,7 +1136,7 @@ class ControllerState:
                 and r.kind == "booking"
                 and r.user is not None
                 and r.user.username == namespace
-                and self.gpu_class_labels.get(r.gpu_class_id) == gpu_class_label
+                and self._effective_label(r) == gpu_class_label
                 and r.gpu_count == gpu_count
                 and (
                     self.required_group_label is None

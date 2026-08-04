@@ -204,6 +204,7 @@ audit blocking admission" without matching on message text.
 | WARNING | `preempt.unknown_victim` | `poduid` | App named a pod that was never offered; ignored. |
 | ERROR | `preempt.sweep_failed` | `err` | |
 | DEBUG | `preempt.demand_skipped` | `rid reason` | Reservation's class label unresolvable. |
+| DEBUG | `guarantee.chain_skipped` | `rid reason` | Back-to-back chaining declined: the anchor reservation's class label is unresolvable, so its guarantee covers only its own window. Two classes that both fail to resolve would otherwise compare equal and chain across each other. |
 
 `sweep=A` is the lead-time phase (proactive, `boundary > now`); `sweep=B` is
 at-boundary. `phase=` on other lines means the **pod lifecycle phase** — the two

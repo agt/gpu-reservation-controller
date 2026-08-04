@@ -146,3 +146,53 @@ class TestReservationsClaimedBy:
         r2 = _user_reservation(2, slot_index=1, reservation_date=future)
         state = _state(r1, r2)
         assert state.reservations_claimed_by(1) == {1, 2}
+
+
+# ---------------------------------------------------------------------------
+# Unresolvable GPU-class labels must not chain across classes
+# ---------------------------------------------------------------------------
+
+
+class TestChainWithUnresolvableClassLabel:
+    """``_chain_for`` resolves the class label on *both* sides of its comparison.
+
+    Every other matcher compares a reservation's label against the *pod's* label,
+    which is always a real string. Here both operands were
+    ``gpu_class_labels.get(...)``, so two different classes whose labels both
+    failed to resolve compared equal (``None == None``) and chained — extending a
+    pod's runtime guarantee across a window of a class it never held.
+    """
+
+    def _abutting_pair(self):
+        """Two back-to-back windows, same user and GPU count, different classes."""
+        first = _user_reservation(1, gpu_class_id=GPU_CLASS_ID)
+        second = _user_reservation(
+            2, gpu_class_id=OTHER_CLASS_ID, start_time="10:00:00"
+        )
+        return first, second
+
+    def test_does_not_chain_two_unresolvable_classes(self):
+        first, second = self._abutting_pair()
+        # Neither class is in the label map: both used to resolve to None.
+        state = _state(first, second, labels={})
+
+        assert state._chain_for(first, NOW) == []
+        # The guarantee is the reservation's own window, not the pair's.
+        assert state.compute_guaranteed_until(NOW, first) == first.end_utc
+
+    def test_still_chains_when_both_resolve_to_the_same_label(self):
+        """The fix must not break the case chaining exists for."""
+        first = _user_reservation(1, gpu_class_id=GPU_CLASS_ID)
+        second = _user_reservation(2, gpu_class_id=GPU_CLASS_ID, start_time="10:00:00")
+        state = _state(first, second)
+
+        assert [r.id for r in state._chain_for(first, NOW)] == [2]
+        assert state.compute_guaranteed_until(NOW, first) == second.end_utc
+
+    def test_does_not_chain_a_resolvable_class_to_an_unresolvable_one(self):
+        first, second = self._abutting_pair()
+        # Only the anchor's class resolves; the follow-on's does not.
+        state = _state(first, second, labels={GPU_CLASS_ID: "h100"})
+
+        assert state._chain_for(first, NOW) == []
+        assert state.compute_guaranteed_until(NOW, first) == first.end_utc
