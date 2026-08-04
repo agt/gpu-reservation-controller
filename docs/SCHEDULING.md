@@ -11,53 +11,46 @@ operations-research literature for configuration guidance.
   `total_gpus` (the cluster pool for that tier). This is the supply. Multiple
   independent classes (e.g. H100, A100) are scheduled separately; there is no
   cross-class substitution. Each class carries a `su_rate_per_hour` (base Service
-  Units per GPU per hour, default 0), an optional `max_gpus_per_reservation`
-  cap, an optional `min_su_per_gpu_hour` floor (hard minimum effective rate —
-  see **SU pricing** below), and a `management_buffer` (INT, default 0) —
-  see **Management buffer** below.
+  Units per GPU per hour, default 0) and an optional `max_gpus_per_reservation`
+  cap.
 - **Capacity overrides** (`gpu_class_day_overrides`) — per-date-span capacity
   adjustments (holidays, maintenance, surge). Inclusive `date_start`/`date_end`,
   either bound nullable = unbounded. Overlaps resolve **narrowest-span-wins**;
   ties → largest `available_gpus`. This lets a short maintenance window override
-  a long-standing baseline. Each override also carries a `management_buffer` that
-  replaces the class-level buffer for covered dates.
+  a long-standing baseline.
 
-### Management buffer
-
-`GpuClass.management_buffer` (and `GpuClassDayOverride.management_buffer` for
-date-scoped periods) reserves a slice of GPU capacity that is invisible to
-ordinary members:
-
-- **Non-privileged users** see `total_gpus − management_buffer` as their
-  effective pool in availability queries and are capped to that ceiling when
-  booking.
-- **Admins and group managers** see and book -- for themselves or on behalf of users/group members -- against the true `total_gpus`
-  (the buffer does not reduce their visible or bookable capacity).
-- The day-override `management_buffer` follows the same narrowest-span-wins
-  resolution as `available_gpus`, so a short maintenance-mode override can
-  raise or lower the buffer relative to the class default.
-
-Use this to hold headroom for unplanned hardware maintenance, or to allow 
-instructors to make student accommodations even when the cluster otherwise appears full.
+The physical pool (`total_gpus`, or a day override's `available_gpus`) is the
+same for every user; headroom for maintenance or accommodations is now reserved
+through the per-group and per-cluster GPU ceilings rather than a hidden buffer.
 
 ## 2. The time structure (how reservations are expressed)
 
-Time is **continuous at whole-hour granularity** — not a fixed slot grid.
-A reservation specifies an arbitrary `start_dt`/`end_dt` pair, both snapped to
-whole hours (no minutes/seconds), site-local wall-clock time:
+Time is **continuous** — not a fixed slot grid. A reservation specifies an
+arbitrary `start_dt`/`end_dt` pair in site-local wall-clock time. Two kinds
+exist:
 
-- `start_dt` must be at least 15 minutes in the future (propagation lead time
-  for the Kubernetes controller).
-- `end_dt > start_dt`; may cross midnight (e.g. 22:00 → 06:00).
-- Non-privileged members are subject to a **48-hour server-side cap** (the API
-  returns 400 for requests exceeding 48 h). Admins and group managers are exempt
-  and may create reservations longer than 48 h, typically via the admin
-  reservation interface. The frontend booking wizard also enforces a 48-hour
-  ceiling for non-privileged users.
+- **Web bookings** (`kind='booking'`) are snapped to whole hours (no
+  minutes/seconds) by the API validator:
+  - `start_dt` must be at least 15 minutes in the future (propagation lead time
+    for the Kubernetes controller).
+  - `end_dt > start_dt`; may cross midnight (e.g. 22:00 → 06:00).
+  - Non-privileged members are subject to a **48-hour server-side cap** (the API
+    returns 400 for requests exceeding 48 h). Admins and group managers are exempt
+    and may create reservations longer than 48 h, typically via the admin
+    reservation interface. The frontend booking wizard also enforces a 48-hour
+    ceiling for non-privileged users.
+- **On-demand leases** (`kind='on_demand'`, requested by the Kubernetes
+  controller for pending on-demand pods) are anchored at the app's "now" with an
+  arbitrary **second-granularity** duration — no grid, no lead time, no 48-hour
+  cap.
 - The `date` column mirrors `start_dt.date()` for filtering.
 
-Capacity is evaluated **per hour** across the booked interval, so cross-midnight
-ranges correctly see each day's day-override capacity.
+Capacity is evaluated per **hour-aligned segment** across the booked interval
+(segments never span an hour or date boundary), with **exact peak-concurrency**
+counting — so cross-midnight ranges see each day's day-override capacity, and a
+whole-hour booking conflicts with a sub-hour lease only when their intervals
+genuinely overlap (the web UI simply shows a partially-consumed hour as
+unavailable).
 
 ## 3. Service Unit (SU) pricing
 
@@ -79,19 +72,17 @@ that reduce the effective rate during off-peak windows:
 - When no attached schedule covers the instant, the multiplier is **1.0** (full price).
 
 The booking's **total SU cost** is computed at creation time and stored on the
-reservation row:
+reservation row as two fields that start equal:
 
 ```
-effective_rate(hour) = max(base_rate × multiplier(hour), min_su_per_gpu_hour)
-su_cost = Σ (effective_rate(hour) × gpu_count)  for each hour in [start_dt, end_dt)
+effective_rate(hour) = base_rate × multiplier(hour)
+su_cost_user  = Σ (effective_rate(hour) × gpu_count)  for each hour in [start_dt, end_dt)
+su_cost_group = su_cost_user   (at creation; may diverge on a manager waive — see below)
 ```
 
-`GpuClass.min_su_per_gpu_hour` is a hard floor on the effective per-GPU-hour rate
-regardless of which discount schedule applies.  It ensures a minimum cost even when
-a zero-multiplier free window is active.  `NULL` means no floor (any multiplier,
-including 0, applies directly).
-
-This stored cost is then used for budget enforcement and reporting.
+`su_cost_user` is charged against the individual member's `su_budget`;
+`su_cost_group` is charged against the group's `pool_su_budget`.
+Both are used for budget enforcement and reporting.
 
 `app/pricing.py` exposes `effective_multiplier`, `compute_su_cost`, and
 `hourly_breakdown` (used by the availability timeline so the frontend can preview
@@ -99,24 +90,104 @@ cost before booking).
 
 ### Cancellation penalties
 
-The stored `su_cost` is adjusted at cancellation time based on lead time:
+`su_cost_user` (and `su_cost_group`) are rewritten at cancellation time to the
+**retained cost** = time already consumed (charged in full) + a penalty on the
+*unused* reserved hours that fall within the next 24 h. Reserved time beyond
+that 24 h window is always free, so cancelling well ahead costs nothing.
 
-| Lead time at cancellation | SU cost outcome |
+The penalty is computed by `_compute_cancellation_penalty` in
+`app/routers/reservations.py`. Let:
+
+- `used` = consumed hours (0 unless the reservation is in progress),
+- `pen`  = unused reserved hours inside the next 24 h (`[max(start, now), min(end, now+24h)]`),
+- `committed = used + pen`.
+
+The **exemption** (in hours) is `min(committed / 2, 8)`. Then:
+
+- if `pen ≤ exemption` → **no penalty** (you still pay for `used`);
+- otherwise the penalty is the window's SU cost scaled by `(pen − exemption) / pen`
+  — i.e. a *fraction of cost*, with every hour forgiven proportionally.
+
+`retained = used_cost + penalty`. Worked behaviour (base rate 1 SU/GPU·h, so
+SU == hours):
+
+| Situation at cancellation | Retained SU |
 |---|---|
-| ≥ 24 h before `start_dt` | `su_cost` set to **0** (full waiver) |
-| < 24 h before `start_dt` | `su_cost` set to **50 %** of the cost attributable to the within-24h portion of the reservation |
+| ≥ 24 h before start | **0** |
+| 4 h booking, not started, within 24 h | **2.0** (≈ 50 % — see below) |
+| 24 h booking, just started | **16.0** (used 0 + 24 × (24−8)/24) |
+| 12 h booking, cancelled 6 h in | **6.0** (used 6 + 0 penalty; `pen=6 ≤ exemption=6`) |
+| 24 h booking, cancelled 20 h in | **20.0** (used 20 + 0 penalty) |
 
-A cancelled reservation with a non-zero `su_cost` (a late-cancel penalty)
-continues to count against the member's open SU balance until its `end_dt`
-passes — the same renewable-ceiling model as active reservations. This prevents
-gaming the budget by booking then cancelling at the last minute.
+A cancelled reservation with a non-zero penalty continues to count against the
+member's `su_cost_user` balance until its `end_dt` passes — the same
+renewable-ceiling model as active reservations. This prevents gaming the budget
+by booking then cancelling at the last minute.
+
+#### Design rationale and the three knobs
+
+This policy replaced a simpler "100 % of consumed + 50 % of the next-24 h
+remainder" rule. Three properties drove the redesign, and three constants
+(declared at the top of the cancel helpers in `app/routers/reservations.py`)
+remain the levers to retune:
+
+1. **Penalty window — `_CANCEL_PENALTY_WINDOW_H` (24 h).** Only imminent
+   capacity is scarce, so only reserved hours within this horizon are
+   penalisable; everything past it is free. Widening it penalises further-out
+   cancellations; narrowing it makes the system more forgiving. It also sets the
+   floor the controller poll/guard intervals must stay under conceptually
+   (capacity freed by a cancel is only useful if it can be re-booked in time).
+
+2. **Exemption divisor — `_CANCEL_EXEMPTION_DIVISOR` (2).** The exemption is
+   `committed / divisor`, where `committed = used + penalisable`. At `2` a
+   *not-yet-started* booking (where `used = 0`) is charged exactly 50 % of its
+   in-window cost, matching the old headline rate — so the change is invisible
+   to the common "I booked and changed my mind" case. The exemption grows with
+   *consumed* time, so an in-progress job that has already run longer than its
+   remaining-within-24 h time pays **no** extra penalty (the `pen ≤ exemption`
+   branch): you are not punished for releasing a job you have mostly used.
+   Smaller divisors (1/3, 1/4) forgive less and bite harder on every case;
+   we modelled all three before settling on 1/2.
+
+3. **Exemption cap — `_CANCEL_EXEMPTION_CAP_H` (8 h).** Without a ceiling the
+   exemption would scale with very long reservations, letting someone hold (say)
+   a 48 h block and walk away cheaply. The cap engages only when
+   `committed > 16 h`, so it leaves all small/medium bookings on the pure-1/2
+   curve and pushes only genuinely large cancellations toward near-full charge
+   (e.g. a just-started 24 h block retains 16 SU rather than 12). Lowering the
+   cap discourages large speculative holds more aggressively; raising it (or
+   removing it) is gentler on long legitimate jobs.
+
+**Why "fraction of cost" and not "shave trailing hours".** The exemption is `E`
+*hours* of relief, but with time-of-day discounts the SU value of an hour
+varies, so *which* hours are forgiven matters. Three application methods were
+compared:
+
+- *trail* — drop the last `E` hours of the window. Position-dependent: it
+  systematically favours users whose expensive hours sit late in the window and
+  penalises those whose cheap (off-peak) hours do, for otherwise-identical
+  bookings.
+- *cheap* — forgive the `E` cheapest hours. The mirror image (keeps expensive
+  hours billed); also order-sensitive in the opposite direction.
+- *frac* (**chosen**) — scale the whole window cost by `(pen − E)/pen`. Every
+  hour is forgiven in proportion, so the retained SU is a fixed fraction of the
+  window's actual cost **regardless of where discounted hours fall**. This is
+  the only rate-neutral, predictable option and the one implemented.
+
+If discount-aware fairness ever stops mattering, `trail` is marginally cheaper
+to compute; switching methods is a localised change in
+`_compute_cancellation_penalty`.
 
 **Waiving penalties.** Admins and group managers can waive the penalty:
 - **At cancellation time** — the cancel modal shows the computed penalty and
   offers a waive checkbox.
 - **After the fact** — `POST /api/reservations/{id}/waive-penalty` clears the
-  `su_cost` on an already-cancelled reservation. The admin reservations page shows
+  penalty on an already-cancelled reservation. The admin reservations page shows
   an amber indicator on cancelled rows with a non-zero penalty.
+
+The waiver scope differs by privilege level:
+- **Manager waive** — zeroes `su_cost_user` only (the member's personal budget is freed); `su_cost_group` is retained (the group pool still carries the penalty).
+- **Admin waive** — zeroes both `su_cost_user` and `su_cost_group` (full pardon).
 
 ## 4. Access scoping & shares (who can book what)
 
@@ -146,43 +217,117 @@ All on `UsageGroup`, enforced for regular members in both
 | `valid_from` / `valid_until` | Date range the group can book within | Activation window |
 | `min_days_ahead` | Earliest lead time before a start date (booking opens) | Booking horizon (lower) |
 | `max_days_ahead` | Furthest ahead a start date can be booked | Booking horizon (upper) |
-| `su_budget` | Cap on a member's total **open Service Units** within the configured window (see `su_anchor_mode`); `NULL` = unlimited | SU budget limit |
-| `su_anchor_mode` | Determines how far back the SU budget window reaches: `open` (default), `weekly`, `monthly`, `quarterly`, or `since_creation` — see table below | Budget window |
+| `su_budget` | Cap on a member's Service Units (`su_cost_user`) **per budget window** (see `su_anchor_mode`); `NULL` = unlimited; skipped for privileged users | Per-member SU budget |
+| `pool_su_budget` | Cap on the group's Service Units (`su_cost_group`) across all members, per the same window; `NULL` = unlimited; enforced for all non-admin users including managers | Group-wide SU pool |
+| `su_anchor_mode` | How the SU budget accrues: `weekly` (default), `open`, `monthly`, `quarterly`, or `since_creation` — see table below. Each window carries its own allowance | Budget window |
 
 Additional hard constraints:
 - `start_dt` must be at least 15 minutes in the future.
 - Start date must be today or future.
-- No duplicate-booking unique key (there is no `(group, user, date, policy, slot_index)`
-  constraint; any number of reservations for the same user on the same day are
-  allowed, subject to capacity and SU budget).
+- Multiple reservations for the same user on the same day are allowed, subject to
+  capacity and SU budget.
 - Availability queries are capped at a 90-day date range.
 
 ### SU budget window (`su_anchor_mode`)
 
-`su_anchor_mode` on `UsageGroup` selects how far back the budget window reaches:
+`su_anchor_mode` on `UsageGroup` selects how the budget accrues:
 
-| Mode | Window start | Character |
+| Mode | Window | Character |
 |---|---|---|
-| `open` (default) | `end_dt > now` — only currently-open reservations | Renewable ceiling: SUs are freed when a reservation ends or is cancelled (no penalty) |
-| `weekly` | Monday 00:00 local of the current week | Resets each week |
-| `monthly` | 1st of the current month 00:00 local | Resets each month |
-| `quarterly` | Jan 1 / Apr 1 / Jul 1 / Oct 1 00:00 local | Resets each calendar quarter |
-| `since_creation` | `UsageGroup.created_at` | Cumulative — never resets |
+| `open` | none — the ceiling applies to reservations with `end_dt > now` | Renewable ceiling: SUs are freed when a reservation ends or is cancelled (no penalty) |
+| `weekly` (default) | Monday 00:00 local → the following Monday | Resets each week |
+| `monthly` | 1st of the month 00:00 local → the 1st of the next | Resets each month |
+| `quarterly` | Jan 1 / Apr 1 / Jul 1 / Oct 1 00:00 local → the next quarter | Resets each calendar quarter |
+| `since_creation` | `UsageGroup.created_at` → never closes | Cumulative — never resets |
 
-For windowed modes (`weekly`, `monthly`, `quarterly`, `since_creation`) the
-balance counts all `su_cost` accrued since the anchor date regardless of whether
-the reservation has ended — effectively a **depleting quota** over the window
-period rather than a renewable concurrent ceiling. The `GET /api/groups/su-status`
-endpoint returns per-group breakdown fields: `su_used` (active SUs in window),
-`su_open` (active future reservations in window), `su_cancelled` (late-cancel
-penalties still counting), `used_count`, `open_count`, and `su_remaining`.
+**`weekly` is the code default for new groups** — it maps onto weekly assignment
+rhythms and throttles demand near deadlines without requiring students to cancel
+finished reservations to free headroom. Set `open` explicitly for groups that
+want a renewable concurrent ceiling instead of a per-week depleting quota.
 
-The `since_creation` mode is the strictest: once SUs are spent they are never
-recovered (except by the cancellation-penalty waiver mechanic above or by the
-admin increasing `su_budget`).
+For the anchored modes the balance counts all `su_cost_user` accrued in the
+window regardless of whether the reservation has ended — a **depleting quota**
+over the window rather than a renewable concurrent ceiling.
 
-Note: late-cancel penalties (`su_cost > 0` on cancelled rows) count against the
-budget until `end_dt` passes, regardless of anchor mode.
+#### Each window is its own allowance
+
+**A reservation is charged to the budget window containing its `start_dt`, and to
+no other window.** Booking three weeks ahead spends that week's budget and leaves
+the current week's untouched; conversely, a member who has exhausted this week can
+still plan next week's work.
+
+This was not always so. The window originally had a *start* but no *end*, so the
+balance counted the current window **and everything after it** against one
+ceiling. A reservation booked for a future week therefore consumed the current
+week's allowance — and every intervening week's as the anchor advanced — which
+penalised exactly the planning-ahead the booking horizon exists to permit. The
+half-open window (`timezone_utils.su_window_bounds`) is what closed that.
+
+Two consequences worth stating:
+
+- **The gate checks the window the *prospective* reservation falls in**, not the
+  window "now" falls in, and the availability preview reports that window's
+  figures for the date being previewed (`su_window_start` / `su_window_end` on the
+  response name it). The dashboard's su-status card still shows the *current*
+  window, with SU committed to later windows reported separately as `su_future` /
+  `pool_su_future` so booking ahead is visible rather than merely absent.
+- **`max_days_ahead` is now the lever that caps aggregate pre-booking.** Total
+  future commitment is bounded by `su_budget` × the number of windows a member can
+  reach, so a group that needs a hard ceiling on how far demand can be locked in
+  should set a booking horizon. Without one, the reachable windows are unbounded.
+
+#### Reservations that span a window boundary
+
+A reservation crossing a boundary is **not** split across windows: it is charged
+**wholly to the window containing its `start_dt`**. A weekly-mode booking running
+Sunday 22:00 → Monday 20:00 charges 100 % to the earlier week, and the new week's
+allowance is untouched even though most of its hours fall there.
+
+Whole-reservation attribution is deliberate, over pro-rating by hours:
+
+1. **It is an invariant.** Every reservation counts in exactly one window, and the
+   window it counts in never changes. Sums stay stable across anchor rollovers,
+   nothing is double-counted or dropped, and the bucket a reservation will charge
+   is decidable at booking time — which is what the admission gate needs.
+2. **Penalty rewrites stay well-defined.** A late cancellation rewrites
+   `su_cost_user` to a retained value that no longer corresponds to particular
+   hours (see §"Cancellation penalty"). Splitting that across windows would need
+   an invented apportionment rule; attributing it whole needs none.
+3. **The distortion is bounded.** Non-privileged web bookings cap at 48 h, so at
+   most **one** boundary can be crossed. Multi-boundary spans arise only from
+   privileged bookings (exempt from the budget gate anyway), long on-demand leases
+   and *continue*, and the latter two anchor at "now" — so they start in the
+   current window, which is where work consuming capacity now belongs.
+4. **Gaming is self-limiting.** Starting a booking at Sunday 23:00 to shelter
+   Monday's hours costs real headroom in the *old* week, and the 48 h cap bounds
+   how much can be sheltered.
+
+Pro-rated apportionment (splitting a spanning reservation by its hours in each
+window) remains a localised future change if boundary gaming ever becomes real:
+the attribution rule lives entirely in `budget.window_filters`.
+
+The `since_creation` mode is the strictest: it is a single window that never
+closes, so once SUs are spent they are never recovered (except by the
+cancellation-penalty waiver mechanic above or by the admin increasing
+`su_budget`). `open` and `since_creation` are the two modes with no *later*
+window, so `su_future` is structurally zero for both.
+
+`GET /api/groups/su-status` returns per-group breakdown fields: `su_used` (active
+SUs already ended in the current window), `su_open` (active, not yet ended),
+`su_cancelled` (late-cancel penalties still counting), `used_count`, `open_count`,
+`su_remaining`, and `su_future` / `future_count` (committed to later windows);
+plus pool-budget parallels `pool_su_budget`, `pool_su_used`, `pool_su_open`,
+`pool_su_remaining`, and `pool_su_future`.
+
+Note: late-cancel penalties (non-zero `su_cost_user` on cancelled rows) count
+against the per-member budget until `end_dt` passes, regardless of anchor mode.
+Likewise, `su_cost_group` on cancelled rows counts against the pool budget.
+
+**SU quota boosts follow the same time basis.** A boost lifts the ceiling of the
+window a reservation is charged to, so it is evaluated on the reservation's
+**start date**, not the day the booking is placed — an offset dated to finals week
+lets members book finals week in advance, and an offset active only today cannot
+inflate the ceiling of every future window a member can reach.
 
 ## 6. Privilege tiers (constraint bypass)
 
@@ -192,8 +337,6 @@ budget until `end_dt` passes, regardless of anchor mode.
   **Group membership is not bypassed**: admins and group managers must still be
   members of a group to book under it or query its availability. They still face
   hardware capacity and per-reservation GPU limits. Additionally:
-  - **Management buffer bypass** — see the full `total_gpus` pool (not the
-    member-visible reduced ceiling) in availability and booking.
   - **Penalty waiver** — can waive late-cancellation SU penalties at cancel
     time or after the fact via `POST /api/reservations/{id}/waive-penalty`.
 
@@ -204,54 +347,48 @@ serialized critical section (SQLite `BEGIN IMMEDIATE` via `write_intent()`) so
 concurrent bookings for the last GPU(s) in a slot cannot both succeed. There is
 **no optimization, priority, or fairness algorithm** in the booking path — it's
 pure admission control: a request is accepted iff every constraint passes and
-capacity remains at every hour in the requested interval.
+capacity remains at every instant in the requested interval. Controller-requested
+on-demand leases pass through the *same* admission control (see §7.1).
 
-The on-demand / auto-fill sweep and `app/scheduling.py` were **removed** in the
-time-range redesign; there is no background loop that fills idle capacity.
+### 7.1 On-demand leases (controller-requested reservations)
 
-### GPU capacity recovery (reclaim reservations)
+There is **no idle-capacity tiling** and no preemption of one reservation by
+another. Instead, when the Kubernetes controller sees pending **on-demand** pods
+it *requests a lease* from the app (`POST /api/reservations` with
+`on_demand: true`, write-scope service key): user + group + GPU class + GPU
+count + duration. The app anchors the lease at its own "now" and admits it with
+the **same admission control as a web booking** — the three capacity tiers
+(physical / cohort / group, including borrowing when the group's resolved
+relaxation flag is on, clamped by the per-class `relax_min_available` buffer),
+the SU budget and pool gates, `max_gpus_per_reservation`, and the group validity
+window — while timing policy (15-minute lead, whole-hour grid, 48-hour cap,
+`min/max_days_ahead`) does not apply. Denials return 409; requests are
+idempotent on an `idempotency_key`.
 
-An optional background task (`app/gpu_recovery.py`) fills otherwise-idle capacity
-with **reclaim reservations** (`Reservation.kind = 'reclaim'`).  These are
-admin-only capacity holds with no user or group attribution (`user_id = NULL`,
-`group_id = NULL`).  The Kubernetes controller can use them to schedule
-opportunistic background workloads into unbooked hours, filling the cluster
-rather than leaving idle GPUs unused.
+Consequences for the scheduling model:
 
-- Enabled by setting `SiteSettings.gpu_recovery_window_hours` to a positive
-  integer (number of hours ahead to fill); `0` or `NULL` disables the loop.
-- Runs hourly (30-second startup delay); idempotent because existing reclaims
-  count as used capacity in the per-hour profile.
-- A greedy merge algorithm walks each active GPU class's availability profile and
-  emits one single-GPU reclaim spanning each contiguous free run.
-- Reclaim reservations are **excluded from default API views** (`status=active`
-  or `status=cancelled`) and **excluded from reports** — they only appear when
-  the caller explicitly requests `status=all`.
-- They still count against cluster capacity for the purposes of user booking
-  availability checks (a reclaim hold prevents a regular user from booking the
-  same GPU-hour).
-- Admins can also create reclaim reservations manually via `POST /api/reservations`
-  with `kind='reclaim'`.
+- An admitted lease **holds its capacity until it ends or is cancelled** — a web
+  booking cannot displace on-demand usage. The per-class borrowing buffer
+  (`relax_min_available`) is the operator's lever for keeping headroom open for
+  interactive users on a busy class.
+- Leases are charged Service Units and budget-gated exactly like bookings, so
+  heavy on-demand use draws down the same per-member/team budget.
+- The controller cancels a lease it no longer needs
+  (`POST /api/reservations/{id}/cancel`, reason `controller-revoked`) or reports
+  a holder who never ran pods (`no-show` — also usable against an
+  already-started booking). The standard unwaived cancellation penalty applies,
+  so an early no-show retains a real charge while a lease revoked near its end
+  retains only the consumed time.
 
 ## 8. What is NOT modeled (gaps for OR guidance)
 
-- **No priorities, weights, or preemption** between users or groups **at
-  booking time** — the reservation app itself is pure FCFS within static
-  ceilings. (The separate Kubernetes controller *does* preempt at the pod
-  level, independent of this app's booking logic: a pod running past its
-  guaranteed window may be deleted to free capacity for an incoming
-  reservation, with random — not priority-based — victim selection among
-  overstayers. See the controller's README/CLAUDE.md for that mechanism; it
-  has no visibility into or effect on booking admission here.)
+- **No priorities, weights, or preemption** between users or groups.
 - **No fairness mechanism** (no proportional sharing, max-min fairness, lottery,
   or aging) — purely FCFS within static per-group ceilings.
 - **No dynamic pricing or quota adjustment** — SU rates and discount schedules
   are static admin-set values; group GPU ceilings are static (date-span overrides
   aside).
-- **No backfill/optimization of user bookings** — idle capacity is simply
-  unavailable until another user claims it.
-- **No waitlist / queue** — a full interval returns 409; no demand signal is
-  captured.
+- **No waitlist / queue** — no demand signal is captured when potential bookings are turned away
 - **No per-user-per-day GPU cap** (`max_gpus_per_user_per_day` is a documented
   deferred feature in CLAUDE.md).
 - Concurrency limits are on **peak instantaneous GPU count** and **SU budget**
@@ -263,24 +400,24 @@ rather than leaving idle GPUs unused.
 ## 9. Configuration levers an operator actually turns
 
 Per **course (group)**: validity dates, booking horizon (`min/max_days_ahead`),
-per-member SU budget (`su_budget`), SU budget window mode (`su_anchor_mode`),
-per-class GPU ceiling (with date-span boosts), and which GPU classes are visible.
+per-member SU budget (`su_budget`), group-wide SU pool (`pool_su_budget`), SU
+budget window mode (`su_anchor_mode`), per-class GPU ceiling (with date-span
+boosts), and which GPU classes are visible.
 
-Per **GPU class**: total GPUs, `su_rate_per_hour` (base SU rate),
-`min_su_per_gpu_hour` (effective rate floor; `NULL` = no floor), optional
-per-reservation GPU cap, `management_buffer` (GPUs hidden from non-privileged
-users), date-span capacity overrides (each with their own `available_gpus` and
-`management_buffer`).
+Per **GPU class**: total GPUs, `su_rate_per_hour` (base SU rate), optional
+per-reservation GPU cap, and date-span capacity overrides (each with their own
+`available_gpus`).
 
 Per **SU discount schedule**: days-of-week, start/end time-of-day window
 (midnight-wrap supported), multiplier (0 = free, 1 = full price), optional date
 bounds, active flag, and the list of GPU classes the schedule applies to
 (`gpu_class_ids`; a schedule with no attached classes has no effect).
 
-Site-wide: timezone, `gpu_recovery_window_hours` (hours-ahead to fill with
-reclaim capacity-hold reservations; `0`/`NULL` disables recovery).
+Site-wide: timezone; the borrowing default (`relax_limits`, Admin → Settings)
+with per-group/per-cohort tri-state overrides; and each class's borrowing buffer
+(`relax_min_available`).
 
-## 10. Open questions for OR review
+## 10. Open questions, future work
 
 1. How to set per-group GPU ceilings and open-SU budgets to balance utilization
    vs. fair student access under contention (especially near assignment deadlines).
@@ -291,9 +428,16 @@ reclaim capacity-hold reservations; `0`/`NULL` disables recovery).
 4. Whether the first-come-first-served model with per-group ceilings achieves
    adequate fairness, or whether a max-min fair share or lottery mechanism would
    better serve a multi-course lab environment.
-5. Whether `su_anchor_mode = since_creation` or quarterly gives better incentive
+5. Whether `su_anchor_mode = since_creation`, `weekly`, or `quarterly` gives better incentive
    alignment near assignment deadlines compared to the renewable-ceiling (`open`)
-   default, and how the 50 % late-cancel penalty rate affects no-show rates in
-   practice.
-6. Appropriate sizing of `management_buffer` to balance instructor/maintenance
-   headroom against the utilization visible to students under the reduced ceiling.
+   default, and how the cancellation-penalty knobs (window / divisor / cap, see
+   §3 "Cancellation penalties") affect no-show rates in practice.
+6. Whether per-window budgets need a **carry-forward** (banking an unused quiet
+   week toward a heavy one, admitting a booking in window *k* while cumulative
+   commitment across windows 0..*k* stays within (*k*+1) × budget). It supports
+   bursty project work that a flat per-window cap does not, at the cost of a
+   meter that is materially harder to explain. Deferred pending evidence that
+   real usage is bursty enough to need it.
+7. Whether a spanning reservation should apportion its SU across the windows it
+   covers rather than charging its start window whole (see §"Reservations that
+   span a window boundary" for why it does not today, and where the rule lives).

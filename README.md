@@ -747,7 +747,7 @@ gpu-reservation-controller/
 │   ├── RESERVATION-API.md    Reservation management API specification
 │   │                         (identical copy of API.md in gpu-reservation-app —
 │   │                         update both together)
-│   ├── SCHEDULING.md         Reservation-app scheduling/reclaim behaviour reference
+│   ├── SCHEDULING.md         Reservation-app scheduling behaviour reference (shared copy)
 │   └── lifecycle.mmd/.png    Pod lifecycle state diagram (Mermaid + rendered)
 ├── requirements.txt
 ├── requirements-dev.txt

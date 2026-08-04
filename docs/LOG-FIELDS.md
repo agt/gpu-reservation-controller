@@ -109,13 +109,15 @@ Rendered by the logging formatter, not by call sites.
 | field | app | controller |
 |---|---|---|
 | timestamp / level / logger | `%(asctime)s %(levelname)s %(name)s` | same, level padded to 8 |
-| `actor` | from the **unverified** Bearer JWT `username` claim: a username, `imp:<target>:<impersonator>`, or `-` | constant `controller` |
+| `actor` | set by the auth layer after the session cookie resolves against the database: a username, `imp:<target>:<impersonator>`, or `-` (background work, machine callers, and any request rejected before authentication) | constant `controller` |
 | `trace` | the `X-Client-Trace` header, whitelist-matched `[A-Za-z0-9_-]{1,36}`, else `-` | one per unit of work (`fetch-`/`queue-`/`sweep-`/`audit-`/`jit-`/`pod-`/`startup-`), sent outbound on every app call; an inbound header is adopted |
 
-The actor is read before signature verification (a rejected login still logs),
-so it goes through `_sanitize_log_token`, which additionally replaces space,
-`=` and `"` — a formatter cannot decide to quote, so the value must be safe
-bare. `kv()` quotes instead, but only because it renders the message body.
+The actor is a database-resolved username, but it is interpolated by the
+formatter, which cannot decide to quote — so it still goes through
+`sanitize_log_token` (`app/request_context.py`), which drops non-printables and
+replaces space, `=` and `"` so the value is safe bare. `kv()` quotes instead,
+but only because it renders the message body. An unauthenticated request can no
+longer put a name in the field at all.
 
 **The trace crosses the process boundary**, which is what makes an operation
 correlatable end to end rather than just an object. The controller mints one per
@@ -151,6 +153,7 @@ follow this grammar and are not expected to.
 | `rid` | int | reservation id, referenced from a non-reservation event |
 | `tid` | int | team id |
 | `extid` | string | SSO provider's stable identity |
+| `rev` | string | Alembic schema revision id |
 | `poduid` | string | Kubernetes pod UID; also a lease's idempotency key |
 | `ns` | string | Kubernetes namespace |
 | `pod` | string | Kubernetes pod name |
@@ -168,9 +171,16 @@ follow this grammar and are not expected to.
 | `provider` | `local` \| `jupyterhub` \| `google` \| `oidc` \| `saml` | auth path |
 | `role` | `admin` \| `auditor` \| `user`, or `member` \| `manager` | scoped by `event=` |
 | `scope` | `read_only` \| `read_write` | service-key privilege |
+| `bootstrap` | bool | whether `BOOTSTRAP_ADMIN_USERNAME` granted the new account admin (emitted only when it did) |
 
-`reason` enums by event: `auth.*` → `no_such_user`, `inactive`,
+`reason` enums by event: `auth.login_failed` → `no_such_user`, `inactive`,
 `wrong_provider`, `account_locked`, `bad_password`, `deactivated` ·
+`auth.oauth_state_rejected` → `state_mismatch` ·
+`auth.csrf_rejected` → `missing_trace`, `invalid_trace` ·
+`auth.session_revoked` → `self`, `admin`, `password_change` ·
+`user.impersonation_ended` → `ended`, `target_invalid`, `revoked` ·
+`user.bootstrap_skipped` → `admin_exists` · `email.loop_disabled` → `debug_date` ·
+`db.migrated` → `fresh`, `adopted_existing`, `upgraded` ·
 `reservation.cancelled` → `no-show`, `controller-revoked`, `pod-terminated`,
 `superseded` · `overstay.recorded` → `pod-terminated`, `preempted`, `deleted` ·
 `k8s.event` → `RuntimeGuaranteed`, `Preempted`, `ReservationCancelled`,
@@ -189,6 +199,8 @@ follow this grammar and are not expected to.
 | `until` | ISO-8601 UTC | runtime-guarantee end instant |
 | `at` | ISO-8601 UTC | projected termination-warning kill instant |
 | `locked_until` | ISO-8601 | account lockout expiry |
+| `date` | ISO-8601 date | the single calendar date a line is about (the effective date under a debug date shift) |
+| `days` | int | signed whole-day count a value is shifted by (the debug effective-date offset) |
 | `dur_s` | int seconds | duration, where a line carries only one |
 | `min_runtime_s` | int seconds | a pod's `horae/minimum-runtime-seconds` ask |
 | `lease_dur_s` | int seconds | granted JIT lease length (`min_runtime_s` + buffer) |
