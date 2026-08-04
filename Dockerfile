@@ -23,6 +23,10 @@ COPY pytest.ini .
 # so they are part of the test inputs, not just prose.
 COPY docs/ ./docs/
 COPY OBSERVABILITY.md .
+# tests/test_shared_artifacts.py imports the checker that hashes the four files
+# kept byte-identical with the sibling repo, so scripts/ is a test input too.
+# (All four artifacts themselves are already covered by app/ and docs/ above.)
+COPY scripts/ ./scripts/
 
 RUN pytest --tb=short -q
 

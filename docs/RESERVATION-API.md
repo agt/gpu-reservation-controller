@@ -89,6 +89,14 @@ Responses are always JSON.
 | Datetime (local) | ISO 8601, no suffix | `2026-09-01T08:00:00` | `start_dt`, `end_dt` — site-local wall-clock, no timezone |
 | Time-of-day | `HH:MM:SS` | `08:00:00` | discount-schedule `start_time`/`end_time` — local wall-clock, no timezone |
 
+**The app's "today" is not always the real one.** A deployment may set
+`DEBUG_DATE_ENABLED`, which lets an administrator shift the app's effective date by a
+whole number of days for testing; every date the app computes then moves with it, while
+audit timestamps stay on the real clock. A daemon's own clock is *not* shifted, so if the
+dates you are served look consistently offset from your clock, read `effective_date` on
+`GET /api/settings` rather than assuming a bug. It is off by default and clears whenever
+the app restarts.
+
 ### Pagination
 
 Endpoints that return lists accept:
@@ -120,8 +128,8 @@ Common status codes:
 
 ## 3. Key management
 
-These endpoints require an **admin Bearer JWT** (human login token), not a
-service key. A service key cannot mint new service keys.
+These endpoints require an **administrator's browser session** (human login),
+not a service key. A service key cannot mint new service keys.
 
 ### `GET /api/service-keys`
 
@@ -214,7 +222,7 @@ all reservations across all users and groups.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `status` | `active` \| `cancelled` \| `all` | `active` | Filter by reservation status |
+| `status` | `active` \| `cancelled` \| `all` \| `recent` | `active` | Filter by reservation status. `recent` is not a stored status but the *Recent & Upcoming* view: every non-cancelled reservation that has not yet ended, **plus** every reservation of any status whose window overlapped the last 24 hours (so a just-finished job, or one cancelled while it was running, stays listed for a day). |
 | `date_start` | date | — | Include reservations on or after this date |
 | `date_end` | date | — | Include reservations on or before this date |
 | `gpu_class_id` | integer | — | Filter by GPU class ID |
@@ -222,7 +230,8 @@ all reservations across all users and groups.
 | `user_id` | integer | — | Filter by user ID |
 | `username` | string | — | Filter by username (exact match) |
 | `group_id` | integer | — | Filter by usage group ID |
-| `include_teammates` | boolean | `false` | Non-privileged callers only: switch to the personal *"me + my team"* scope — own reservations **plus** teammates' reservations in team-enabled groups (Team Mode). Replaces the default own+managed scope. Ignored for admins/auditors/service keys (they already see all). |
+| `include_teammates` | boolean | `false` | Switch to the personal *"me + my team"* scope — own reservations **plus** teammates' reservations in team-enabled groups (Team Mode). Replaces the default own+managed scope, and applies to **any** user token including admins and auditors (it is how the personal pages stay personal for a privileged viewer). Ignored for service keys, which have no user identity to scope to. |
+| `include_consumed_cancellations` | boolean | `false` | Widen `status=active` to also return cancellations that consumed something: the reservation had already started, **or** it retained a late-cancellation SU charge (`su_cost_user > 0`). A cancellation that neither ran nor was charged is still excluded. No-op for `status=all`; ignored for `status=cancelled` (which it could only narrow) and for `status=recent` (which already returns every status inside its window). |
 | `created_after` | datetime | — | Include reservations created at or after this time |
 | `created_before` | datetime | — | Include reservations created at or before this time |
 | `limit` | integer | 200 | Max records (1–1000) |
@@ -355,7 +364,7 @@ Semantics:
 |------|-----------|
 | 201 | Lease created — full [ReservationResponse](#reservationresponse), `kind: "on_demand"` |
 | 200 | `idempotency_key` matched an existing reservation — that original reservation is returned unchanged (idempotent retry) |
-| 403 | Missing/`read_only` key, or a human JWT sent `on_demand: true` |
+| 403 | Missing/`read_only` key, or a human session sent `on_demand: true` |
 | 404 | Unknown `username` / `group_name` / `gpu_class_id` (or inactive) |
 | 409 | Denied — insufficient capacity **or** a policy gate (membership, class access, SU budget, GPU cap, validity dates). Human-readable JSON `detail` explains which |
 | 422 | Malformed body (e.g. `duration_seconds` out of bounds) |
@@ -368,7 +377,7 @@ later as demand/capacity changes.
 ### `POST /api/reservations/{id}/cancel`
 
 Cancel a reservation on the controller's behalf, recording a machine-readable
-reason. Requires a `read_write` service key (or an admin JWT).
+reason. Requires a `read_write` service key (or an admin session).
 
 ```json
 { "reason": "no-show" }
@@ -403,7 +412,7 @@ appears in all reservation responses.
 | Code | Condition |
 |------|-----------|
 | 200 | Cancelled — the updated [ReservationResponse](#reservationresponse). **Idempotent**: cancelling an already-cancelled reservation returns 200 with its current state and changes nothing |
-| 403 | Read-only key / non-admin JWT, or a not-yet-started `booking` |
+| 403 | Read-only key / non-admin session, or a not-yet-started `booking` |
 | 404 | Reservation not found |
 | 422 | Unknown `reason` |
 
@@ -415,7 +424,7 @@ at the app's own "now" with an arbitrary second-granularity `duration_seconds`
 (so it can cover a job that never aligned to the whole-hour grid), then returns
 it. The sibling controller re-links (adopts) the running pod onto the new
 reservation, so the job keeps running with no relaunch. Callable by the source's
-**owner** (JWT), an admin, or a manager of its group — **not** service keys.
+**owner** (their session), an admin, or a manager of its group — **not** service keys.
 
 ```json
 { "duration_seconds": 7200, "gpu_count": 2, "notes": "extending training run" }
@@ -469,7 +478,7 @@ Semantics:
 ### `POST /api/reservations/ondemand-admission`
 
 Choose which pending pods the controller should admit on-demand this round.
-Requires a `read_write` service key (or an admin JWT) — the same gate as the
+Requires a `read_write` service key (or an admin session) — the same gate as the
 on-demand create, cancel, and preemption-victims endpoints. Advisory and
 **read-only**: it creates nothing and returns only a selection; the controller
 then creates a real lease for each granted pod via `POST /api/reservations` (see
@@ -532,13 +541,13 @@ feasibility check.
 | Code | Condition |
 |------|-----------|
 | 200 | The response body `{ "granted_pod_uids": [...] }` (`OnDemandAdmissionResponse`) |
-| 403 | Read-only key / non-admin JWT |
+| 403 | Read-only key / non-admin session |
 | 422 | Malformed body (e.g. `gpu_count <= 0`) |
 
 ### `POST /api/reservations/preemption-victims`
 
 Choose which overstay pods the controller should preempt. Requires a
-`read_write` service key (or an admin JWT) — the same gate as the on-demand and
+`read_write` service key (or an admin session) — the same gate as the on-demand and
 cancel endpoints. Purely advisory and **read-only**: it inspects nothing it
 mutates and returns a decision; the controller performs the deletions.
 
@@ -591,14 +600,14 @@ an older app).
 | Code | Condition |
 |------|-----------|
 | 200 | The response body `{ "victim_pod_uids": [...] }` (`PreemptionSelectionResponse`) |
-| 403 | Read-only key / non-admin JWT |
+| 403 | Read-only key / non-admin session |
 | 422 | Malformed body (e.g. `gpu_count <= 0`) |
 
 ### `POST /api/reservations/{id}/overstay`
 
 Record — **for analysis/reporting only** — that a controller-admitted pod ran
 past its runtime guarantee. Requires a `read_write` service key (or an admin
-JWT) — the same gate as the other controller endpoints. The controller calls
+session) — the same gate as the other controller endpoints. The controller calls
 this best-effort when an overstay **ends** (the pod is deleted, terminates on
 its own, or is preempted), so the full duration is known.
 
@@ -636,7 +645,7 @@ stored `OverstayResponse` (with `start_utc`/`end_utc` echoed back and a computed
 | Code | Condition |
 |------|-----------|
 | 200 | Recorded (or the existing record, when `pod_uid` was already reported) |
-| 403 | Read-only key / non-admin JWT |
+| 403 | Read-only key / non-admin session |
 | 404 | Unknown parent reservation `{id}` |
 | 422 | Malformed body (e.g. `end_utc <= start_utc`, `gpu_count <= 0`) |
 
@@ -712,19 +721,19 @@ discount-schedule multipliers). `max_gpus_per_reservation` caps a single booking
 GPU count (`null` = no cap). `relax_min_available` is an admission-control
 buffer for borrowing (limit relaxation; `null` = no buffer); it does not affect the
 controller and can be ignored by API clients.
+
+`total_gpus` is the app's own count of GPUs in the class. The controller
+consumes it in its hourly capacity audit: it compares `total_gpus` against the
+GPUs physically present in the cluster (from Kubernetes node taints), logs any
+per-class difference as a WARNING, and pauses new on-demand admissions for any
+class whose `total_gpus` exceeds physical capacity. A response that omits
+`total_gpus` leaves that class out of the audit (treated as "unknown", never
+flagged over-committed).
 `attach_all_groups` makes the class bookable by every group without an explicit
 attachment.
 
 `label_value` is `null` when the class has no Kubernetes mapping; the
 controller skips reservations for such classes.
-
-`total_gpus` is the app's own count of GPUs in the class.  The controller
-consumes it in its hourly capacity audit: it compares `total_gpus` against the
-GPUs physically present in the cluster (from Kubernetes node taints), logs any
-per-class difference as a WARNING, and pauses new on-demand admissions for any
-class whose `total_gpus` exceeds physical capacity.  A response that omits
-`total_gpus` leaves that class out of the audit (treated as "unknown", never
-flagged over-committed).
 
 **Errors**
 
@@ -734,7 +743,7 @@ flagged over-committed).
 
 `GET /api/gpu-classes` (the full list) is service-key accessible as well.
 All gpu-class **write** endpoints (`POST`/`PUT`/`DELETE` and the
-`/overrides` sub-resource) require an admin JWT.
+`/overrides` sub-resource) require an admin session.
 
 ### `GET /api/settings`
 
@@ -743,9 +752,7 @@ Public (no authentication required). The response carries UI-oriented fields
 `controller_push_enabled` (whether the app is configured to push reservation
 changes to the controller in real time). Nothing in it is required by the
 controller: every reservation it needs arrives via `GET /api/reservations` and
-the on-demand endpoints above. (The pre-lease-model `reclaim_window_minutes` /
-`reclaim_preempt_guard_minutes` fields are gone along with the reclaim
-subsystem.)
+the on-demand endpoints above.
 
 ---
 
@@ -780,6 +787,7 @@ Create a new user account.
 | `is_admin` | boolean | no | default `false` | **Deprecated alias** for `role` (maps `true`→`admin`, `false`→`user`). Honoured only when `role` is omitted; prefer `role`. Same service-key restriction applies. |
 | `auth_provider` | string | no | default `"local"` | `"local"`, an OAuth provider name (`"jupyterhub"`, `"google"`, `"oidc"`), or `"saml"`. Set the matching provider name when pre-provisioning accounts that will log in via SSO. |
 | `external_id` | string | no | unique | External identity for the provider (JupyterHub username, Google email, OIDC subject, or domain-stripped SAML NameID). Set it for non-local accounts so the SSO callback matches the pre-created row. |
+| `send_email` | boolean | no | default `true` | Whether reservation confirmation and reminder emails are sent to this user. Leave unset for the normal (opted-in) case. |
 
 **Response** `201` — [UserResponse](#userresponse)
 
@@ -810,13 +818,14 @@ fields are left unchanged.
 |-------|------|-------------|
 | `email` | string | New email address (must be unique) |
 | `password` | string (min 8 chars) | New password. **Human callers only** — a service key sending this field receives 403. |
-| `role` | string | Set the privilege tier (`"admin"` \| `"auditor"` \| `"user"`). **Admin JWT only** — a service key sending this field receives 403. |
-| `is_admin` | boolean | **Deprecated alias** for `role` (maps `true`→`admin`, `false`→`user`); applied only when `role` is omitted. **Admin JWT only.** |
+| `role` | string | Set the privilege tier (`"admin"` \| `"auditor"` \| `"user"`). **Admin session only** — a service key sending this field receives 403. |
+| `is_admin` | boolean | **Deprecated alias** for `role` (maps `true`→`admin`, `false`→`user`); applied only when `role` is omitted. **Admin session only.** |
 | `is_active` | boolean | Reactivate (`true`) or deactivate (`false`) a user |
+| `send_email` | boolean | Whether confirmation and reminder emails are sent to this user. An ordinary profile preference like `email`, so a user may set it on their own account. |
 
 For a service-key caller (the roster-sync case) the usable fields are
-therefore `email` and `is_active` — a leaked key must not be able to take
-over an account by resetting its password or changing its role.
+therefore `email`, `send_email` and `is_active` — a leaked key must not be
+able to take over an account by resetting its password or changing its role.
 
 **Response** `200` — [UserResponse](#userresponse)
 
@@ -858,6 +867,12 @@ reservation history are preserved. Deactivated users cannot log in.
 
 List all usage groups with full member and attached-GPU-class details, ordered by name.
 
+**Query parameters**
+
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `mine` | boolean | `false` | Restrict to groups the caller is a member of (any role). Honoured for **any** user token including admins and auditors, whose default scope is every group — it is how the booking wizard offers a privileged viewer only the groups they can actually book in. Ignored for service keys, which have no user identity to scope to. |
+
 **Response** `200` — array of [GroupResponse](#groupresponse)
 
 **Sync pattern:** call this once per sync run to build a `name → id` map,
@@ -898,7 +913,7 @@ Add a user to a group, or update their role if they are already a member
 (idempotent upsert).
 
 **Authorization** (applies to `POST`, `PATCH`, and `DELETE` on `.../members`):
-an admin JWT or a `read_write` service key (the controller path) may curate any
+an admin session or a `read_write` service key (the controller path) may curate any
 group. In the human UI, a **group manager** may also curate a group whose
 `provisioning_source` is `"manager"` (full parity — add/remove members and
 appoint/demote co-managers); other callers get `403`. These endpoints only
@@ -1016,6 +1031,7 @@ both new additions and role corrections without a separate `PATCH` call.
   "role":          "user",
   "is_admin":      false,
   "is_active":     true,
+  "send_email":    true,
   "auth_provider": "local",
   "external_id":   null,
   "created_at":    "2026-01-15T09:00:00Z"
@@ -1030,6 +1046,7 @@ both new additions and role corrections without a separate `PATCH` call.
 | `role` | string | App-wide privilege tier: `"admin"`, `"auditor"` (read-only admin), or `"user"` |
 | `is_admin` | boolean | Derived from `role` (`true` iff `role == "admin"`); retained for backward compatibility |
 | `is_active` | boolean | `false` = soft-deleted |
+| `send_email` | boolean | `true` (the default) = reservation confirmation and reminder emails are sent to this user; `false` = the user has opted out |
 | `auth_provider` | string | `"local"`, an OAuth provider name (`"jupyterhub"`, `"google"`, `"oidc"`), or `"saml"` |
 | `external_id` | string \| null | External identity (JupyterHub username / Google email / OIDC subject / domain-stripped SAML NameID) for SSO accounts |
 | `created_at` | datetime | UTC |
@@ -1073,13 +1090,14 @@ entry is a full GpuClassResponse.
 | `description` | string \| null | |
 | `valid_from` | date \| null | Group bookable on or after this date; admins and group managers get a 90-day grace window before this date |
 | `valid_until` | date \| null | Group bookable on or before this date; admins and group managers get a 90-day grace window after this date |
-| `min_days_ahead` | integer \| null | Members must book at least N days in advance (ignored for admins and group managers) |
-| `max_days_ahead` | integer \| null | Members cannot book more than N days out (ignored for admins and group managers) |
-| `su_budget` | number \| null | Per-member Service Unit budget: the sum of stored `su_cost` over a member's open reservations (within the window set by `su_anchor_mode`) may not exceed this (ignored for admins and group managers). `null` = unlimited |
-| `su_anchor_mode` | string | How far back the SU budget window reaches: `"weekly"` (default), `"open"` (only currently-open reservations; renewable ceiling), `"monthly"`, `"quarterly"`, or `"since_creation"` (cumulative, never resets). See SCHEDULING.md §5 for full semantics. |
+| `min_days_ahead` | integer \| null | A member's reservation must **start** at least N days from the moment of booking. Rolling — measured from the current time, not the calendar day (ignored for admins and group managers) |
+| `max_days_ahead` | integer \| null | A member's reservation must **end** within N days of the moment of booking, so a booking may not overhang the horizon. Rolling — at 19:00 an N-day horizon reaches 19:00 N days out and advances with the clock. `0` leaves nothing bookable (ignored for admins and group managers) |
+| `su_budget` | number \| null | Per-member Service Unit budget: the sum of stored `su_cost` over a member's reservations **in one budget window** (set by `su_anchor_mode`) may not exceed this (ignored for admins and group managers). `null` = unlimited |
+| `su_anchor_mode` | string | How the SU budget accrues: `"weekly"` (default), `"open"` (only currently-open reservations; renewable ceiling, no windows), `"monthly"`, `"quarterly"`, or `"since_creation"` (one window that never closes). Under the anchored modes **each window carries its own allowance**: a reservation is charged to the window containing its `start_dt` and to no other, so booking into a future window does not consume the current one's budget. A reservation spanning a boundary is charged wholly to its start window. See SCHEDULING.md §5 for full semantics. |
 | `provisioning_source` | string | Who may curate this group's membership: `"admin"` (administrators only; default), `"manager"` (the group's managers **and** admins), or `"sicad"` (the built-in SICAD roster sync **and** admins). Administrators may always curate regardless. Settable only by an admin via `POST`/`PUT /api/groups`. |
 | `sync_with_sicad` | boolean | Read-only derived flag (`provisioning_source == "sicad"`). When `true`, the app's built-in SICAD roster sync keeps this group's membership in sync with the course roster (add-only). Retained for backward compatibility; set `provisioning_source` to change it |
 | `sicad_course_id` | string \| null | Remote SICAD/AWSEd courseID backing the roster sync. `null` = fall back to `name`, letting the group name differ from the SICAD courseID. Only meaningful when `provisioning_source` is `"sicad"` |
+| `allow_manager_impersonation` | boolean | Whether this group's **managers** may impersonate its members (`POST /api/users/{id}/impersonate`). Default `false`; administrators may impersonate regardless. Granting it on a group whose `provisioning_source` is `"manager"` also lets those managers impersonate anyone they choose to add. Settable only by an admin via `POST`/`PUT /api/groups` |
 | `is_active` | boolean | Inactive groups cannot accept new reservations |
 | `created_at` | datetime | UTC |
 | `members` | array of [GroupMemberBrief](#groupmemberbrief) | |
@@ -1137,6 +1155,7 @@ Returned by `GET /api/groups/{group_id}/members`.
   "created_at": "2026-08-20T10:15:00Z",
   "updated_at": "2026-08-20T10:15:00Z",
   "cancelled_at": null,
+  "cancelled_at_local": null,
   "cancelled_by_id": null,
   "cancel_reason": null
 }
@@ -1168,6 +1187,7 @@ Returned by `GET /api/groups/{group_id}/members`.
 | `created_at` | datetime (UTC, `Z`) | |
 | `updated_at` | datetime (UTC, `Z`) | |
 | `cancelled_at` | datetime \| null (UTC, `Z`) | |
+| `cancelled_at_local` | datetime \| null (local, no suffix) | `cancelled_at` in site-local wall clock, in `start_dt`'s shape — for UIs that print it beside `start_dt`/`end_dt`. `null` when never cancelled. Not an absolute instant: use `cancelled_at` for time comparisons |
 | `cancelled_by_id` | integer \| null | User ID of whoever cancelled; `null` for a controller (service-key) cancellation |
 | `cancel_reason` | `"no-show"` \| `"controller-revoked"` \| `"pod-terminated"` \| `"superseded"` \| null | Machine-readable reason recorded by `POST /api/reservations/{id}/cancel` (or `"superseded"` when a source was continued via `POST /api/reservations/{id}/continue`); `null` for human cancellations |
 | `continued_from_id` | integer \| null | Set on a booking minted via `POST /api/reservations/{id}/continue`: the id of the superseded source reservation whose pod it carries forward; `null` otherwise |

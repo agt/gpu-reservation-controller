@@ -363,7 +363,7 @@ async def _reconcile_after_reservation_change(
     # Handle owner changes (adoption): evict the prior owner's admitted pod so
     # the new owner can claim the still-active reservation.
     if owner_changes:
-        await _handle_owner_changes(state, owner_changes)
+        await _handle_owner_changes(state, config, owner_changes)
 
 
 async def _refresh_reservations(
@@ -439,9 +439,18 @@ async def _handle_cancelled_reservations(
     # One pod snapshot serves the whole batch.
     pod_snapshot = []
     try:
-        pod_snapshot = await snapshot_tolerated_pods(TOLERATION_KEY)
+        # required_group_label must be passed: without it every ToleratedPodInfo
+        # carries group_label=None, `_group_ok` then rejects every reservation
+        # while the feature is enabled, and the adoption re-link below can never
+        # find a booking to carry the pod onto.
+        pod_snapshot = await snapshot_tolerated_pods(
+            TOLERATION_KEY, config.required_group_label
+        )
     except Exception as exc:  # noqa: BLE001
-        log.warning("%s", kv(event="cancel.snapshot_failed", target="pods", err=exc))
+        log.warning(
+            "%s", kv(event="cancel.snapshot_failed", target="pods", err=exc),
+            exc_info=True,
+        )
 
     for cancelled_res in cancelled_in_window:
         cancelled_by_desc = canceller_description(cancelled_res)
@@ -490,6 +499,7 @@ async def _handle_cancelled_reservations(
 
 async def _handle_owner_changes(
     state: ControllerState,
+    config: Config,
     owner_changes: list[tuple[ReservationResponse, str]],
 ) -> None:
     """Evict the prior owner's admitted pod for each reassigned reservation.
@@ -510,9 +520,16 @@ async def _handle_owner_changes(
     # One pod snapshot serves the whole batch.
     pod_snapshot = []
     try:
-        pod_snapshot = await snapshot_tolerated_pods(TOLERATION_KEY)
+        # See _handle_cancelled_reservations: the group label must be captured
+        # or every pod view fails the REQUIRED_GROUP_LABEL match.
+        pod_snapshot = await snapshot_tolerated_pods(
+            TOLERATION_KEY, config.required_group_label
+        )
     except Exception as exc:  # noqa: BLE001
-        log.warning("%s", kv(event="owner_change.snapshot_failed", target="pods", err=exc))
+        log.warning(
+            "%s", kv(event="owner_change.snapshot_failed", target="pods", err=exc),
+            exc_info=True,
+        )
 
     for res, prior_username in owner_changes:
         new_owner = res.user.username if res.user else "another user"

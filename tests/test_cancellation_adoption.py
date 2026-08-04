@@ -20,30 +20,14 @@ from app.config import Config
 from app.controller import ControllerState
 from app.k8s_client import ToleratedPodInfo
 
-from tests.conftest import GPU_CLASS_LABEL, USERNAME, reservation
+from tests.conftest import make_config, GPU_CLASS_LABEL, USERNAME, reservation
 
 NOW = datetime(2024, 1, 15, 15, 15, tzinfo=timezone.utc)
 
 
 def _config(**overrides) -> Config:
-    base = dict(
-        reservation_api_url="http://reservations.local",
-        reservation_api_key="gpures_test",
-        reservation_fetch_interval=300,
-        reservation_lookahead_days=7,
-        kubeconfig_path=None,
-        http_port=8000,
-        ondemand_lease_enabled=True,
-        noshow_timeout_minutes=15,
-        noshow_grace_minutes=30,
-        queue_processor_interval=300,
-        scheduling_gate_name=None,
-        inbound_api_token=None,
-        preemption_lead_minutes=15,
-        preemption_check_interval=60,
-    )
-    base.update(overrides)
-    return Config(**base)
+    """Thin alias for the shared builder in tests/conftest."""
+    return make_config(**overrides)
 
 
 def _main_module(monkeypatch):
@@ -95,7 +79,7 @@ def _install_stubs(monkeypatch, m, snapshot):
     cancelled_events: list[tuple[str, str, str]] = []
     patched_refs: list[tuple[str, str]] = []  # (pod name, booking_reference)
 
-    async def _snapshot(_key):
+    async def _snapshot(_key, _group_label_key=None):
         return list(snapshot)
 
     async def _delete(name, ns):
@@ -202,3 +186,67 @@ class TestAdoptBeforeEvict:
         assert patched_refs == []
         assert deleted == [("pod-uid-1", USERNAME)]
         assert len(cancelled_events) == 1
+
+
+# ---------------------------------------------------------------------------
+# REQUIRED_GROUP_LABEL must reach the cancellation/owner-change snapshots
+# ---------------------------------------------------------------------------
+
+
+class TestSnapshotCarriesTheGroupLabel:
+    """Both handlers must capture the configured usage-group pod label.
+
+    ``snapshot_tolerated_pods(key, group_label_key)`` only populates each view's
+    ``group_label`` when told which label to read. Three of the five call sites
+    passed ``config.required_group_label``; these two did not, so with the
+    feature enabled every view carried ``group_label=None``, ``_group_ok``
+    rejected every candidate reservation, and the adoption re-link in
+    ``_handle_cancelled_reservations`` could never find a booking to carry the
+    pod onto — silently turning "carry the job forward" into "evict it". That is
+    the path ``POST /api/reservations/{id}/continue`` depends on when it pushes a
+    ``superseded`` source alongside its replacement.
+
+    The old stubs took a single argument, so the test doubles encoded the bug and
+    could not have caught it.
+    """
+
+    def _capture(self, monkeypatch, build_handler):
+        """Run the handler and return the group_label_key it asked the snapshot for."""
+        m = _main_module(monkeypatch)
+        seen = {}
+
+        async def _snapshot(key, group_label_key=None):
+            seen["key"] = key
+            seen["group_label_key"] = group_label_key
+            return []
+
+        monkeypatch.setattr(m, "snapshot_tolerated_pods", _snapshot)
+        asyncio.run(build_handler(m))
+        return seen
+
+    def test_cancellation_path_passes_it(self, monkeypatch):
+        state = ControllerState()
+        config = _config(required_group_label="dsmlp/course")
+        seen = self._capture(
+            monkeypatch,
+            lambda m: m._handle_cancelled_reservations(state, config, [], NOW),
+        )
+        assert seen["group_label_key"] == "dsmlp/course"
+
+    def test_owner_change_path_passes_it(self, monkeypatch):
+        state = ControllerState()
+        config = _config(required_group_label="dsmlp/course")
+        seen = self._capture(
+            monkeypatch,
+            lambda m: m._handle_owner_changes(state, config, []),
+        )
+        assert seen["group_label_key"] == "dsmlp/course"
+
+    def test_none_when_the_feature_is_off(self, monkeypatch):
+        """The default configuration is unchanged."""
+        state = ControllerState()
+        seen = self._capture(
+            monkeypatch,
+            lambda m: m._handle_cancelled_reservations(state, _config(), [], NOW),
+        )
+        assert seen["group_label_key"] is None

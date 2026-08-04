@@ -145,7 +145,7 @@ def test_push_cancellation_evicts_admitted_pod(monkeypatch):
     )
     deleted: list[tuple[str, str]] = []
 
-    async def _snapshot(_key):
+    async def _snapshot(_key, _group_label_key=None):
         return [pod]
 
     async def _delete(name, ns):
@@ -210,7 +210,7 @@ def test_push_owner_change_evicts_prior_owner_pod(monkeypatch):
     deleted: list[tuple[str, str]] = []
     events: list[str] = []
 
-    async def _snapshot(_key):
+    async def _snapshot(_key, _group_label_key=None):
         return [pod]
 
     async def _delete(name, ns):

@@ -161,12 +161,13 @@ def test_every_emitted_field_is_in_the_dictionary():
     )
 
 
-def test_dictionary_and_helper_are_in_sync_with_the_sibling_repo():
-    """The shared files must exist where the cross-repo convention says they do.
+def test_dictionary_and_helper_are_present():
+    """The shared files exist where the cross-repo convention says they do.
 
-    Only presence is asserted — the sibling checkout is not available here, so
-    the actual byte-for-byte comparison is a review-time obligation stated in
-    the dictionary's own header.
+    Presence only. Whether they still *match* the sibling repo is enforced by
+    ``tests/test_shared_artifacts.py`` against ``docs/SHARED-ARTIFACTS.sha256`` —
+    this assertion used to carry that name and check nothing, which is how the
+    dictionary drifted in both directions at once.
     """
     assert _DICTIONARY.is_file()
     assert (_APP_DIR / "log_fields.py").is_file()

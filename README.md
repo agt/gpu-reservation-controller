@@ -747,7 +747,7 @@ gpu-reservation-controller/
 │   ├── RESERVATION-API.md    Reservation management API specification
 │   │                         (identical copy of API.md in gpu-reservation-app —
 │   │                         update both together)
-│   ├── SCHEDULING.md         Reservation-app scheduling/reclaim behaviour reference
+│   ├── SCHEDULING.md         Reservation-app scheduling behaviour reference (shared copy)
 │   └── lifecycle.mmd/.png    Pod lifecycle state diagram (Mermaid + rendered)
 ├── requirements.txt
 ├── requirements-dev.txt
@@ -758,3 +758,12 @@ gpu-reservation-controller/
 ├── AGENTS.md                 Development standards for AI coding agents
 └── README.md                 This file
 ```
+
+## Improvement review
+
+An August 2026 review covering both this repo and `gpu-reservation-app` —
+centralization opportunities, code smells, and maintainability/ops changes — is
+recorded in the app repo at `docs/REPO-REVIEW-2026-08.md`. Controller-specific
+findings not yet addressed include the shared relink body behind `_adopt_pods` /
+`_merge_ondemand_into_bookings`, the pod-annotation vocabulary spread across
+three modules, and `reservation_lock` being held across outbound I/O.
