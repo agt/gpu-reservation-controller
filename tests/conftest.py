@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 
+from app.config import Config
 from app.controller import ControllerState
 from app.schemas import GpuClassBrief, GroupBrief, ReservationResponse, UserBrief
 
@@ -255,3 +256,42 @@ def make_state(
     state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL} if labels is None else labels
     state.required_group_label = required_group_label
     return state
+
+
+# ---------------------------------------------------------------------------
+# Config helper
+# ---------------------------------------------------------------------------
+
+
+def make_config(**overrides) -> Config:
+    """A ``Config`` with every required field filled in; override what matters.
+
+    Nine test modules each carried a private ``_config()`` enumerating all
+    fourteen required fields. Five were byte-identical and two had already
+    forked — ``test_overstay_report`` adding ``overstay_report_enabled=True``
+    and ``test_watch_release`` flipping ``ondemand_lease_enabled`` — which is
+    exactly the drift a shared builder prevents: both of those are one-line
+    overrides here.
+
+    The real cost of the copies was not the duplication but the coupling: adding
+    a required field to ``Config`` meant editing nine files, so the pressure was
+    always to give new settings a default whether or not one made sense.
+    """
+    base = dict(
+        reservation_api_url="http://reservations.local",
+        reservation_api_key="gpures_test",
+        reservation_fetch_interval=300,
+        reservation_lookahead_days=7,
+        kubeconfig_path=None,
+        http_port=8000,
+        ondemand_lease_enabled=True,
+        noshow_timeout_minutes=15,
+        noshow_grace_minutes=30,
+        queue_processor_interval=300,
+        scheduling_gate_name=None,
+        inbound_api_token=None,
+        preemption_lead_minutes=15,
+        preemption_check_interval=60,
+    )
+    base.update(overrides)
+    return Config(**base)

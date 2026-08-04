@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 from app.controller import ControllerState
 from app.k8s_client import ToleratedPodInfo
-from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, reservation
+from tests.conftest import make_config, GPU_CLASS_ID, GPU_CLASS_LABEL, reservation
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +150,7 @@ def _install_k8s_stubs(monkeypatch, m, snapshot):
     deleted: list[tuple[str, str]] = []
     events: list[tuple[str, str, str]] = []
 
-    async def _snapshot(_key):
+    async def _snapshot(_key, _group_label_key=None):
         return list(snapshot)
 
     async def _delete(name, ns):
@@ -180,7 +180,7 @@ class TestHandleOwnerChanges:
         state.reservations = [new_res]
         state.record_placement(1, "uid-1", 2)  # prior owner's pod occupies it
 
-        asyncio.run(m._handle_owner_changes(state, [(new_res, "alice")]))
+        asyncio.run(m._handle_owner_changes(state, make_config(), [(new_res, "alice")]))
 
         assert deleted == [("pod-1", "alice")]        # prior owner's pod evicted
         assert events == [("pod-1", "alice", "to bob")]
@@ -197,7 +197,7 @@ class TestHandleOwnerChanges:
         state.reservations = [new_res]
         state.record_placement(1, "uid-2", 2)
 
-        asyncio.run(m._handle_owner_changes(state, [(new_res, "alice")]))
+        asyncio.run(m._handle_owner_changes(state, make_config(), [(new_res, "alice")]))
 
         assert deleted == []                          # nothing in prior namespace
         assert events == []
@@ -212,7 +212,7 @@ class TestHandleOwnerChanges:
         new_res = _booking(1, user_id=2, username="bob")
         state.reservations = [new_res]
 
-        asyncio.run(m._handle_owner_changes(state, [(new_res, "alice")]))
+        asyncio.run(m._handle_owner_changes(state, make_config(), [(new_res, "alice")]))
 
         assert deleted == []
         assert events == []

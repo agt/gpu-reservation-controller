@@ -27,30 +27,14 @@ from types import SimpleNamespace
 from app.config import Config
 from app.controller import PodRuntimeView
 
-from tests.conftest import GPU_CLASS_LABEL, USERNAME
+from tests.conftest import make_config, GPU_CLASS_LABEL, USERNAME
 from tests.conftest import make_state as _state
 from tests.conftest import reservation
 
 
 def _config(**overrides) -> Config:
-    base = dict(
-        reservation_api_url="http://reservations.local",
-        reservation_api_key="gpures_test",
-        reservation_fetch_interval=300,
-        reservation_lookahead_days=7,
-        kubeconfig_path=None,
-        http_port=8000,
-        ondemand_lease_enabled=True,
-        noshow_timeout_minutes=15,
-        noshow_grace_minutes=30,
-        queue_processor_interval=300,
-        scheduling_gate_name=None,
-        inbound_api_token=None,
-        preemption_lead_minutes=15,
-        preemption_check_interval=60,
-    )
-    base.update(overrides)
-    return Config(**base)
+    """Thin alias for the shared builder in tests/conftest."""
+    return make_config(**overrides)
 
 
 def _main_module(monkeypatch):

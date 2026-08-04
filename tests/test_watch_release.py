@@ -12,28 +12,13 @@ import asyncio
 from types import SimpleNamespace
 
 from app.config import Config
+from tests.conftest import make_config
 from app.controller import ControllerState
 
 
 def _config(**overrides) -> Config:
-    base = dict(
-        reservation_api_url="http://reservations.local",
-        reservation_api_key="gpures_test",
-        reservation_fetch_interval=300,
-        reservation_lookahead_days=7,
-        kubeconfig_path=None,
-        http_port=8000,
-        ondemand_lease_enabled=False,  # the configuration that exposed B1
-        noshow_timeout_minutes=15,
-        noshow_grace_minutes=30,
-        queue_processor_interval=300,
-        scheduling_gate_name=None,
-        inbound_api_token=None,
-        preemption_lead_minutes=15,
-        preemption_check_interval=60,
-    )
-    base.update(overrides)
-    return Config(**base)
+    """Shared builder (tests/conftest.make_config) with this module's default."""
+    return make_config(**{"ondemand_lease_enabled": False} | overrides)
 
 
 class _FakeWatcher:
