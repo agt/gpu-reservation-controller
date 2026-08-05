@@ -3,8 +3,9 @@
 This document covers every endpoint needed to build two external daemons:
 
 - **Kubernetes controller** — reads active reservations and manages pod
-  scheduling by injecting GPU-reservation tolerations and enforcing runtime
-  caps (`activeDeadlineSeconds`) on admitted pods.
+  scheduling by injecting GPU-reservation tolerations onto admitted pods and
+  guaranteeing each one its reserved window, reclaiming capacity from a pod that
+  overruns only when a later reservation actually needs it.
 - **Roster sync daemon** — provisions user accounts and manages usage-group
   membership from an institutional directory.
 
@@ -661,12 +662,27 @@ Every `ReservationResponse` includes pre-computed UTC timestamps:
 Use these directly — no timezone knowledge required:
 
 ```python
-# Python example — compute activeDeadlineSeconds for the k8s controller
+# Python example — when a pod's guaranteed window ends
 from datetime import datetime, timezone
 
 end = datetime.strptime(reservation["end_utc"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-active_deadline_seconds = max(0, int((end - datetime.now(timezone.utc)).total_seconds()))
+seconds_remaining = max(0, int((end - datetime.now(timezone.utc)).total_seconds()))
 ```
+
+**Do not turn this into a `spec.activeDeadlineSeconds`.** `end_utc` is the end of
+a *guarantee*, not a hard runtime cap: a pod may keep running past it, and the
+reference controller reclaims its capacity only when a later reservation needs
+it. Two reasons the distinction is load-bearing:
+
+- A guarantee can **grow** after admission — the user books an abutting
+  follow-on window, and the controller chains the two — which Kubernetes cannot
+  express, since it forbids raising an existing deadline.
+- Killing at the boundary destroys work that nobody is waiting on. The reference
+  controller instead records the instant as an informational
+  `horae/guaranteed-until` annotation and preempts on demand.
+
+An integrator who genuinely wants a hard cap should set one from their own
+policy, not from `end_utc`.
 
 **How they are computed.** The server converts the stored local-time `start_dt` /
 `end_dt` to UTC using the `TIMEZONE` environment variable configured at deployment time:
@@ -1184,7 +1200,7 @@ Returned by `GET /api/groups/{group_id}/members`.
 | `end_dt` | datetime (local, no suffix) | Reservation end; ≤ 48h after `start_dt` for non-privileged members' bookings; no server-side cap for admins/managers; `start + duration_seconds` for leases |
 | `date` | date | Calendar date of `start_dt` (convenience for filtering) |
 | `start_utc` | string (ISO 8601, `Z`) | Reservation start converted to UTC; use this for time comparisons |
-| `end_utc` | string (ISO 8601, `Z`) | Reservation end converted to UTC; use this for `activeDeadlineSeconds` |
+| `end_utc` | string (ISO 8601, `Z`) | Reservation end converted to UTC; the end of the pod's *guaranteed* window, not a hard runtime cap — see §6 above |
 | `gpu_count` | integer | Number of GPUs reserved |
 | `su_cost_user` | number | Service Units charged to the individual user (zeroed when a manager waives a cancellation penalty) |
 | `su_cost_group` | number | Service Units charged against the group pool (only zeroed on an admin waive) |
