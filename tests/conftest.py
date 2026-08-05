@@ -295,3 +295,53 @@ def make_config(**overrides) -> Config:
     )
     base.update(overrides)
     return Config(**base)
+
+
+# ---------------------------------------------------------------------------
+# Log-line field parser
+# ---------------------------------------------------------------------------
+
+
+def kv_fields(message: str) -> dict[str, str]:
+    """Parse a ``log_fields.kv()``-rendered message back into a field dict.
+
+    Assertions on log output should name the field they mean, not search the
+    rendered string: ``"fails=1" in message`` is also true of ``fails=12``, and
+    ``"status=409" in message`` is also true of ``status=4091``.  Parsing turns
+    both into an exact comparison.
+
+    Understands the two shapes ``kv()`` emits — a bare ``key=value`` and a
+    quoted ``key="value with spaces"`` with ``\\`` / ``"`` escaped.  Values stay
+    strings; compare against ``"409"`` rather than ``409``, since that is what
+    the log actually carries.
+    """
+    fields: dict[str, str] = {}
+    i, n = 0, len(message)
+    while i < n:
+        while i < n and message[i] == " ":
+            i += 1
+        start = i
+        while i < n and message[i] not in ("=", " "):
+            i += 1
+        if i >= n or message[i] != "=":
+            # A bare token with no '=' is not a field; skip it.
+            i += 1
+            continue
+        key = message[start:i]
+        i += 1  # consume '='
+        if i < n and message[i] == '"':
+            i += 1
+            buf: list[str] = []
+            while i < n and message[i] != '"':
+                if message[i] == "\\" and i + 1 < n:
+                    i += 1
+                buf.append(message[i])
+                i += 1
+            i += 1  # consume closing quote
+            fields[key] = "".join(buf)
+        else:
+            start = i
+            while i < n and message[i] != " ":
+                i += 1
+            fields[key] = message[start:i]
+    return fields

@@ -14,6 +14,7 @@ Implements only the endpoints the controller needs:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -36,6 +37,65 @@ from . import trace
 from .log_fields import kv
 
 log = logging.getLogger(__name__)
+
+# The app's documented denial code for an infeasible on-demand lease: capacity,
+# SU budget, or a policy ceiling.  Routine, expected, and worth retrying — every
+# other status is a fault the operator has to fix.
+LEASE_DENIED_STATUS = 409
+
+
+@dataclass(frozen=True)
+class LeaseAttempt:
+    """Outcome of one ``create_ondemand_reservation`` call.
+
+    Carries the HTTP status alongside the result so the caller can tell a
+    routine 409 denial (retry — capacity may free up) from a fault that will
+    never resolve on its own (a read-only service key, a schema mismatch after
+    an app upgrade, an unknown group name).  Both used to collapse into a bare
+    ``None``, which is why a misconfigured deployment retried forever while
+    logging only at INFO.
+    """
+
+    reservation: Optional[ReservationResponse] = None
+    status: Optional[int] = None  # None when the app never answered (network/parse)
+
+    @property
+    def granted(self) -> bool:
+        return self.reservation is not None
+
+    @property
+    def retryable(self) -> bool:
+        """Whether waiting is a plausible fix.
+
+        A 409 is the app saying "not right now"; a network error or a 5xx may be
+        transient.  A 4xx that is not 409 is a fault in the request or the
+        credential, so backing off hard beats hammering the app every 2–5 min.
+        """
+        if self.status is None:
+            return True
+        return self.status == LEASE_DENIED_STATUS or self.status >= 500
+
+
+_DETAIL_MAX_CHARS = 200
+
+
+def _response_detail(response: httpx.Response) -> str:
+    """A short, log-safe excerpt of an error response body.
+
+    The app answers a rejection with a JSON ``detail``; anything else (a proxy's
+    HTML error page, an empty body) degrades to the raw text.  Truncated because
+    a misconfigured route can return a full page, and ``kv()`` would render the
+    whole thing on one line.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    text = str(detail) if detail is not None else (response.text or "").strip()
+    if len(text) > _DETAIL_MAX_CHARS:
+        text = text[:_DETAIL_MAX_CHARS] + "…"
+    return text or "no body"
 
 
 async def _attach_trace(request: httpx.Request) -> None:
@@ -167,12 +227,20 @@ class ReservationClient:
 
     async def create_ondemand_reservation(
         self, req: OnDemandReservationRequest
-    ) -> Optional[ReservationResponse]:
-        """Request a JIT on-demand booking; None on denial (409) or error.
+    ) -> LeaseAttempt:
+        """Request a JIT on-demand booking.
 
         Idempotent by ``req.idempotency_key`` (the admitting pod's UID): the
         app returns the original reservation for a repeated key rather than a
         duplicate, so the caller can safely retry with the same request.
+
+        Returns a :class:`LeaseAttempt` rather than a bare reservation, because
+        the caller must distinguish a 409 — the app's routine "infeasible right
+        now", worth retrying — from any other status, which is a fault that will
+        not resolve on its own.  Only the 409 is logged at INFO; everything else
+        is a WARNING carrying the response body, so a read-only key or a schema
+        mismatch is visible to an operator watching at WARNING rather than
+        buried in a per-pod INFO line every 2–5 minutes forever.
         """
         try:
             resp = await self._client.post(
@@ -181,23 +249,33 @@ class ReservationClient:
                 timeout=15.0,
             )
             resp.raise_for_status()
-            return ReservationResponse.model_validate(resp.json())
+            return LeaseAttempt(
+                reservation=ReservationResponse.model_validate(resp.json()),
+                status=resp.status_code,
+            )
         except httpx.HTTPStatusError as exc:
-            log.info("%s", kv(
-                event="api.lease_denied", poduid=req.idempotency_key,
-                status=exc.response.status_code,
-            ))
-            return None
+            status = exc.response.status_code
+            if status == LEASE_DENIED_STATUS:
+                log.info("%s", kv(
+                    event="api.lease_denied", poduid=req.idempotency_key,
+                    status=status,
+                ))
+            else:
+                log.warning("%s", kv(
+                    event="api.lease_error", poduid=req.idempotency_key,
+                    status=status, detail=_response_detail(exc.response),
+                ))
+            return LeaseAttempt(status=status)
         except httpx.RequestError as exc:
             log.warning("%s", kv(
                 event="api.lease_failed", poduid=req.idempotency_key, err=exc,
             ))
-            return None
+            return LeaseAttempt()
         except (ValidationError, ValueError) as exc:
             log.warning("%s", kv(
                 event="api.lease_parse_failed", poduid=req.idempotency_key, err=exc,
             ))
-            return None
+            return LeaseAttempt()
 
     async def select_preemption_victims(
         self, req: PreemptionSelectionRequest

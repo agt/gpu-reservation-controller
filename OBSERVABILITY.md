@@ -166,7 +166,8 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 | INFO | `ondemand.candidate_dropped` | `ns pod reason` (+ `phase` \| `detail`) | Terminal phase, or Pending for a non-GPU reason. |
 | DEBUG/INFO/WARNING | `ondemand.candidate_held` | `guard reason ns pod` (+ `clabel gpus node_free`) | **The guard number is the field** — see below. |
 | DEBUG | `ondemand.schedule_verdict` | `ns pod` | Scheduler verdict arrived; re-attempting immediately. |
-| INFO | `lease.denied` | `ns pod clabel gpus` | App refused (409); cooldown 2–5 min. |
+| INFO | `lease.denied` | `ns pod clabel gpus status` | App refused the ask as infeasible (409), or a transient network/5xx failure; cooldown 2–5 min. |
+| WARNING | `lease.error` | `ns pod clabel gpus status fails retry_s` | **A fault waiting cannot fix** — a 4xx that is not 409 (read-only service key, schema mismatch, unknown group). Exponential backoff to 30 min; `grep 'event=lease.error'` is how a misconfigured deployment announces itself. |
 | INFO | `lease.granted` | `rid ns pod clabel gpus lease_dur_s` | |
 | WARNING | `lease.admission_failed` | `rid ns pod detail` | Grant landed but admission did not — a compensating cancel follows. |
 | INFO | `lease.teardown` | `rid class reason` | The lease's pod went away; the lease is cancelled. |
@@ -174,7 +175,9 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 | WARNING | `ondemand.selection_unavailable` | `fallback candidates` | Delegation call failed; granting all. |
 | WARNING | `ondemand.unknown_grant` | `poduid` | App returned a uid that was never offered; ignored. |
 | WARNING | `ondemand.pod_read_failed` | `ns pod err` | |
-| INFO/WARNING | `api.lease_denied` / `api.lease_failed` / `api.lease_parse_failed` | `poduid` + `status` \| `err` | Client-side view of the same request. |
+| INFO | `api.lease_denied` | `poduid status` | Client-side view of a routine 409 denial. |
+| WARNING | `api.lease_error` | `poduid status detail` | Client-side view of any other non-2xx, with the response body excerpt. Pairs with `lease.error` above. |
+| WARNING | `api.lease_failed` / `api.lease_parse_failed` | `poduid err` | Network failure / unparseable response — the app never answered. |
 
 **Guards** (`guard=`), all short-retry rather than drop:
 

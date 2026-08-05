@@ -15,12 +15,14 @@ required env vars, since importing it runs ``create_app()`` at module load.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from app.controller import ControllerState, OnDemandCandidate, slot_start
+from app.reservation_client import LeaseAttempt
 
-from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, GROUP_NAME, USERNAME
+from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, GROUP_NAME, USERNAME, kv_fields
 from tests.conftest import make_state as _state
 from tests.conftest import ondemand_block as _ondemand_block
 from tests.conftest import reservation, user_reservation as _user_reservation
@@ -306,8 +308,20 @@ def _state_ready() -> ControllerState:
 
 
 class _FakeClient:
-    def __init__(self, *, lease=None, leases=None, cancel_result=True, select_response=None):
+    def __init__(
+        self,
+        *,
+        lease=None,
+        leases=None,
+        cancel_result=True,
+        select_response=None,
+        deny_status=409,
+    ):
         self._lease = lease
+        # Status accompanying a non-grant.  409 is the app's routine denial;
+        # pass 403/422 to simulate a fault that waiting cannot fix, and None to
+        # simulate the app never answering (network failure).
+        self._deny_status = deny_status
         # Per-uid leases (keyed by idempotency_key = pod uid) so a batch grant
         # gives each pod its own reservation id; falls back to ``lease``.
         self._leases = leases or {}
@@ -320,8 +334,14 @@ class _FakeClient:
         self.select_requests: list = []
 
     async def create_ondemand_reservation(self, req):
+        # Mirrors the real signature: a LeaseAttempt, never a bare reservation.
+        # A stub shaped around the old return type is how the caller's inability
+        # to tell a 409 from a 403 stayed invisible.
         self.create_requests.append(req)
-        return self._leases.get(req.idempotency_key, self._lease)
+        lease = self._leases.get(req.idempotency_key, self._lease)
+        if lease is None:
+            return LeaseAttempt(status=self._deny_status)
+        return LeaseAttempt(reservation=lease, status=201)
 
     async def cancel_reservation(self, reservation_id, reason):
         self.cancel_calls.append((reservation_id, reason))
@@ -402,6 +422,74 @@ class TestTryRequestLease:
         assert result is False
         assert candidate.next_attempt_at > before
         assert state.reservations == []
+        # A 409 is routine, so nothing escalates.
+        assert candidate.lease_error_count == 0
+
+    def _run_lease_attempt(self, m, monkeypatch, client, candidate):
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_gpu_only_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        config = SimpleNamespace(
+            ondemand_horizon_minutes=30, ondemand_lease_buffer_minutes=10,
+            scheduling_gate_name=None,
+        )
+        return asyncio.run(
+            m._try_request_lease(_state_ready(), client, config, candidate.pod_uid, candidate)
+        )
+
+    def test_non_409_escalates_and_backs_off_exponentially(self, monkeypatch, caplog):
+        # A read-only service key (403) can never succeed by waiting.  It used
+        # to log at INFO and retry at the flat 2-5 min denial cadence forever;
+        # now it warns and the delay doubles per consecutive failure.
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=None, deny_status=403)
+        candidate = _candidate("uid-1")
+
+        delays = []
+        for expected_count in (1, 2, 3):
+            with caplog.at_level(logging.WARNING, logger=m.log.name):
+                caplog.clear()
+                before = datetime.now(timezone.utc)
+                assert self._run_lease_attempt(m, monkeypatch, client, candidate) is False
+            assert candidate.lease_error_count == expected_count
+            delays.append((candidate.next_attempt_at - before).total_seconds())
+
+            record = next(
+                r for r in caplog.records if "event=lease.error" in r.getMessage()
+            )
+            assert record.levelno == logging.WARNING
+            fields = kv_fields(record.getMessage())
+            assert fields["status"] == "403"
+            # Parsed, not substring-matched: "fails=1" in the message is also
+            # true of fails=12.
+            assert fields["fails"] == str(expected_count)
+
+        # Each attempt waits at least as long as the previous one, and the
+        # growth is real rather than jitter (the floor doubles: 120 → 240 → 480).
+        assert delays[1] >= 2 * 120
+        assert delays[2] >= 4 * 120
+
+    def test_error_backoff_is_capped(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=None, deny_status=403)
+        candidate = _candidate("uid-1")
+        candidate.lease_error_count = 40  # far past the cap
+
+        before = datetime.now(timezone.utc)
+        assert self._run_lease_attempt(m, monkeypatch, client, candidate) is False
+        delay = (candidate.next_attempt_at - before).total_seconds()
+        assert delay <= m.ERROR_RETRY_CAP_SECONDS + 1
+
+    def test_a_grant_clears_a_previous_error_streak(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        _patch_admission(monkeypatch, m)
+        client = _FakeClient(lease=_lease(501))
+        candidate = _candidate("uid-1")
+        candidate.lease_error_count = 3  # a fault the operator has since fixed
+
+        assert self._run_lease_attempt(m, monkeypatch, client, candidate) is True
+        assert candidate.lease_error_count == 0
 
     def test_admission_failure_issues_compensating_cancel(self, monkeypatch):
         m = _main_module(monkeypatch)

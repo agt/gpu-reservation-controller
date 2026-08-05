@@ -172,10 +172,29 @@ def _configure_logging(config: Config) -> None:
 RETRY_JITTER_RANGE = (120, 300)
 SHORT_RETRY_SECONDS = 30
 
+# Backoff for a lease failure that waiting cannot fix (a 4xx that is not 409).
+# Doubles per consecutive failure from the ordinary denial floor up to the cap,
+# so a deployment with a read-only service key settles at one attempt per half
+# hour per pod instead of one every 2-5 min forever.
+ERROR_RETRY_CAP_SECONDS = 1800
+
 
 def _jittered_retry_at(now: datetime) -> datetime:
     """Return *now* pushed forward by a random 2–5 min backoff."""
     return now + timedelta(seconds=random.randint(*RETRY_JITTER_RANGE))
+
+
+def _error_retry_at(now: datetime, failures: int) -> datetime:
+    """Return *now* pushed forward by an exponential backoff for *failures*.
+
+    Starts at the ordinary jittered denial delay and doubles per consecutive
+    non-retryable failure, capped at ``ERROR_RETRY_CAP_SECONDS``.  The jitter is
+    kept so a class-wide fault (every pod holding the same bad credential) does
+    not resynchronise every candidate onto the same instant.
+    """
+    base = random.randint(*RETRY_JITTER_RANGE)
+    delay = min(base * (2 ** max(0, failures - 1)), ERROR_RETRY_CAP_SECONDS)
+    return now + timedelta(seconds=delay)
 
 
 def _short_retry_at(now: datetime) -> datetime:
@@ -925,15 +944,36 @@ async def _grant_and_admit(
         idempotency_key=uid,
         notes=f"on-demand lease for pod {candidate.pod_namespace}/{candidate.pod_name}",
     )
-    lease = await client.create_ondemand_reservation(request)
-    if lease is None:
-        log.info("%s", kv(
-            event="lease.denied", ns=candidate.pod_namespace, pod=candidate.pod_name,
-            clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
-        ))
-        candidate.next_attempt_at = _jittered_retry_at(now)
+    attempt = await client.create_ondemand_reservation(request)
+    if not attempt.granted:
+        if attempt.retryable:
+            # The app's routine "infeasible right now" (409), or a transient
+            # network/5xx failure: capacity may free up, so keep the ordinary
+            # cadence and the ordinary INFO line.
+            candidate.lease_error_count = 0
+            log.info("%s", kv(
+                event="lease.denied", ns=candidate.pod_namespace, pod=candidate.pod_name,
+                clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
+                status=attempt.status,
+            ))
+            candidate.next_attempt_at = _jittered_retry_at(now)
+        else:
+            # A fault waiting will not fix — a read-only service key, a schema
+            # mismatch after an app upgrade, an unknown group name.  WARNING so
+            # it clears an alerting threshold, and an exponential backoff so a
+            # misconfigured deployment stops hammering the app per pod forever.
+            candidate.lease_error_count += 1
+            candidate.next_attempt_at = _error_retry_at(now, candidate.lease_error_count)
+            log.warning("%s", kv(
+                event="lease.error", ns=candidate.pod_namespace, pod=candidate.pod_name,
+                clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
+                status=attempt.status, fails=candidate.lease_error_count,
+                retry_s=int((candidate.next_attempt_at - now).total_seconds()),
+            ))
         return False
 
+    candidate.lease_error_count = 0
+    lease = attempt.reservation
     log.info("%s", kv(
         event="lease.granted", rid=lease.id, ns=candidate.pod_namespace,
         pod=candidate.pod_name, clabel=candidate.gpu_class_label,

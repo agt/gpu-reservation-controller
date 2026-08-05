@@ -656,8 +656,18 @@ two-step **preflight → delegate → grant** pipeline.
 - **Grant** (`_grant_and_admit`, per granted pod): calls `POST /api/reservations`
   with `on_demand=True` (the app relaxes policy limits — SU, caps, minimum
   duration — never physical calendar capacity), **idempotent by the pod's UID**
-  (`idempotency_key`).  A **denial** (409 / error → `None`) cools the candidate
-  down 2–5 min.  On **grant** the lease is upserted into `state.reservations`
+  (`idempotency_key`).  The client returns a `LeaseAttempt` carrying the HTTP
+  status, because the two non-grant cases need different handling: a **409**
+  (the app's documented "infeasible right now") or a network/5xx failure is
+  routine, logs `lease.denied` at INFO, and cools the candidate down 2–5 min;
+  any **other 4xx** — a `read_only` service key, a schema mismatch after an app
+  upgrade, an unknown `group_name` — is a fault waiting cannot fix, so it logs
+  `lease.error` at **WARNING** with the response body and backs off
+  exponentially to `ERROR_RETRY_CAP_SECONDS` (30 min) via
+  `OnDemandCandidate.lease_error_count`, reset on any grant or routine denial.
+  Collapsing the two was how a misconfigured deployment retried every 2–5 min
+  per pending pod indefinitely while logging only below WARNING.
+  On **grant** the lease is upserted into `state.reservations`
   (`apply_push_to_active`) and the pod is admitted immediately
   (`_try_apply_toleration`) — the existing admission path, so it stamps
   `res-<id>`, records the guarantee, and emits `RuntimeGuaranteed`.  **If

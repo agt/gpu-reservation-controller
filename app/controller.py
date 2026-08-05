@@ -267,6 +267,12 @@ class OnDemandCandidate:
     # of waiting for a periodic scan; other cooldowns (denial, guard-3/4) leave
     # this False so they are never short-circuited.  See main.pod_watch_loop.
     awaiting_schedule_signal: bool = False
+    # Consecutive non-retryable lease failures (a 4xx that is not 409: a
+    # read-only service key, a schema mismatch, an unknown group).  Waiting does
+    # not fix these, so the backoff grows with the count instead of retrying at
+    # the flat 2-5 min denial cadence forever.  Reset on any grant or routine
+    # denial.  See main._grant_and_admit and _error_retry_at.
+    lease_error_count: int = 0
 
 
 @dataclass(frozen=True)
