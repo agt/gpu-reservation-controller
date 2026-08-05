@@ -45,13 +45,11 @@ jobs:
       # image tag policy in values.yaml, and for the opposite reason: this is a
       # build-time check, not a deployed artifact.)
       #
-      # `token` is passed because the action resolves "latest" through the
-      # GitHub API, which is rate-limited for anonymous callers.
+      # Note that "latest" now resolves to Helm 4, not 3.
       - name: Install Helm (latest stable)
         uses: azure/setup-helm@v4
         with:
           version: latest
-          token: ${{ github.token }}
 
       - name: Show Helm version
         run: helm version
