@@ -485,8 +485,8 @@ ns/name` becomes `ns=… pod=…`), arrows or `a..b` ranges inside a value.
 (`kv()`) is the only thing that renders it.
 
 Both are **duplicated verbatim in the reservation app**, the same arrangement
-`docs/RESERVATION-API.md` / the app's `API.md` already use — update the copies
-together.  Sharing the dictionary is the point: a controller line and an app line
+`docs/RESERVATION-API.md` / the app's `docs/contracts/RESERVATION-API.md` already
+use — update the copies together.  Sharing the dictionary is the point: a controller line and an app line
 join on the same key (`rid`, `poduid`, `cid`), which the old vocabularies could
 not do (`uid=` meant the pod UID here and nothing there; a reservation was `#42`
 here and `id=42` there).
@@ -1092,6 +1092,15 @@ build if a new numeric setting is added with a bare `int()`.
 The Dockerfile builds a minimal image:
 
 - Base: `python:3.13-slim`
+- **Dependencies installed from compiled lockfiles** (`requirements.lock` /
+  `requirements-dev.lock`), never the lower-bound-only `requirements*.txt`.  The
+  `final` stage reinstalls on a clean base rather than copying site-packages from
+  `deps` — that is what keeps dev-only packages out of the runtime image, but it
+  also means the two stages resolve independently, so without a lock the suite
+  could pass against one dependency set while the image shipped another.  The dev
+  lock is compiled with the prod lock as a constraint, making it a superset at
+  identical versions; `tests/test_dependency_lock.py` asserts both properties and
+  fails the build on drift.  Regeneration commands are in `AGENTS.md`.
 - Non-root user `appuser` (UID 1000)
 - Health check: `GET http://localhost:8000/health`
 - Entrypoint: `python -m app.main` (starts uvicorn programmatically so `HTTP_PORT` controls the bind port)
@@ -1101,3 +1110,29 @@ ServiceAccount, ClusterRole/Binding, Deployment, and `/health` Service; keep
 its `values.yaml`/`deployment.yaml` env wiring in sync when adding settings
 to `config.py`.  See README.md for RBAC requirements and a sample manual
 Deployment manifest.
+
+**The chart's default image reference must stay registry-qualified and must
+name a tag the workflow actually publishes.**  An unqualified repository
+resolves to `docker.io/library/…`, and `docker/metadata-action`'s
+`flavor.latest=auto` emits `latest` only for a semver git-tag push — which this
+repository never makes — so the workflow requests it explicitly via
+`type=raw,value=latest`.  The floating default tag is paired with
+`pullPolicy: Always`, without which a node holding an old `latest` layer never
+re-pulls and `helm upgrade` rolls nothing; pin an immutable tag and switch back
+to `IfNotPresent` for production.  The previous defaults were wrong on every one
+of those points, and nothing read the chart to notice.
+
+Two layers now do, and they are complementary rather than redundant:
+
+- **`tests/test_chart_image.py`** asserts the four properties above by *parsing*
+  the chart.  It cannot render — the suite also runs inside the Dockerfile's
+  `test` stage, which has no helm — but the defects it covers render perfectly
+  well while being wrong, so parsing is the right tool for them.
+- **The `chart` job in `.github/workflows/docker.yml`** installs the latest
+  stable helm and renders for real: `helm lint`, a default render asserting the
+  full object set, a render with the optional blocks (`imagePullSecrets`,
+  `INBOUND_API_TOKEN`, `REQUIRED_GROUP_LABEL`) populated — they are empty by
+  default, so the default render proves nothing about them — and a negative case
+  asserting the `reservationApiUrl` `required` guard still fires.  This is what
+  catches template syntax, indentation and undefined values.  `build-and-push-image`
+  needs it: an image whose chart cannot render is not deployable.

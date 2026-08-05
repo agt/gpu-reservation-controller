@@ -1,5 +1,18 @@
 name: Build and push image
 on:
+  # Rebuild weekly even with no commits, so the image picks up base-OS security
+  # patches. `python:3.13-slim` is rebuilt upstream as its Debian base is
+  # patched, but a `FROM` alone pulls that in only when something triggers a
+  # build — so a quiet period leaves the deployed image accumulating known
+  # unpatched CVEs it would otherwise have shed for free.
+  #
+  # Safe to do on a schedule only because the dependency locks make an unattended
+  # rebuild reproducible: it re-resolves nothing, so the sole difference from the
+  # previous build is the patched base layer. Adding this while the requirements
+  # were lower-bound only would have made an unreviewed dependency bump land in
+  # production every Sunday. Mirrors the reservation app's workflow.
+  schedule:
+    - cron: '0 0 * * 0'
   push:
 
 env:
@@ -7,8 +20,102 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  # Renders the Helm chart with the real `helm` binary. This is the only place
+  # that happens: tests/test_chart_image.py parses the chart's YAML instead,
+  # because it also runs inside the Dockerfile's `test` stage where helm is not
+  # installed. The two check different things and neither replaces the other —
+  # the pytest guard pins values-level properties (registry-qualified
+  # repository, a tag the pipeline publishes), while this catches template
+  # syntax, bad indentation, and undefined values, none of which are visible
+  # without rendering.
+  chart:
+    name: Render Helm chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Deliberately floating: a chart linter *should* track the newest helm so
+      # deprecations surface here rather than at deploy time. The tradeoff is
+      # that a helm release can turn this red with no commit of ours — pin an
+      # exact version here if that becomes disruptive. (The opposite of the
+      # image tag policy in values.yaml, and for the opposite reason: this is a
+      # build-time check, not a deployed artifact.)
+      #
+      # Note that "latest" now resolves to Helm 4, not 3.
+      - name: Install Helm (latest stable)
+        uses: azure/setup-helm@v4
+        with:
+          version: latest
+
+      - name: Show Helm version
+        run: helm version
+
+      - name: Lint chart
+        run: |
+          helm lint helm/gpu-reservation-controller \
+            --set reservationApiUrl=https://gpures.example.edu
+
+      # The default path: every value at its shipped default apart from the one
+      # the chart marks required. `helm template` parses its own output into
+      # Kubernetes objects, so a rendering that produces malformed YAML fails
+      # here rather than at `kubectl apply` time.
+      - name: Render with defaults
+        run: |
+          helm template gpu-reservation-controller helm/gpu-reservation-controller \
+            --set reservationApiUrl=https://gpures.example.edu \
+            > /tmp/rendered-defaults.yaml
+          # Assert the object set rather than a count: a template that silently
+          # stopped rendering would still leave a plausible-looking number.
+          for kind in ServiceAccount ClusterRole ClusterRoleBinding Deployment Service; do
+            if ! grep -qx "kind: ${kind}" /tmp/rendered-defaults.yaml; then
+              echo "::error::chart rendered no ${kind}"
+              exit 1
+            fi
+          done
+          # The defect rank 11 was about: an unqualified repository silently
+          # becoming a docker.io/library reference.
+          grep -q 'image: "ghcr.io/' /tmp/rendered-defaults.yaml
+
+      # The optional blocks are empty by default, so the render above proves
+      # nothing about them. imagePullSecrets in particular is new and is exactly
+      # what a private GHCR reference depends on.
+      - name: Render with optional blocks populated
+        run: |
+          helm template gpu-reservation-controller helm/gpu-reservation-controller \
+            --set reservationApiUrl=https://gpures.example.edu \
+            --set imagePullSecrets[0].name=ghcr-pull-secret \
+            --set inboundApiTokenSecret.name=controller-inbound-token \
+            --set config.requiredGroupLabel=dsmlp/course \
+            --set config.podSchedulingGateName=gpu-reservation \
+            --set config.timezone=America/Los_Angeles \
+            > /tmp/rendered-full.yaml
+          grep -q 'imagePullSecrets:' /tmp/rendered-full.yaml
+          grep -q 'name: ghcr-pull-secret' /tmp/rendered-full.yaml
+          grep -q 'INBOUND_API_TOKEN' /tmp/rendered-full.yaml
+          grep -q 'REQUIRED_GROUP_LABEL' /tmp/rendered-full.yaml
+
+      # The chart's one `required` guard. Asserting it fires keeps it from
+      # decaying into a default that silently deploys a controller pointed at
+      # no API at all.
+      - name: Reject a render missing the required value
+        run: |
+          if helm template gpu-reservation-controller helm/gpu-reservation-controller \
+               > /dev/null 2>&1; then
+            echo "::error::chart rendered without reservationApiUrl; the required guard is not firing"
+            exit 1
+          fi
+          echo "required guard fired as expected"
+
   build-and-push-image:
     runs-on: ubuntu-latest
+    # An image whose chart cannot render is not deployable, so it should not be
+    # published — the same reasoning as running the test suite before the
+    # registry login below.
+    needs: chart
     permissions:
       contents: read
       packages: write
@@ -43,6 +150,20 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # The first four are metadata-action's own defaults, restated because
+          # supplying `tags` replaces them rather than adding to them.
+          #
+          # `latest` is the addition. The action's `flavor.latest=auto` default
+          # emits it only for a semver git-tag push, and this repository pushes
+          # no git tags — so nothing ever published `latest`, while the Helm
+          # chart asked for exactly that. The chart's default was unpullable
+          # regardless of registry.
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=tag
+            type=ref,event=pr
+            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push image
         uses: docker/build-push-action@v6

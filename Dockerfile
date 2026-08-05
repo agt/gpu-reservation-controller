@@ -2,8 +2,20 @@ FROM python:3.13-slim AS deps
 
 WORKDIR /app
 
-COPY requirements.txt requirements-dev.txt ./
-RUN pip install --no-cache-dir -r requirements-dev.txt
+# Install from the compiled lockfiles, not the loose `requirements*.txt`.  Both
+# are lower-bound only, so a plain install resolves whatever is newest at build
+# time — and because `final` below reinstalls on a clean base, this stage could
+# test one dependency set while the shipped image ran another.  The locks are
+# what make the two resolutions identical.
+#
+# `requirements-dev.lock` is compiled with `requirements.lock` as a constraint,
+# so it is a superset at identical versions; `tests/test_dependency_lock.py`
+# asserts that rather than trusting it.  Regenerate both together:
+#
+#   uv pip compile requirements.txt -o requirements.lock
+#   uv pip compile requirements-dev.txt -c requirements.lock -o requirements-dev.lock
+COPY requirements.txt requirements-dev.txt requirements.lock requirements-dev.lock ./
+RUN pip install --no-cache-dir -r requirements-dev.lock
 
 
 # Runs the full test suite.  A non-zero exit here fails the build, so a broken
@@ -27,7 +39,19 @@ COPY OBSERVABILITY.md .
 # kept byte-identical with the sibling repo, so scripts/ is a test input too.
 # (All four artifacts themselves are already covered by app/ and docs/ above.)
 COPY scripts/ ./scripts/
+# tests/test_chart_image.py parses the chart and the workflow (helm is not a test
+# dependency, so it checks the values rather than rendering them), which makes
+# both deployment config a test input.  Nothing is copied out of this stage, so
+# they never reach the runtime image.
+COPY helm/ ./helm/
+COPY .github/ ./.github/
+# tests/test_docker_test_stage.py reads this file to check the COPY list below
+# against what the suite actually opens.
+COPY Dockerfile .
 
+# tests/test_docker_test_stage.py guards the list above: a test that reads a
+# repo-root path this stage does not COPY passes locally and errors here, where
+# the file simply is not present.
 RUN pytest --tb=short -q
 
 
@@ -35,8 +59,12 @@ FROM python:3.13-slim AS final
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# The same lock the `deps`/`test` stages installed, so what shipped is what was
+# tested.  `final` deliberately reinstalls on a clean base rather than copying
+# site-packages from `deps`, which is what keeps the dev-only packages out of
+# the runtime image.
+COPY requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
 
 COPY app/ ./app/
 

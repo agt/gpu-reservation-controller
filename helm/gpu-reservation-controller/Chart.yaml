@@ -10,4 +10,6 @@ keywords:
   - controller
   - kubernetes
 maintainers:
-  - email: agt@ucsd.edu
+  # `name` is mandatory — `helm lint` fails the chart without it.
+  - name: agt
+    email: agt@ucsd.edu

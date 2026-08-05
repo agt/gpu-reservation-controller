@@ -338,11 +338,20 @@ queue-processor tick. Re-linked pods get a Kubernetes Event with reason
 ### Docker (recommended)
 
 ```bash
-docker build -t gpu-reservation-controller:latest .
+docker build -t ghcr.io/agt/gpu-reservation-controller:latest .
 ```
 
-Or pull from your registry if you use the provided GitHub Actions workflow
-(`.github/workflows/docker.yml`).
+Or pull the published image, which `.github/workflows/docker.yml` pushes to
+`ghcr.io/<github-owner>/<repo-name>` — `ghcr.io/agt/gpu-reservation-controller`
+for this repository, tagged `latest` on the default branch:
+
+```bash
+docker pull ghcr.io/agt/gpu-reservation-controller:latest
+```
+
+Keep the registry prefix. An unqualified `gpu-reservation-controller:latest`
+resolves to `docker.io/library/gpu-reservation-controller`, which is a
+different image that does not exist.
 
 ### Local (development / out-of-cluster)
 
@@ -637,7 +646,11 @@ spec:
       serviceAccountName: gpu-reservation-controller
       containers:
         - name: controller
-          image: gpu-reservation-controller:latest
+          # Registry-qualified on purpose: an unqualified name resolves to
+          # docker.io/library/. Add imagePullSecrets below if the GHCR package
+          # is private (it is, by default).
+          image: ghcr.io/agt/gpu-reservation-controller:latest
+          imagePullPolicy: Always  # `latest` is floating; see the Helm chart's values.yaml
           ports:
             - containerPort: 8000
           env:
@@ -745,8 +758,8 @@ gpu-reservation-controller/
 ├── helm/gpu-reservation-controller/  Helm chart (Deployment, RBAC, Service)
 ├── docs/
 │   ├── RESERVATION-API.md    Reservation management API specification
-│   │                         (identical copy of API.md in gpu-reservation-app —
-│   │                         update both together)
+│   │                         (identical copy of docs/contracts/RESERVATION-API.md
+│   │                         in gpu-reservation-app — update both together)
 │   ├── SCHEDULING.md         Reservation-app scheduling behaviour reference (shared copy)
 │   └── lifecycle.mmd/.png    Pod lifecycle state diagram (Mermaid + rendered)
 ├── requirements.txt

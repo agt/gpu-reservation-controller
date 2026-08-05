@@ -172,6 +172,7 @@ follow this grammar and are not expected to.
 | `role` | `admin` \| `auditor` \| `user`, or `member` \| `manager` | scoped by `event=` |
 | `scope` | `read_only` \| `read_write` | service-key privilege |
 | `bootstrap` | bool | whether `BOOTSTRAP_ADMIN_USERNAME` granted the new account admin (emitted only when it did) |
+| `banner` | bool | whether an effective-date shift announces itself on screen; `false` means this line is the only record of it |
 
 `reason` enums by event: `auth.login_failed` → `no_such_user`, `inactive`,
 `wrong_provider`, `account_locked`, `bad_password`, `deactivated` ·
