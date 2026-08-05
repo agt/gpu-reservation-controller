@@ -172,10 +172,29 @@ def _configure_logging(config: Config) -> None:
 RETRY_JITTER_RANGE = (120, 300)
 SHORT_RETRY_SECONDS = 30
 
+# Backoff for a lease failure that waiting cannot fix (a 4xx that is not 409).
+# Doubles per consecutive failure from the ordinary denial floor up to the cap,
+# so a deployment with a read-only service key settles at one attempt per half
+# hour per pod instead of one every 2-5 min forever.
+ERROR_RETRY_CAP_SECONDS = 1800
+
 
 def _jittered_retry_at(now: datetime) -> datetime:
     """Return *now* pushed forward by a random 2–5 min backoff."""
     return now + timedelta(seconds=random.randint(*RETRY_JITTER_RANGE))
+
+
+def _error_retry_at(now: datetime, failures: int) -> datetime:
+    """Return *now* pushed forward by an exponential backoff for *failures*.
+
+    Starts at the ordinary jittered denial delay and doubles per consecutive
+    non-retryable failure, capped at ``ERROR_RETRY_CAP_SECONDS``.  The jitter is
+    kept so a class-wide fault (every pod holding the same bad credential) does
+    not resynchronise every candidate onto the same instant.
+    """
+    base = random.randint(*RETRY_JITTER_RANGE)
+    delay = min(base * (2 ** max(0, failures - 1)), ERROR_RETRY_CAP_SECONDS)
+    return now + timedelta(seconds=delay)
 
 
 def _short_retry_at(now: datetime) -> datetime:
@@ -316,10 +335,12 @@ async def _reconcile_after_reservation_change(
             if gc.label_value:
                 new_labels[gc.id] = gc.label_value
                 new_ids[gc.label_value] = gc.id
-                # App-side GPU count for the hourly capacity audit; recorded
-                # only when known (see GpuClassDetail.total_gpus).
-                if gc.total_gpus is not None:
-                    new_capacity[gc.label_value] = gc.total_gpus
+                # App-side GPU count for the hourly capacity audit: the
+                # override-resolved count the app actually admits against, not
+                # the configured default.  Recorded only when known (see
+                # GpuClassDetail.audit_gpus).
+                if gc.audit_gpus is not None:
+                    new_capacity[gc.label_value] = gc.audit_gpus
     else:
         new_labels = dict(state.gpu_class_labels)
         new_ids = dict(state.gpu_class_ids)
@@ -336,8 +357,8 @@ async def _reconcile_after_reservation_change(
         if gpu_class and gpu_class.label_value:
             new_labels[cid] = gpu_class.label_value
             new_ids[gpu_class.label_value] = cid
-            if gpu_class.total_gpus is not None:
-                new_capacity[gpu_class.label_value] = gpu_class.total_gpus
+            if gpu_class.audit_gpus is not None:
+                new_capacity[gpu_class.label_value] = gpu_class.audit_gpus
             log.info("%s", kv(event="class.resolved", cid=cid, class_=gpu_class.name, clabel=gpu_class.label_value))
         else:
             log.warning("%s", kv(
@@ -923,15 +944,36 @@ async def _grant_and_admit(
         idempotency_key=uid,
         notes=f"on-demand lease for pod {candidate.pod_namespace}/{candidate.pod_name}",
     )
-    lease = await client.create_ondemand_reservation(request)
-    if lease is None:
-        log.info("%s", kv(
-            event="lease.denied", ns=candidate.pod_namespace, pod=candidate.pod_name,
-            clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
-        ))
-        candidate.next_attempt_at = _jittered_retry_at(now)
+    attempt = await client.create_ondemand_reservation(request)
+    if not attempt.granted:
+        if attempt.retryable:
+            # The app's routine "infeasible right now" (409), or a transient
+            # network/5xx failure: capacity may free up, so keep the ordinary
+            # cadence and the ordinary INFO line.
+            candidate.lease_error_count = 0
+            log.info("%s", kv(
+                event="lease.denied", ns=candidate.pod_namespace, pod=candidate.pod_name,
+                clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
+                status=attempt.status,
+            ))
+            candidate.next_attempt_at = _jittered_retry_at(now)
+        else:
+            # A fault waiting will not fix — a read-only service key, a schema
+            # mismatch after an app upgrade, an unknown group name.  WARNING so
+            # it clears an alerting threshold, and an exponential backoff so a
+            # misconfigured deployment stops hammering the app per pod forever.
+            candidate.lease_error_count += 1
+            candidate.next_attempt_at = _error_retry_at(now, candidate.lease_error_count)
+            log.warning("%s", kv(
+                event="lease.error", ns=candidate.pod_namespace, pod=candidate.pod_name,
+                clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
+                status=attempt.status, fails=candidate.lease_error_count,
+                retry_s=int((candidate.next_attempt_at - now).total_seconds()),
+            ))
         return False
 
+    candidate.lease_error_count = 0
+    lease = attempt.reservation
     log.info("%s", kv(
         event="lease.granted", rid=lease.id, ns=candidate.pod_namespace,
         pod=candidate.pod_name, clabel=candidate.gpu_class_label,
@@ -2391,11 +2433,13 @@ async def _run_capacity_audit(
     """One capacity audit: compare app-side vs physical per-class GPU capacity.
 
     The app-side counts come from ``state.gpu_class_capacity`` (the reservation
-    app's ``total_gpus`` per class, refreshed each reservation fetch).  Physical
-    capacity is snapshotted live from Kubernetes node taints.  Any difference is
-    logged at WARNING; any class the app believes is larger than it physically
-    is (``app_side > physical``) is added to ``state.overcommitted_gpu_classes``,
-    which pauses new on-demand admissions for that class only.
+    app's ``effective_gpus_today`` per class — its ``total_gpus`` after any date-
+    span capacity override covering today, refreshed each reservation fetch; see
+    ``GpuClassDetail.audit_gpus``).  Physical capacity is snapshotted live from
+    Kubernetes node taints.  Any difference is logged at WARNING; any class the
+    app believes is larger than it physically is (``app_side > physical``) is
+    added to ``state.overcommitted_gpu_classes``, which pauses new on-demand
+    admissions for that class only.
 
     Fail-safe: if the node snapshot fails, the audit is skipped and the current
     pause set is left unchanged — a transient LIST failure must never silently

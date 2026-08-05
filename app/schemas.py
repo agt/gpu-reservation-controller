@@ -67,18 +67,38 @@ class GpuClassDetail(GpuClassBrief):
 
     Extends ``GpuClassBrief`` (id, name, optional ``label_value`` — the
     Kubernetes node-label value used to match pod gpu-class labels, e.g.
-    "h100") with the app-side ``total_gpus`` count.  Subclassed rather than
-    redeclared so the shared fields cannot drift (CODE-REVIEW H7).
+    "h100") with the app-side GPU counts.  Subclassed rather than redeclared so
+    the shared fields cannot drift (CODE-REVIEW H7).
 
-    ``total_gpus`` is the app's own notion of how many GPUs a class has; the
-    hourly capacity audit compares it against the physical per-class capacity
-    observed from Kubernetes node taints (``snapshot_node_gpu_capacity``).  It
-    is ``Optional`` so a payload that omits it (an older app, or a bulk list
-    that doesn't include it) degrades to "unknown" — such a class is left out
-    of the app-side capacity map rather than defaulting to a misleading count.
+    Two counts, and the hourly capacity audit wants the *second* one:
+
+    ``total_gpus`` is the class's configured default.  ``effective_gpus_today``
+    is that default after the app has applied any date-span capacity override
+    covering today — which is the number the app actually admits against.  A
+    maintenance window that halves a class for a week moves only the latter, so
+    auditing ``total_gpus`` compares a figure nobody is enforcing against real
+    physical capacity: it invents a mismatch when the override matches a genuine
+    node drain (pausing JIT admission for a class that is not over-committed),
+    and hides a real over-commit when the override raises the count.
+
+    Both are ``Optional`` so a payload omitting them (an older app, or a bulk
+    list that doesn't include them) degrades to "unknown" — such a class is left
+    out of the app-side capacity map rather than defaulting to a misleading
+    count.  ``effective_gpus_today`` absent falls back to ``total_gpus``, so an
+    app predating the field still audits exactly as before.
     """
 
     total_gpus: Optional[int] = None
+    effective_gpus_today: Optional[int] = None
+
+    @property
+    def audit_gpus(self) -> Optional[int]:
+        """The app-side count the capacity audit should compare against.
+
+        The override-resolved count when the app publishes one, else the
+        configured default, else ``None`` (unknown — omit from the audit).
+        """
+        return self.total_gpus if self.effective_gpus_today is None else self.effective_gpus_today
 
 
 # ---------------------------------------------------------------------------

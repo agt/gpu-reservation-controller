@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import pytest
 
 from app.config import Config
-from app.reservation_client import ReservationClient
+from app.reservation_client import ReservationClient, _response_detail
 from app.schemas import (
     OnDemandAdmissionCandidate,
     OnDemandAdmissionRequest,
@@ -21,7 +23,17 @@ from app.schemas import (
     OverstayReportRequest,
 )
 
-from tests.conftest import make_config, reservation as _reservation
+from tests.conftest import kv_fields as _fields, make_config, reservation as _reservation
+
+
+def _only_lease_record(caplog) -> logging.LogRecord:
+    """The single api.lease_* record emitted by one client call."""
+    records = [
+        r for r in caplog.records
+        if r.name == "app.reservation_client" and "event=api.lease_" in r.getMessage()
+    ]
+    assert len(records) == 1, [r.getMessage() for r in records]
+    return records[0]
 
 
 def _config(**overrides) -> Config:
@@ -117,6 +129,35 @@ def test_fetch_gpu_classes_returns_list():
     asyncio.run(client.aclose())
 
 
+def test_fetch_gpu_classes_parses_effective_gpus_today():
+    # The audit reads the override-resolved count, so it has to survive parsing.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                # A maintenance window has halved this class for today.
+                {
+                    "id": 10,
+                    "name": "H100",
+                    "label_value": "h100",
+                    "total_gpus": 80,
+                    "effective_gpus_today": 40,
+                },
+                # An app predating the field publishes only the default.
+                {"id": 20, "name": "A100", "label_value": "a100", "total_gpus": 8},
+            ],
+        )
+
+    client = _client_with_handler(_config(), handler)
+    result = asyncio.run(client.fetch_gpu_classes())
+    assert result is not None
+    assert (result[0].total_gpus, result[0].effective_gpus_today) == (80, 40)
+    assert result[0].audit_gpus == 40
+    assert result[1].effective_gpus_today is None
+    assert result[1].audit_gpus == 8
+    asyncio.run(client.aclose())
+
+
 def test_fetch_gpu_classes_returns_none_on_http_error():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500)
@@ -172,26 +213,89 @@ def test_create_ondemand_reservation_201_returns_reservation():
 
     client = _client_with_handler(_config(), handler)
     result = asyncio.run(client.create_ondemand_reservation(_ondemand_request()))
-    assert result is not None and result.id == 7
+    assert result.granted and result.reservation.id == 7
     asyncio.run(client.aclose())
 
 
-def test_create_ondemand_reservation_409_returns_none():
-    """A capacity/policy denial must degrade to None, not raise."""
+def test_create_ondemand_reservation_409_is_a_routine_denial(caplog):
+    """A capacity/policy denial degrades without raising, and stays at INFO."""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(409, json={"detail": "no capacity"})
 
     client = _client_with_handler(_config(), handler)
-    assert asyncio.run(client.create_ondemand_reservation(_ondemand_request())) is None
+    with caplog.at_level(logging.DEBUG, logger="app.reservation_client"):
+        result = asyncio.run(client.create_ondemand_reservation(_ondemand_request()))
+    assert not result.granted
+    assert result.status == 409
+    assert result.retryable is True
+
+    record = _only_lease_record(caplog)
+    assert record.levelno == logging.INFO
+    assert _fields(record.getMessage())["event"] == "api.lease_denied"
     asyncio.run(client.aclose())
 
 
-def test_create_ondemand_reservation_timeout_returns_none():
+@pytest.mark.parametrize("status", [401, 403, 404, 422])
+def test_create_ondemand_reservation_non_409_is_an_error(caplog, status):
+    """A fault waiting cannot fix: WARNING, carries the body, not retryable.
+
+    These used to be indistinguishable from a 409 — same INFO line, same bare
+    None — so a read-only service key retried every 2-5 min forever below the
+    level anyone alerts on.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"detail": "write scope required"})
+
+    client = _client_with_handler(_config(), handler)
+    with caplog.at_level(logging.DEBUG, logger="app.reservation_client"):
+        result = asyncio.run(client.create_ondemand_reservation(_ondemand_request()))
+    assert not result.granted
+    assert result.status == status
+    assert result.retryable is False
+
+    record = _only_lease_record(caplog)
+    assert record.levelno == logging.WARNING
+    fields = _fields(record.getMessage())
+    assert fields["event"] == "api.lease_error"
+    assert fields["status"] == str(status)
+    assert fields["detail"] == "write scope required"
+    asyncio.run(client.aclose())
+
+
+def test_create_ondemand_reservation_5xx_is_an_error_but_retryable():
+    # The app is broken rather than refusing: loud, but waiting may still fix it.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="upstream unavailable")
+
+    client = _client_with_handler(_config(), handler)
+    result = asyncio.run(client.create_ondemand_reservation(_ondemand_request()))
+    assert not result.granted
+    assert result.status == 503
+    assert result.retryable is True
+    asyncio.run(client.aclose())
+
+
+def test_create_ondemand_reservation_timeout_has_no_status():
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectTimeout("timed out", request=request)
 
     client = _client_with_handler(_config(), handler)
-    assert asyncio.run(client.create_ondemand_reservation(_ondemand_request())) is None
+    result = asyncio.run(client.create_ondemand_reservation(_ondemand_request()))
+    assert not result.granted
+    # The app never answered, so there is no status to reason about — and a
+    # network blip must stay retryable.
+    assert result.status is None
+    assert result.retryable is True
+    asyncio.run(client.aclose())
+
+
+def test_lease_error_detail_truncates_a_large_body():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="x" * 5000)
+
+    client = _client_with_handler(_config(), handler)
+    assert asyncio.run(client.create_ondemand_reservation(_ondemand_request())).status == 400
+    assert len(_response_detail(httpx.Response(400, text="x" * 5000))) <= 201
     asyncio.run(client.aclose())
 
 

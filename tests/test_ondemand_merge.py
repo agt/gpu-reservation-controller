@@ -212,6 +212,23 @@ class TestPlanOndemandMerges:
         # One GPU of budget on the booking → only one pod merges.
         assert len(plan) == 1
 
+    def test_pass_spreads_across_bookings_rather_than_packing_the_largest(self):
+        # Mirrors the adoption-pass regression: two equally-ending bookings, one
+        # 4-GPU and one 2-GPU, with three 1-GPU lease pods.  The tie-break must
+        # follow the shrinking spare capacity so both bookings are used;
+        # comparing the untouched `available` packed the larger one every time.
+        state = _state(
+            _lease(100),
+            _open_booking(200, gpu_count=4),
+            _open_booking(201, gpu_count=2),
+        )
+        pods = [_view(f"p{i}", reservation_id=100) for i in range(3)]
+
+        plan = state.plan_ondemand_merges(pods, NOW)
+
+        assert len(plan) == 3
+        assert {target.id for _, target in plan} == {200, 201}
+
 
 # ---------------------------------------------------------------------------
 # Async orchestrator: main._merge_ondemand_into_bookings / _drain_pending_merge_cancels

@@ -64,7 +64,7 @@ app/
 | `pod_watch_loop` | continuous (WATCH resumed by `resourceVersion`; LIST at start and every ~10 min resync) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease; **fast-path**: applies toleration immediately when a new pod arrives inside an open window.  Each event is handled under its own try/except, so one bad event cannot kill the consumer |
 | `queue_processor_loop` | every `QUEUE_PROCESSOR_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
 | `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee, only when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**) |
-| `capacity_audit_loop` | every `CAPACITY_CHECK_INTERVAL` s (default 3600) | Compares app-side per-class GPU capacity (`total_gpus`) against physical cluster capacity; logs any difference as a WARNING and pauses on-demand admission for over-committed classes (see **App-side vs physical capacity reconciliation**) |
+| `capacity_audit_loop` | every `CAPACITY_CHECK_INTERVAL` s (default 3600) | Compares app-side per-class GPU capacity (`effective_gpus_today`) against physical cluster capacity; logs any difference as a WARNING and pauses on-demand admission for over-committed classes (see **App-side vs physical capacity reconciliation**) |
 | `lease_guard_loop` | every 20 s (only when `SINGLETON_LEASE_ENABLED`) | Renews the singleton `coordination.k8s.io` Lease; terminates the process if another live instance takes it (see **Singleton lease guard**) |
 
 Every task is **supervised**: `_on_task_done` records an unhandled exception in
@@ -656,8 +656,18 @@ two-step **preflight → delegate → grant** pipeline.
 - **Grant** (`_grant_and_admit`, per granted pod): calls `POST /api/reservations`
   with `on_demand=True` (the app relaxes policy limits — SU, caps, minimum
   duration — never physical calendar capacity), **idempotent by the pod's UID**
-  (`idempotency_key`).  A **denial** (409 / error → `None`) cools the candidate
-  down 2–5 min.  On **grant** the lease is upserted into `state.reservations`
+  (`idempotency_key`).  The client returns a `LeaseAttempt` carrying the HTTP
+  status, because the two non-grant cases need different handling: a **409**
+  (the app's documented "infeasible right now") or a network/5xx failure is
+  routine, logs `lease.denied` at INFO, and cools the candidate down 2–5 min;
+  any **other 4xx** — a `read_only` service key, a schema mismatch after an app
+  upgrade, an unknown `group_name` — is a fault waiting cannot fix, so it logs
+  `lease.error` at **WARNING** with the response body and backs off
+  exponentially to `ERROR_RETRY_CAP_SECONDS` (30 min) via
+  `OnDemandCandidate.lease_error_count`, reset on any grant or routine denial.
+  Collapsing the two was how a misconfigured deployment retried every 2–5 min
+  per pending pod indefinitely while logging only below WARNING.
+  On **grant** the lease is upserted into `state.reservations`
   (`apply_push_to_active`) and the pod is admitted immediately
   (`_try_apply_toleration`) — the existing admission path, so it stamps
   `res-<id>`, records the guarantee, and emits `RuntimeGuaranteed`.  **If
@@ -717,12 +727,23 @@ existing pod-patch path); `ONDEMAND_HORIZON_MINUTES` and
 The controller derives physical GPU capacity solely from Kubernetes node taints
 (`snapshot_node_gpu_capacity` — total allocatable `nvidia.com/gpu` per
 `gpu-class-reservation` taint value).  The reservation app has its **own**
-per-class GPU count, `total_gpus` (RESERVATION-API.md §4), now modelled on
-`schemas.GpuClassDetail` and cached per label in
+per-class GPU count, modelled on `schemas.GpuClassDetail` and cached per label in
 `ControllerState.gpu_class_capacity` — refreshed on every reconcile from the
-same `GET /api/gpu-classes` fetch that builds the label maps (only classes whose
-`total_gpus` is known are recorded; a payload omitting it degrades to
-"unknown").
+same `GET /api/gpu-classes` fetch that builds the label maps.
+
+**Which of the app's two counts to audit against.**  The app publishes both
+`total_gpus` (the class's configured default) and `effective_gpus_today` (that
+default after any date-span capacity override covering today) —
+RESERVATION-API.md §4.  The audit reads **`effective_gpus_today`**, because that
+is the number the app actually admits against; `total_gpus` is a figure nobody
+is enforcing while an override is in force.  Auditing the default instead was
+wrong in both directions: an override that lowers a class to match a genuine
+node drain read as a mismatch and **paused JIT admission via guard 4** for a
+class that was not over-committed, while an override *raising* a class above its
+default hid a real over-commit entirely.  `GpuClassDetail.audit_gpus` is the
+single accessor, falling back to `total_gpus` when the app publishes no
+effective count (an older app audits exactly as before).  Only classes whose
+count is known are recorded; a payload omitting both degrades to "unknown".
 
 `capacity_audit_loop` (`_run_capacity_audit` in `main.py`) runs every
 `CAPACITY_CHECK_INTERVAL` s (default hourly, plus once synchronously at
@@ -996,7 +1017,7 @@ the claimed set and the grace re-arm path above applies.
 | `ONDEMAND_LEASE_ENABLED` | `true` | Set to `false` to disable the JIT on-demand lease path entirely (a non-JIT-eligible pod still waits for a matching reservation; an ineligible one is left Pending) |
 | `ONDEMAND_HORIZON_MINUTES` | `30` | JIT routing horizon: a pod is queued for a reservation that opens within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | `10` | Minutes added to a pod's `horae/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
-| `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch (`POST /api/reservations/ondemand-admission`) for LAS prioritization; `false` (or any app-call failure) grants every eligible candidate — the prior greedy per-pod behaviour. Opt-in: enable once the app implements the endpoint |
+| `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch (`POST /api/reservations/ondemand-admission`) for LAS prioritization; `false` (or any app-call failure) grants every eligible candidate — the prior greedy per-pod behaviour. The app endpoint **is shipped**, but its selection is currently grant-all, so turning this on changes nothing yet; enable it once the app carries real admission policy |
 | `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
 | `NOSHOW_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared |
 | `QUEUE_PROCESSOR_INTERVAL` | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST |
@@ -1022,6 +1043,20 @@ the claimed set and the grace re-arm path above applies.
 
 Runtime configuration is through environment variables only — no config files,
 no database, no secrets embedded in the image.
+
+**Parsing is tolerant, in both vocabularies.**  `_env_bool` takes a recognised
+truthy/falsy word and falls back to the default on anything else; `_env_int` does
+the same for numbers, rejecting junk *and* out-of-range values rather than
+raising or accepting them.  A rejected value logs `config.invalid` at WARNING
+naming the variable, so an operator who set something and saw no effect can find
+out why.  Both mirror the reservation app's `config_utils` (`env_bool` /
+`_env_positive_float`) — keep the two repos in step.
+
+Numeric **floors are per-setting, not uniform**: an interval of `0` is a busy
+loop against the Kubernetes API and is rejected, while a lead/grace/horizon of
+`0` legitimately means "disabled" and is honoured.  `HTTP_PORT` additionally
+caps at 65535.  `tests/test_config_env.py` asserts the whole matrix and fails the
+build if a new numeric setting is added with a bare `int()`.
 
 ---
 

@@ -171,6 +171,30 @@ class TestFindOpenBookingFor:
         )
         assert got is None
 
+    def test_tie_break_subtracts_extra_used(self):
+        # Both windows end at the same instant, so the tie-break decides.  The
+        # bigger booking (8 GPUs) has already had 5 tentatively assigned this
+        # pass, leaving 3; the smaller one (4 GPUs) is untouched.  The tie-break
+        # must compare 3 vs 4 — the same quantity the filter uses — not the
+        # untouched `available` (8 vs 4), which never moves during a pass.
+        big = _open_booking(200, start_utc=THREE_PM, end_utc=FIVE_PM, gpu_count=8)
+        small = _open_booking(201, start_utc=THREE_PM, end_utc=FIVE_PM, gpu_count=4)
+        state = _state(big, small)
+        got = state.find_open_booking_for(
+            USERNAME, GPU_CLASS_LABEL, NOW, 1, extra_used={200: 5}
+        )
+        assert got is not None and got.id == 201
+
+    def test_tie_break_is_deterministic_not_list_order(self):
+        # Equal end *and* equal spare: resolved by id, so the answer does not
+        # depend on the order `state.reservations` happens to be in.
+        a = _open_booking(200, start_utc=THREE_PM, end_utc=FIVE_PM, gpu_count=2)
+        b = _open_booking(201, start_utc=THREE_PM, end_utc=FIVE_PM, gpu_count=2)
+        forward = _state(a, b).find_open_booking_for(USERNAME, GPU_CLASS_LABEL, NOW, 1)
+        reverse = _state(b, a).find_open_booking_for(USERNAME, GPU_CLASS_LABEL, NOW, 1)
+        assert forward is not None and reverse is not None
+        assert forward.id == reverse.id
+
 
 # ---------------------------------------------------------------------------
 # plan_pod_adoptions
@@ -233,6 +257,27 @@ class TestPlanPodAdoptions:
         plan = state.plan_pod_adoptions([p1, p2], NOW)
         # Only one GPU of budget on the new booking → only one pod adopted.
         assert len(plan) == 1
+
+    def test_pass_spreads_across_bookings_rather_than_packing_the_largest(self):
+        # Two windows ending at the same instant, so the tie-break decides every
+        # pick: a 4-GPU booking and a 2-GPU one, with three 1-GPU overstay pods.
+        # Following the shrinking spare capacity puts pods on both.  Comparing
+        # the untouched `available` — constant across the pass — made the larger
+        # booking win every time, so the smaller one was never used at all.
+        old = _old_booking(100)
+        larger = _open_booking(
+            200, start_utc=THREE_PM + timedelta(minutes=10), end_utc=FIVE_PM, gpu_count=4
+        )
+        smaller = _open_booking(
+            201, start_utc=THREE_PM + timedelta(minutes=10), end_utc=FIVE_PM, gpu_count=2
+        )
+        state = _state(old, larger, smaller)
+        pods = [_view(f"p{i}", reservation_id=100, gpu_count=1) for i in range(3)]
+
+        plan = state.plan_pod_adoptions(pods, NOW)
+
+        assert len(plan) == 3
+        assert {target.id for _, target in plan} == {200, 201}
 
     def test_terminating_pod_skipped(self):
         old = _old_booking(100)
