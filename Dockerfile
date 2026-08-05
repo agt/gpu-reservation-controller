@@ -39,7 +39,19 @@ COPY OBSERVABILITY.md .
 # kept byte-identical with the sibling repo, so scripts/ is a test input too.
 # (All four artifacts themselves are already covered by app/ and docs/ above.)
 COPY scripts/ ./scripts/
+# tests/test_chart_image.py parses the chart and the workflow (helm is not a test
+# dependency, so it checks the values rather than rendering them), which makes
+# both deployment config a test input.  Nothing is copied out of this stage, so
+# they never reach the runtime image.
+COPY helm/ ./helm/
+COPY .github/ ./.github/
+# tests/test_docker_test_stage.py reads this file to check the COPY list below
+# against what the suite actually opens.
+COPY Dockerfile .
 
+# tests/test_docker_test_stage.py guards the list above: a test that reads a
+# repo-root path this stage does not COPY passes locally and errors here, where
+# the file simply is not present.
 RUN pytest --tb=short -q
 
 
