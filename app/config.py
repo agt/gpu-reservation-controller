@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from typing import Optional
+
+from .log_fields import kv
+
+log = logging.getLogger(__name__)
 
 # Boolean env-var vocabulary, shared with the reservation app's
 # ``config_utils`` (keep the two in step): a recognised truthy/falsy word wins,
@@ -30,6 +35,51 @@ def _env_bool(name: str, default: bool) -> bool:
     if value in _FALSY:
         return False
     return default
+
+
+def _env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int = 1,
+    maximum: Optional[int] = None,
+) -> int:
+    """Read an integer environment variable, falling back on junk or out-of-range.
+
+    The numeric settings used to be parsed with a bare ``int()``, which is the
+    opposite posture to ``_env_bool`` above: junk raised ``ValueError`` at
+    startup, and — worse — a ``0`` or a negative was accepted silently.  A
+    ``PREEMPTION_CHECK_INTERVAL`` or ``QUEUE_PROCESSOR_INTERVAL`` of ``0`` is a
+    busy loop hammering the Kubernetes API, which is a far worse outcome than
+    ignoring the value.
+
+    This mirrors the reservation app's ``config_utils._env_positive_float`` —
+    "the ``env_bool`` tolerance posture, applied to numbers" — and keeps the two
+    repos' vocabularies in step.  *minimum* is per-setting rather than uniform:
+    a zero interval is a busy loop, but a zero grace/lead genuinely means "no
+    grace", so only the settings where zero is meaningless floor at 1.
+
+    A rejected value logs at WARNING naming the variable, because an operator
+    who set it and saw no effect needs to know it was ignored.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("%s", kv(
+            event="config.invalid", name=name, value=raw,
+            reason="not_an_integer", detail=f"using default {default}",
+        ))
+        return default
+    if value < minimum or (maximum is not None and value > maximum):
+        log.warning("%s", kv(
+            event="config.invalid", name=name, value=value,
+            reason="out_of_range", detail=f"using default {default}",
+        ))
+        return default
+    return value
 
 
 @dataclass(frozen=True)
@@ -77,41 +127,30 @@ class Config:
                 "RESERVATION_API_KEY environment variable is required"
             )
 
+        # Floors are per-setting on purpose.  An interval of 0 is a busy loop,
+        # so those floor at 1; a lead/grace/horizon of 0 is a meaningful "off",
+        # so those floor at 0 and only reject negatives.
         return cls(
             reservation_api_url=url,
             reservation_api_key=key,
-            reservation_fetch_interval=int(
-                os.environ.get("RESERVATION_FETCH_INTERVAL", "300")
-            ),
-            reservation_lookahead_days=int(
-                os.environ.get("RESERVATION_LOOKAHEAD_DAYS", "7")
-            ),
+            reservation_fetch_interval=_env_int("RESERVATION_FETCH_INTERVAL", 300),
+            reservation_lookahead_days=_env_int("RESERVATION_LOOKAHEAD_DAYS", 7),
             kubeconfig_path=os.environ.get("KUBECONFIG") or None,
-            http_port=int(os.environ.get("HTTP_PORT", "8000")),
+            http_port=_env_int("HTTP_PORT", 8000, maximum=65535),
             ondemand_lease_enabled=_env_bool("ONDEMAND_LEASE_ENABLED", True),
-            noshow_timeout_minutes=int(
-                os.environ.get("NOSHOW_TIMEOUT_MINUTES", "15")
-            ),
-            noshow_grace_minutes=int(
-                os.environ.get("NOSHOW_GRACE_MINUTES", "30")
-            ),
-            queue_processor_interval=int(
-                os.environ.get("QUEUE_PROCESSOR_INTERVAL", "300")
-            ),
+            noshow_timeout_minutes=_env_int("NOSHOW_TIMEOUT_MINUTES", 15, minimum=0),
+            noshow_grace_minutes=_env_int("NOSHOW_GRACE_MINUTES", 30, minimum=0),
+            queue_processor_interval=_env_int("QUEUE_PROCESSOR_INTERVAL", 300),
             scheduling_gate_name=os.environ.get("POD_SCHEDULING_GATE_NAME") or None,
             required_group_label=os.environ.get("REQUIRED_GROUP_LABEL") or None,
             inbound_api_token=os.environ.get("INBOUND_API_TOKEN") or None,
-            preemption_lead_minutes=int(
-                os.environ.get("PREEMPTION_LEAD_MINUTES", "15")
-            ),
-            preemption_check_interval=int(
-                os.environ.get("PREEMPTION_CHECK_INTERVAL", "60")
-            ),
+            preemption_lead_minutes=_env_int("PREEMPTION_LEAD_MINUTES", 15, minimum=0),
+            preemption_check_interval=_env_int("PREEMPTION_CHECK_INTERVAL", 60),
             pod_adoption_enabled=_env_bool("POD_ADOPTION_ENABLED", True),
             ondemand_merge_enabled=_env_bool("ONDEMAND_MERGE_ENABLED", True),
             termination_warning_enabled=_env_bool("TERMINATION_WARNING_ENABLED", True),
-            termination_warning_lead_minutes=int(
-                os.environ.get("TERMINATION_WARNING_LEAD_MINUTES", "30")
+            termination_warning_lead_minutes=_env_int(
+                "TERMINATION_WARNING_LEAD_MINUTES", 30, minimum=0
             ),
             preemption_delegate_selection=_env_bool(
                 "PREEMPTION_DELEGATE_SELECTION", True
@@ -119,15 +158,13 @@ class Config:
             ondemand_delegate_admission=_env_bool(
                 "ONDEMAND_DELEGATE_ADMISSION", False
             ),
-            ondemand_horizon_minutes=int(
-                os.environ.get("ONDEMAND_HORIZON_MINUTES", "30")
+            ondemand_horizon_minutes=_env_int(
+                "ONDEMAND_HORIZON_MINUTES", 30, minimum=0
             ),
-            ondemand_lease_buffer_minutes=int(
-                os.environ.get("ONDEMAND_LEASE_BUFFER_MINUTES", "10")
+            ondemand_lease_buffer_minutes=_env_int(
+                "ONDEMAND_LEASE_BUFFER_MINUTES", 10, minimum=0
             ),
-            capacity_check_interval=int(
-                os.environ.get("CAPACITY_CHECK_INTERVAL", "3600")
-            ),
+            capacity_check_interval=_env_int("CAPACITY_CHECK_INTERVAL", 3600),
             overstay_report_enabled=_env_bool("OVERSTAY_REPORT_ENABLED", False),
             singleton_lease_enabled=_env_bool("SINGLETON_LEASE_ENABLED", True),
             # POD_NAME comes from the downward API in-cluster; HOSTNAME is the

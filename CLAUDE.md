@@ -1044,6 +1044,20 @@ the claimed set and the grace re-arm path above applies.
 Runtime configuration is through environment variables only — no config files,
 no database, no secrets embedded in the image.
 
+**Parsing is tolerant, in both vocabularies.**  `_env_bool` takes a recognised
+truthy/falsy word and falls back to the default on anything else; `_env_int` does
+the same for numbers, rejecting junk *and* out-of-range values rather than
+raising or accepting them.  A rejected value logs `config.invalid` at WARNING
+naming the variable, so an operator who set something and saw no effect can find
+out why.  Both mirror the reservation app's `config_utils` (`env_bool` /
+`_env_positive_float`) — keep the two repos in step.
+
+Numeric **floors are per-setting, not uniform**: an interval of `0` is a busy
+loop against the Kubernetes API and is rejected, while a lead/grace/horizon of
+`0` legitimately means "disabled" and is honoured.  `HTTP_PORT` additionally
+caps at 65535.  `tests/test_config_env.py` asserts the whole matrix and fails the
+build if a new numeric setting is added with a bare `int()`.
+
 ---
 
 ## Deployment

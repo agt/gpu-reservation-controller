@@ -79,6 +79,7 @@ pod UID, so `event=reservation.lease_created … poduid=X` in the app and
 
 | Level | `event=` | Fields | Notes |
 |---|---|---|---|
+| WARNING | `config.invalid` | `name value reason detail` | An environment variable was junk or out of range and the **default was used instead** (`reason=not_an_integer` \| `out_of_range`). Emitted from `Config.from_env`, so it precedes every other line. |
 | INFO | `startup.initial_fetch` | — | Synchronous first fetch, before the loops launch. |
 | INFO | `startup.initial_fetch_complete` | `reservations classes` | |
 | INFO | `startup.noshow_armed` | `watched` | No-show deadlines armed. |
