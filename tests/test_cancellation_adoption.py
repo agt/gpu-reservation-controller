@@ -110,6 +110,19 @@ def _install_stubs(monkeypatch, m, snapshot):
     return deleted, cancelled_events, patched_refs
 
 
+def _run_cancellations(m, state, config, cancelled, now):
+    """Plan under the lock, execute outside it — the shape the reconcile uses."""
+    async def _go():
+        snapshot = await m._snapshot_pods_for_eviction(config)
+        async with state.reservation_lock:
+            evictions = await m._plan_cancelled_reservations(
+                state, config, cancelled, now, snapshot
+            )
+        await m._execute_evictions(state, evictions)
+
+    asyncio.run(_go())
+
+
 class TestAdoptBeforeEvict:
     def test_superseded_pod_relinks_to_replacement_booking(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -123,10 +136,7 @@ class TestAdoptBeforeEvict:
         state.reservations = [_replacement_booking(2)]
         state.record_placement(1, "uid-1", 1)
 
-        run_locked(
-            state,
-            m._handle_cancelled_reservations(state, _config(), [_cancelled_source(1)], NOW),
-        )
+        _run_cancellations(m, state, _config(), [_cancelled_source(1)], NOW)
 
         assert patched_refs == [("pod-uid-1", "res-2")]  # re-linked, not evicted
         assert deleted == []
@@ -143,11 +153,8 @@ class TestAdoptBeforeEvict:
         state.reservations = [_replacement_booking(2)]
         state.record_placement(1, "uid-1", 1)
 
-        run_locked(
-            state,
-            m._handle_cancelled_reservations(
-                state, _config(pod_adoption_enabled=False), [_cancelled_source(1)], NOW
-            ),
+        _run_cancellations(
+            m, state, _config(pod_adoption_enabled=False), [_cancelled_source(1)], NOW
         )
 
         assert patched_refs == []
@@ -163,10 +170,7 @@ class TestAdoptBeforeEvict:
         state.reservations = []  # nothing to adopt into
         state.record_placement(1, "uid-1", 1)
 
-        run_locked(
-            state,
-            m._handle_cancelled_reservations(state, _config(), [_cancelled_source(1)], NOW),
-        )
+        _run_cancellations(m, state, _config(), [_cancelled_source(1)], NOW)
 
         assert patched_refs == []
         assert deleted == [("pod-uid-1", USERNAME)]
@@ -182,10 +186,7 @@ class TestAdoptBeforeEvict:
         state.reservations = [_replacement_booking(2, gpu_count=1)]
         state.record_placement(1, "uid-1", 2)
 
-        run_locked(
-            state,
-            m._handle_cancelled_reservations(state, _config(), [_cancelled_source(1)], NOW),
-        )
+        _run_cancellations(m, state, _config(), [_cancelled_source(1)], NOW)
 
         assert patched_refs == []
         assert deleted == [("pod-uid-1", USERNAME)]
@@ -225,9 +226,10 @@ class TestSnapshotCarriesTheGroupLabel:
             return []
 
         monkeypatch.setattr(m, "snapshot_tolerated_pods", _snapshot)
-        # Both handlers require the lock, so drive them the way their real
-        # caller does.
-        run_locked(state, build_handler(m))
+        # The snapshot is now taken once by the shared helper, before either
+        # planner runs — but it must still carry the group label, which is the
+        # property this whole class exists to pin.
+        asyncio.run(build_handler(m))
         return seen
 
     def test_cancellation_path_passes_it(self, monkeypatch):
@@ -236,7 +238,7 @@ class TestSnapshotCarriesTheGroupLabel:
         seen = self._capture(
             monkeypatch,
             state,
-            lambda m: m._handle_cancelled_reservations(state, config, [], NOW),
+            lambda m: m._snapshot_pods_for_eviction(config),
         )
         assert seen["group_label_key"] == "dsmlp/course"
 
@@ -246,7 +248,7 @@ class TestSnapshotCarriesTheGroupLabel:
         seen = self._capture(
             monkeypatch,
             state,
-            lambda m: m._handle_owner_changes(state, config, []),
+            lambda m: m._snapshot_pods_for_eviction(config),
         )
         assert seen["group_label_key"] == "dsmlp/course"
 
@@ -256,6 +258,6 @@ class TestSnapshotCarriesTheGroupLabel:
         seen = self._capture(
             monkeypatch,
             state,
-            lambda m: m._handle_cancelled_reservations(state, _config(), [], NOW),
+            lambda m: m._snapshot_pods_for_eviction(_config()),
         )
         assert seen["group_label_key"] is None

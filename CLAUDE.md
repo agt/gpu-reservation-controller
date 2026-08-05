@@ -859,10 +859,29 @@ source of truth.
   which touches no shared state) and take the lock only for
   `detect → detect → preserve → replace`, which is synchronous — so a push no
   longer queues behind a fetch cycle's HTTP, which was the endpoint's entire
-  reason to exist. Keep that split: the critical section must stay one
-  uninterrupted acquisition (two would re-open the
-  `preserve_local_ondemand_leases` clobber it exists to prevent), and it must
-  stay await-free on the no-eviction path.
+  reason to exist. Evictions are likewise **planned** under the lock
+  (`_plan_cancelled_reservations` / `_plan_owner_changes`, sharing one pod
+  snapshot) and **executed** outside it (`_execute_evictions`), so per-pod
+  Kubernetes I/O never serialises against a push.
+
+  Three ordering invariants make that split safe, and all three are load-bearing:
+  **detect before replace** (the detectors compare against the old set, which is
+  what makes eviction idempotent across cycles), **replace before adopt**
+  (`find_open_booking_for` must see a replacement booking pushed alongside its
+  `superseded` source, or the Continue flow kills the job it was carrying
+  forward), and **adopt before evict**. The critical section must also stay one
+  uninterrupted acquisition — two would re-open the
+  `preserve_local_ondemand_leases` clobber it exists to prevent.
+
+  **Not yet await-free on the eviction path.** Planning still awaits the pod
+  snapshot and `_adopt_pods`' per-pod patches. The no-eviction path — the
+  overwhelming majority of cycles, since both handlers are conditional — is
+  fully synchronous, which is where the latency win comes from. Lifting
+  adoption's I/O out is open follow-up work, as is the six remaining lock sites
+  that hold across their own cancel HTTP (`_grant_and_admit`,
+  `_teardown_ondemand_lease`, `_cancel_pending_noshows`,
+  `_drain_pending_merge_cancels`, the queue tick's merge/adopt block, and
+  `_run_preemption_sweep`).
 - **RBAC**: unchanged — eviction reuses the existing `pods: delete` /
   `events: create` permissions.
 

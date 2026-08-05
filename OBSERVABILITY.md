@@ -276,7 +276,7 @@ were deliberately given different keys.
 | INFO | `cancel.pods_relinked` | `rid count` | Adoption rescued pods instead of evicting them. |
 | INFO | `cancel.evicting` | `rid count detail` | |
 | INFO | `owner_change.evicting` | `rid count detail old.user` | Reservation reassigned to a teammate. |
-| WARNING | `cancel.snapshot_failed` / `owner_change.snapshot_failed` | `target err` | Eviction skipped this cycle. |
+| WARNING | `evict.snapshot_failed` | `target err` | The single pod snapshot both eviction planners share failed; eviction skipped this cycle. Replaces the former per-handler cancel/owner-change snapshot events — the two handlers now share one LIST. |
 | WARNING | `k8s.event_failed` | `ns pod reason err` | Best-effort; deletion still attempted. |
 | WARNING | `pod.delete_failed` | `ns pod err` | |
 

@@ -39,7 +39,7 @@ import socket
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator, NamedTuple, Optional
+from typing import AsyncIterator, Callable, NamedTuple, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -382,7 +382,7 @@ async def _reconcile_after_reservation_change(
     owner_changes: list[tuple[ReservationResponse, str]],
     now: datetime,
     gpu_class_maps: GpuClassMaps,
-) -> None:
+) -> list[_PodEviction]:
     """Apply a new active reservation set and run the reconciliation tail.
 
     Shared by the periodic fetch loop (which supplies a full snapshot) and the
@@ -414,16 +414,30 @@ async def _reconcile_after_reservation_change(
     # Occupancy is rebuilt from a live cluster snapshot each queue-processor
     # tick (reconcile_occupancy), so no reservation-driven prune is needed here.
 
-    # Handle mid-window cancellations: re-link each admitted pod onto another
-    # open booking its user holds where possible (the Continue/supersede flow),
+    if not (cancelled_in_window or owner_changes):
+        # The common case: nothing to evict, so the whole critical section was
+        # the synchronous block above.
+        return []
+
+    # One snapshot serves both planners, taken lazily — we only know whether it
+    # is needed after detection, and detection happens under the lock.
+    pod_snapshot = await _snapshot_pods_for_eviction(config)
+
+    evictions: list[_PodEviction] = []
+    # Mid-window cancellations: re-link each admitted pod onto another open
+    # booking its user holds where possible (the Continue/supersede flow),
     # evicting only the pods with nowhere to go.
     if cancelled_in_window:
-        await _handle_cancelled_reservations(state, config, cancelled_in_window, now)
+        evictions += await _plan_cancelled_reservations(
+            state, config, cancelled_in_window, now, pod_snapshot
+        )
 
-    # Handle owner changes (adoption): evict the prior owner's admitted pod so
-    # the new owner can claim the still-active reservation.
+    # Owner changes (adoption): evict the prior owner's admitted pod so the new
+    # owner can claim the still-active reservation.
     if owner_changes:
-        await _handle_owner_changes(state, config, owner_changes)
+        evictions += _plan_owner_changes(state, owner_changes, pod_snapshot)
+
+    return evictions
 
 
 async def _refresh_reservations(
@@ -472,7 +486,7 @@ async def _refresh_reservations(
                 event="lease.preserved", count=len(preserved),
                 ids=[r.id for r in preserved], reason="absent_from_fetch_snapshot",
             ))
-        await _reconcile_after_reservation_change(
+        evictions = await _reconcile_after_reservation_change(
             state,
             client,
             config,
@@ -483,23 +497,65 @@ async def _refresh_reservations(
             gpu_class_maps,
         )
 
+    # Deleting pods is per-pod Kubernetes I/O over shared-state-free data, so it
+    # runs with the lock released.
+    await _execute_evictions(state, evictions)
+
 
 # ---------------------------------------------------------------------------
-# Cancellation handler
+# Cancellation and owner-change handlers
+#
+# Each is split "plan under the lock / execute outside it".  The planning half
+# reads the merged reservation set and re-homes occupancy, so it must be atomic
+# with the replace; the execution half is per-pod Kubernetes I/O that reads no
+# shared state, and holding the lock across it made every eviction a serialising
+# event for the push endpoint.
 # ---------------------------------------------------------------------------
 
 
-async def _handle_cancelled_reservations(
+class _PodEviction(NamedTuple):
+    """One pod to evict, and everything the execution half needs to do it."""
+
+    pod: "ToleratedPodInfo"
+    reason: str            # human-readable, rendered into the Kubernetes event
+    event_reason: str      # the event's `reason` field, for failure logging
+    emit: Callable         # emit_reservation_{cancelled,reassigned}_event
+
+
+async def _snapshot_pods_for_eviction(config: Config) -> list:
+    """One tolerated-pod snapshot, shared by both eviction planners.
+
+    Taken lazily — only when a reconcile actually has something to evict.  A
+    speculative LIST on every push would add latency to exactly the path this
+    change exists to make fast.
+
+    required_group_label must be passed: without it every ToleratedPodInfo
+    carries group_label=None, `_group_ok` then rejects every reservation while
+    the feature is enabled, and the adoption re-link can never find a booking to
+    carry the pod onto.
+    """
+    try:
+        return await snapshot_tolerated_pods(TOLERATION_KEY, config.required_group_label)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "%s", kv(event="evict.snapshot_failed", target="pods", err=exc),
+            exc_info=True,
+        )
+        return []
+
+
+async def _plan_cancelled_reservations(
     state: ControllerState,
     config: Config,
     cancelled_in_window: list[ReservationResponse],
     now: datetime,
-) -> None:
-    """Re-link or evict pods admitted under cancelled reservations.
+    pod_snapshot: list,
+) -> list[_PodEviction]:
+    """Re-link what can be rescued; return what still has to be evicted.
 
     For each in-window cancelled reservation (already carrying canceller info
     from the ``status=all`` fetch):
-    1. Snapshot live tolerated pods and filter those admitted under this reservation.
+    1. Filter the snapshot to pods admitted under this reservation.
     2. **Adoption first** (``POD_ADOPTION_ENABLED``): a cancelled reservation's
        pod is by definition past its guarantee, so ``_adopt_pods`` re-links it
        onto another currently-open booking its user holds with spare budget —
@@ -510,30 +566,18 @@ async def _handle_cancelled_reservations(
        the eviction race.  The caller has already replaced
        ``state.reservations`` with the merged set, so the follow-on booking is
        visible to ``find_open_booking_for``.
-    3. Emit a ReservationCancelled event on each pod still unclaimed, then
-       delete it.
+    3. Everything not rescued is returned for the caller to evict once the lock
+       is released.
 
     The caller must hold ``state.reservation_lock``: step 2 reads the merged
     ``state.reservations`` and mutates occupancy, so a concurrent fetch's
     wholesale replace landing mid-adoption would re-link a pod onto a booking
-    that is no longer in the set.
+    that is no longer in the set.  This half is therefore *not* await-free —
+    ``_adopt_pods`` patches each rescued pod — which is why lifting adoption's
+    I/O is named as follow-up work rather than claimed as done.
     """
-    state.require_reservation_lock("_handle_cancelled_reservations")
-    # One pod snapshot serves the whole batch.
-    pod_snapshot = []
-    try:
-        # required_group_label must be passed: without it every ToleratedPodInfo
-        # carries group_label=None, `_group_ok` then rejects every reservation
-        # while the feature is enabled, and the adoption re-link below can never
-        # find a booking to carry the pod onto.
-        pod_snapshot = await snapshot_tolerated_pods(
-            TOLERATION_KEY, config.required_group_label
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "%s", kv(event="cancel.snapshot_failed", target="pods", err=exc),
-            exc_info=True,
-        )
+    state.require_reservation_lock("_plan_cancelled_reservations")
+    evictions: list[_PodEviction] = []
 
     for cancelled_res in cancelled_in_window:
         cancelled_by_desc = canceller_description(cancelled_res)
@@ -558,69 +602,44 @@ async def _handle_cancelled_reservations(
                 event="cancel.evicting", rid=cancelled_res.id,
                 count=len(pods_for_res), detail=cancelled_by_desc,
             ))
-        for pod_info in pods_for_res:
-            # Emit event before deletion so the event record survives.
-            try:
-                pod_obj = await read_pod(pod_info.name, pod_info.namespace)
-                await emit_reservation_cancelled_event(
-                    pod_obj, pod_info.name, pod_info.namespace, cancelled_by_desc
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warning("%s", kv(
-                    event="k8s.event_failed", ns=pod_info.namespace, pod=pod_info.name,
-                    reason="ReservationCancelled", err=exc,
-                ))
-            try:
-                await delete_pod(pod_info.name, pod_info.namespace)
-                state.release_pod(pod_info.uid)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("%s", kv(
-                    event="pod.delete_failed", ns=pod_info.namespace,
-                    pod=pod_info.name, err=exc,
-                ))
+        evictions.extend(
+            _PodEviction(
+                pod=pod_info,
+                reason=cancelled_by_desc,
+                event_reason="ReservationCancelled",
+                emit=emit_reservation_cancelled_event,
+            )
+            for pod_info in pods_for_res
+        )
+
+    return evictions
 
 
-async def _handle_owner_changes(
+def _plan_owner_changes(
     state: ControllerState,
-    config: Config,
     owner_changes: list[tuple[ReservationResponse, str]],
-) -> None:
-    """Evict the prior owner's admitted pod for each reassigned reservation.
+    pod_snapshot: list,
+) -> list[_PodEviction]:
+    """Return the prior owner's admitted pods for each reassigned reservation.
 
     For each in-progress reservation whose owner changed (adoption), the pod
     already admitted under it lives in the *prior* owner's namespace and can no
-    longer be legitimately matched to the reservation.  For each such change:
-    1. Snapshot live tolerated pods and filter those admitted under this
-       reservation id **in the prior owner's namespace** (the ``namespace ==
-       prior_username`` guard ensures a pod the new owner may already have had
-       admitted is never touched).
-    2. Emit a ReservationReassigned event on each pod, then delete it.
-    3. Release its capacity so the new owner's pod can be admitted under the same
-       still-active reservation on a subsequent tick / watch event.
+    longer be legitimately matched to the reservation.  Pods are filtered by
+    reservation id **and** the prior owner's namespace (the ``namespace ==
+    prior_username`` guard ensures a pod the new owner may already have had
+    admitted is never touched), then handed back for the caller to evict once
+    the lock is released.
 
     Unlike cancellation, the reservation stays active; it simply changes hands.
 
     The caller must hold ``state.reservation_lock``.  Unlike its cancellation
-    sibling this helper reads ``state.reservations`` not at all — its only state
-    contact is ``release_pod``, a synchronous occupancy edit keyed by pod uid —
-    so the requirement is a **consistency choice**, not a data dependency: it
+    sibling this planner reads ``state.reservations`` not at all and is entirely
+    pure — the requirement is a **consistency choice**, not a data dependency: it
     runs as one step of a reconcile that must appear atomic, and a caller that
     could reach it without the lock would be a caller in the wrong place.
     """
-    state.require_reservation_lock("_handle_owner_changes")
-    # One pod snapshot serves the whole batch.
-    pod_snapshot = []
-    try:
-        # See _handle_cancelled_reservations: the group label must be captured
-        # or every pod view fails the REQUIRED_GROUP_LABEL match.
-        pod_snapshot = await snapshot_tolerated_pods(
-            TOLERATION_KEY, config.required_group_label
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "%s", kv(event="owner_change.snapshot_failed", target="pods", err=exc),
-            exc_info=True,
-        )
+    state.require_reservation_lock("_plan_owner_changes")
+    evictions: list[_PodEviction] = []
 
     for res, prior_username in owner_changes:
         new_owner = res.user.username if res.user else "another user"
@@ -636,26 +655,54 @@ async def _handle_owner_changes(
                 event="owner_change.evicting", rid=res.id, count=len(pods_for_res),
                 detail=new_owner_desc, **{"old.user": prior_username},
             ))
-        for pod_info in pods_for_res:
-            # Emit event before deletion so the event record survives.
-            try:
-                pod_obj = await read_pod(pod_info.name, pod_info.namespace)
-                await emit_reservation_reassigned_event(
-                    pod_obj, pod_info.name, pod_info.namespace, new_owner_desc
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warning("%s", kv(
-                    event="k8s.event_failed", ns=pod_info.namespace, pod=pod_info.name,
-                    reason="ReservationReassigned", err=exc,
-                ))
-            try:
-                await delete_pod(pod_info.name, pod_info.namespace)
-                state.release_pod(pod_info.uid)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("%s", kv(
-                    event="pod.delete_failed", ns=pod_info.namespace,
-                    pod=pod_info.name, err=exc,
-                ))
+        evictions.extend(
+            _PodEviction(
+                pod=pod_info,
+                reason=new_owner_desc,
+                event_reason="ReservationReassigned",
+                emit=emit_reservation_reassigned_event,
+            )
+            for pod_info in pods_for_res
+        )
+
+    return evictions
+
+
+async def _execute_evictions(
+    state: ControllerState, evictions: list[_PodEviction]
+) -> None:
+    """Emit an event on each doomed pod and delete it — **outside** the lock.
+
+    Reads no shared state.  ``release_pod`` is a synchronous occupancy edit
+    keyed by pod uid, and occupancy is rebuilt wholesale from a live cluster
+    snapshot every queue-processor tick, so a release lost to a crash here
+    self-heals within one tick.
+
+    Deliberately keeps ``release_pod`` *inside* the delete ``try``: a failed
+    delete must leave occupancy alone, or the controller would believe capacity
+    was freed while the pod is still holding GPUs.
+    """
+    for eviction in evictions:
+        pod_info = eviction.pod
+        # Emit event before deletion so the event record survives.
+        try:
+            pod_obj = await read_pod(pod_info.name, pod_info.namespace)
+            await eviction.emit(
+                pod_obj, pod_info.name, pod_info.namespace, eviction.reason
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s", kv(
+                event="k8s.event_failed", ns=pod_info.namespace, pod=pod_info.name,
+                reason=eviction.event_reason, err=exc,
+            ))
+        try:
+            await delete_pod(pod_info.name, pod_info.namespace)
+            state.release_pod(pod_info.uid)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s", kv(
+                event="pod.delete_failed", ns=pod_info.namespace,
+                pod=pod_info.name, err=exc,
+            ))
 
 
 # ---------------------------------------------------------------------------
@@ -2919,7 +2966,7 @@ async def push_reservations(
         owner_changes = state.detect_owner_changed_in_window(pushed, now)
         merged_active = apply_push_to_active(state.reservations, pushed)
 
-        await _reconcile_after_reservation_change(
+        evictions = await _reconcile_after_reservation_change(
             state,
             client,
             config,
@@ -2931,7 +2978,8 @@ async def push_reservations(
         )
 
         # Re-arm / prune no-show tracking for the new set, mirroring what the
-        # fetch loop does after _refresh_reservations.
+        # fetch loop does after _refresh_reservations.  Synchronous, so it stays
+        # inside the hold.
         state.reconcile_noshow()
         state.update_noshow_tracking(
             now,
@@ -2939,6 +2987,9 @@ async def push_reservations(
             config.noshow_grace_minutes,
             reason="push",
         )
+
+    # Per-pod Kubernetes I/O, with the lock released.
+    await _execute_evictions(state, evictions)
 
     applied = sum(1 for r in pushed if r.status == "active")
     log.info("%s", kv(

@@ -288,8 +288,8 @@ def test_the_scan_covers_the_helpers_we_expect():
 
     expected = {
         "_reconcile_after_reservation_change",
-        "_handle_cancelled_reservations",
-        "_handle_owner_changes",
+        "_plan_cancelled_reservations",
+        "_plan_owner_changes",
         "_adopt_pods",
         "_merge_ondemand_into_bookings",
         "_cancel_merged_lease",
