@@ -1092,6 +1092,15 @@ build if a new numeric setting is added with a bare `int()`.
 The Dockerfile builds a minimal image:
 
 - Base: `python:3.13-slim`
+- **Dependencies installed from compiled lockfiles** (`requirements.lock` /
+  `requirements-dev.lock`), never the lower-bound-only `requirements*.txt`.  The
+  `final` stage reinstalls on a clean base rather than copying site-packages from
+  `deps` — that is what keeps dev-only packages out of the runtime image, but it
+  also means the two stages resolve independently, so without a lock the suite
+  could pass against one dependency set while the image shipped another.  The dev
+  lock is compiled with the prod lock as a constraint, making it a superset at
+  identical versions; `tests/test_dependency_lock.py` asserts both properties and
+  fails the build on drift.  Regeneration commands are in `AGENTS.md`.
 - Non-root user `appuser` (UID 1000)
 - Health check: `GET http://localhost:8000/health`
 - Entrypoint: `python -m app.main` (starts uvicorn programmatically so `HTTP_PORT` controls the bind port)

@@ -10,11 +10,30 @@ As a first step before any work in this repository, you **must** create a local
 Python virtual environment:
 
 ```bash
-uv venv .venv && source .venv/bin/activate && uv pip install -r requirements.txt
+uv venv .venv && source .venv/bin/activate && uv pip install -r requirements-dev.lock
 ```
 
 An external hook ensures all subsequent shell commands run inside this virtual
 environment — but you must create it first.
+
+Install from the **lock**, not `requirements-dev.txt`.  The requirements files
+are lower-bound only, so installing them directly gives you whatever resolved
+that morning — which is not what the image ships, and not what CI tested.  The
+dev lock also carries `pytest`, which `requirements.txt` alone does not.
+
+### Changing a dependency
+
+Edit the requirements file, then recompile **both** locks — the dev lock is
+compiled against the prod lock as a constraint, so it stays a superset at
+identical versions:
+
+```bash
+uv pip compile requirements.txt -o requirements.lock
+uv pip compile requirements-dev.txt -c requirements.lock -o requirements-dev.lock
+```
+
+`tests/test_dependency_lock.py` fails the build if a requirements file declares
+something its lock does not pin, or if the two locks disagree on a version.
 
 ---
 

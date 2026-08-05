@@ -2,8 +2,20 @@ FROM python:3.13-slim AS deps
 
 WORKDIR /app
 
-COPY requirements.txt requirements-dev.txt ./
-RUN pip install --no-cache-dir -r requirements-dev.txt
+# Install from the compiled lockfiles, not the loose `requirements*.txt`.  Both
+# are lower-bound only, so a plain install resolves whatever is newest at build
+# time — and because `final` below reinstalls on a clean base, this stage could
+# test one dependency set while the shipped image ran another.  The locks are
+# what make the two resolutions identical.
+#
+# `requirements-dev.lock` is compiled with `requirements.lock` as a constraint,
+# so it is a superset at identical versions; `tests/test_dependency_lock.py`
+# asserts that rather than trusting it.  Regenerate both together:
+#
+#   uv pip compile requirements.txt -o requirements.lock
+#   uv pip compile requirements-dev.txt -c requirements.lock -o requirements-dev.lock
+COPY requirements.txt requirements-dev.txt requirements.lock requirements-dev.lock ./
+RUN pip install --no-cache-dir -r requirements-dev.lock
 
 
 # Runs the full test suite.  A non-zero exit here fails the build, so a broken
@@ -35,8 +47,12 @@ FROM python:3.13-slim AS final
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# The same lock the `deps`/`test` stages installed, so what shipped is what was
+# tested.  `final` deliberately reinstalls on a clean base rather than copying
+# site-packages from `deps`, which is what keeps the dev-only packages out of
+# the runtime image.
+COPY requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
 
 COPY app/ ./app/
 
