@@ -854,7 +854,15 @@ source of truth.
 - **Concurrency**: the endpoint and the fetch loop both mutate `reservations`
   across `await` points, so each reconcile is serialised by
   `ControllerState.reservation_lock` (the one place the "no locking" rule is
-  relaxed).
+  relaxed). **The lock covers the state transition, not the I/O that feeds it.**
+  Both callers resolve the GPU-class maps first (`_resolve_gpu_class_maps`,
+  which touches no shared state) and take the lock only for
+  `detect → detect → preserve → replace`, which is synchronous — so a push no
+  longer queues behind a fetch cycle's HTTP, which was the endpoint's entire
+  reason to exist. Keep that split: the critical section must stay one
+  uninterrupted acquisition (two would re-open the
+  `preserve_local_ondemand_leases` clobber it exists to prevent), and it must
+  stay await-free on the no-eviction path.
 - **RBAC**: unchanged — eviction reuses the existing `pods: delete` /
   `events: create` permissions.
 

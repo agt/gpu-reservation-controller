@@ -39,7 +39,7 @@ import socket
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, NamedTuple, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -301,31 +301,36 @@ def _on_task_done(task: asyncio.Task) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _reconcile_after_reservation_change(
-    state: ControllerState,
-    client: ReservationClient,
-    config: Config,
-    active_reservations: list[ReservationResponse],
-    cancelled_in_window: list[ReservationResponse],
-    owner_changes: list[tuple[ReservationResponse, str]],
-    now: datetime,
-) -> None:
-    """Apply a new active reservation set and run the reconciliation tail.
+class GpuClassMaps(NamedTuple):
+    """The three per-class lookup maps a reconcile installs together.
 
-    Shared by the periodic fetch loop (which supplies a full snapshot) and the
-    inbound push endpoint (which supplies a partial delta merged into the current
-    set).  Refreshes the gpu_class_id ↔ label_value maps, assigns the new
-    reservation list, reconciles the task queue, and evicts pods for any
-    in-window cancellations or owner changes (adoption).
-
-    The caller must already hold ``state.reservation_lock`` and must have computed
-    *cancelled_in_window* and *owner_changes* against the OLD reservation set (both
-    detectors compare the incoming entries with ``state.reservations`` before it is
-    replaced here).
+    Resolved *outside* ``reservation_lock`` and handed in, so the HTTP round
+    trips that build them do not serialise against the inbound push endpoint.
     """
-    state.require_reservation_lock("_reconcile_after_reservation_change")
-    # Refresh the full GPU class list (both label and JIT id-lookup maps).  A
-    # failed bulk fetch keeps the previous cycle's maps rather than losing all
+
+    labels: dict[int, str]   # gpu_class_id → label_value
+    ids: dict[str, int]      # label_value → gpu_class_id
+    capacity: dict[str, int]  # label_value → app-side GPU count (audit input)
+
+
+async def _resolve_gpu_class_maps(
+    client: ReservationClient,
+    class_ids: set[int],
+    prior: GpuClassMaps,
+) -> GpuClassMaps:
+    """Build the GPU-class lookup maps, doing every HTTP call here.
+
+    Split out of ``_reconcile_after_reservation_change`` so it can run **before**
+    the reservation lock is taken.  It reads no shared state — *prior* is a copy
+    the caller passes for the bulk-fetch-failure path — which is what makes the
+    hoist safe.
+
+    That matters because in steady state the reconcile evicts nothing (both
+    handlers are conditional), so this was the *only* thing the lock was held
+    across: one 15 s-timeout bulk fetch plus a 10 s per-id fallback for each
+    unresolved class, on every cycle, blocking any push that arrived meanwhile.
+    """
+    # A failed bulk fetch keeps the previous cycle's maps rather than losing all
     # label resolution.
     gpu_classes = await client.fetch_gpu_classes()
     if gpu_classes is not None:
@@ -343,14 +348,13 @@ async def _reconcile_after_reservation_change(
                 if gc.audit_gpus is not None:
                     new_capacity[gc.label_value] = gc.audit_gpus
     else:
-        new_labels = dict(state.gpu_class_labels)
-        new_ids = dict(state.gpu_class_ids)
-        new_capacity = dict(state.gpu_class_capacity)
+        new_labels = dict(prior.labels)
+        new_ids = dict(prior.ids)
+        new_capacity = dict(prior.capacity)
 
-    # Fallback: resolve any class referenced by active reservations that the
-    # bulk list didn't cover (e.g. a class created since the last successful
-    # fetch, or a pushed reservation referencing an id not yet seen).
-    class_ids = {r.gpu_class_id for r in active_reservations}
+    # Fallback: resolve any class the bulk list didn't cover (e.g. one created
+    # since the last successful fetch, or referenced by a pushed reservation
+    # whose id we have not seen).
     for cid in class_ids:
         if cid in new_labels:
             continue
@@ -366,10 +370,44 @@ async def _reconcile_after_reservation_change(
                 event="class.unresolvable", cid=cid, reason="no_label_value",
             ))
 
+    return GpuClassMaps(new_labels, new_ids, new_capacity)
+
+
+async def _reconcile_after_reservation_change(
+    state: ControllerState,
+    client: ReservationClient,
+    config: Config,
+    active_reservations: list[ReservationResponse],
+    cancelled_in_window: list[ReservationResponse],
+    owner_changes: list[tuple[ReservationResponse, str]],
+    now: datetime,
+    gpu_class_maps: GpuClassMaps,
+) -> None:
+    """Apply a new active reservation set and run the reconciliation tail.
+
+    Shared by the periodic fetch loop (which supplies a full snapshot) and the
+    inbound push endpoint (which supplies a partial delta merged into the current
+    set).  Installs the *gpu_class_maps* the caller resolved, assigns the new
+    reservation list, reconciles the task queue, and evicts pods for any
+    in-window cancellations or owner changes (adoption).
+
+    The caller must already hold ``state.reservation_lock`` and must have computed
+    *cancelled_in_window* and *owner_changes* against the OLD reservation set (both
+    detectors compare the incoming entries with ``state.reservations`` before it is
+    replaced here).  It must **also** have resolved *gpu_class_maps* before taking
+    the lock (``_resolve_gpu_class_maps``) — that is the one part of this tail
+    that needs the network, and holding the lock across it is what made the push
+    endpoint wait out a whole fetch cycle.
+    """
+    state.require_reservation_lock("_reconcile_after_reservation_change")
+
+    # Everything from here to reconcile_queue() is synchronous: on a cycle with
+    # no evictions — the overwhelming majority — the whole critical section is
+    # await-free.
     state.reservations = active_reservations
-    state.gpu_class_labels = new_labels
-    state.gpu_class_ids = new_ids
-    state.gpu_class_capacity = new_capacity
+    state.gpu_class_labels = gpu_class_maps.labels
+    state.gpu_class_ids = gpu_class_maps.ids
+    state.gpu_class_capacity = gpu_class_maps.capacity
 
     # Drop / re-match queue entries whose reservation was cancelled.
     state.reconcile_queue()
@@ -393,12 +431,28 @@ async def _refresh_reservations(
 ) -> None:
     """Fetch the current reservation list and update shared state.
 
-    Pulls the full ``status=all`` reservation set, then hands the active subset
-    to ``_reconcile_after_reservation_change`` (under ``reservation_lock``) to
-    apply it and run the reconciliation tail.
+    Pulls the full ``status=all`` reservation set and resolves the GPU-class
+    maps — both network round trips, both **outside** ``reservation_lock`` — then
+    hands the results to ``_reconcile_after_reservation_change`` under the lock
+    to apply them and run the reconciliation tail.
     """
     all_reservations = await client.fetch_reservations()
     active_reservations = [r for r in all_reservations if r.status == "active"]
+
+    # Resolved before the lock: this is HTTP, and a push arriving mid-fetch used
+    # to wait it out.  Reading the prior maps here is safe because they are only
+    # a fallback for a failed bulk fetch, and the three are replaced together
+    # under the lock below (last writer wins on the whole map — the same
+    # granularity as before).
+    gpu_class_maps = await _resolve_gpu_class_maps(
+        client,
+        {r.gpu_class_id for r in active_reservations},
+        GpuClassMaps(
+            dict(state.gpu_class_labels),
+            dict(state.gpu_class_ids),
+            dict(state.gpu_class_capacity),
+        ),
+    )
 
     now = datetime.now(timezone.utc)
     async with state.reservation_lock:
@@ -426,6 +480,7 @@ async def _refresh_reservations(
             cancelled_in_window,
             owner_changes,
             now,
+            gpu_class_maps,
         )
 
 
@@ -2836,6 +2891,25 @@ async def push_reservations(
     pushed = body.reservations
     now = datetime.now(timezone.utc)
 
+    # Resolved before the lock — the whole point of this endpoint is to beat the
+    # poll interval, and it cannot do that from behind a fetch cycle's HTTP.
+    #
+    # Only the *pushed* ids are resolved, not the merged set: the merge reads
+    # state.reservations, which is only safe under the lock.  That is sufficient
+    # because merged ⊆ state.reservations ∪ pushed, and every id already in
+    # state.reservations was resolved by whichever reconcile admitted it.  The
+    # residual gap is a class that failed to resolve on an earlier cycle and is
+    # not named by this push; the fetch loop re-probes it every cycle.
+    gpu_class_maps = await _resolve_gpu_class_maps(
+        client,
+        {r.gpu_class_id for r in pushed},
+        GpuClassMaps(
+            dict(state.gpu_class_labels),
+            dict(state.gpu_class_ids),
+            dict(state.gpu_class_capacity),
+        ),
+    )
+
     async with state.reservation_lock:
         # Evictable in-window cancellations carried by this push (idempotent:
         # detect_cancelled_in_window skips ids already recorded / declared no-show).
@@ -2853,6 +2927,7 @@ async def push_reservations(
             cancelled_in_window,
             owner_changes,
             now,
+            gpu_class_maps,
         )
 
         # Re-arm / prune no-show tracking for the new set, mirroring what the

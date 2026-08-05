@@ -312,3 +312,113 @@ def test_a_helper_that_acquires_the_lock_is_not_guarded(main_module):
     source = inspect.getsource(main_module._drain_pending_merge_cancels)
     assert "async with state.reservation_lock" in source
     assert "require_reservation_lock" not in source
+
+
+# ---------------------------------------------------------------------------
+# Lock scope: no HTTP under the lock, and a push that does not queue behind it
+# ---------------------------------------------------------------------------
+
+
+class _SlowClassClient:
+    """Client whose bulk GPU-class fetch blocks until *gate* is set."""
+
+    def __init__(self, gate: asyncio.Event | None = None):
+        self.gate = gate
+        self.locked_during_fetch: list[bool] = []
+
+    async def fetch_reservations(self):
+        return []
+
+    async def fetch_gpu_classes(self, state=None):
+        # Recorded by the caller through the closure below; see the tests.
+        if self.gate is not None:
+            await self.gate.wait()
+        return []
+
+    async def fetch_gpu_class(self, cid):  # pragma: no cover - never reached
+        return None
+
+
+def _config_stub():
+    from tests.conftest import make_config
+
+    return make_config()
+
+
+def test_reconcile_does_not_hold_the_lock_across_the_gpu_class_fetch(main_module):
+    """The direct regression test for rank 28.
+
+    The class fetch is one 15 s-timeout HTTP round trip on every cycle, and in
+    steady state it was the *only* thing the lock was held across — so a push
+    arriving mid-fetch waited it out for no reason at all.
+    """
+    m = main_module
+    state = ControllerState()
+    observed: list[bool] = []
+
+    class _Client(_SlowClassClient):
+        async def fetch_gpu_classes(self):
+            observed.append(state.reservation_lock.locked())
+            return []
+
+    _run(m._refresh_reservations(state, _Client(), _config_stub()))
+
+    assert observed == [False], "the GPU-class fetch ran with the lock held"
+
+
+def test_push_is_not_blocked_by_a_slow_fetch(main_module):
+    """The behavioural test — and the one that would have caught the design.
+
+    Drives the endpoint coroutine directly rather than through ``TestClient``:
+    ``TestClient`` runs the app on its own event loop, so a gather across it
+    would not share a loop with the fetch and could not exercise the contention
+    this is about.
+    """
+    from types import SimpleNamespace
+
+    from app.schemas import ReservationPushRequest
+
+    m = main_module
+    state = ControllerState()
+    gate = asyncio.Event()
+    order: list[str] = []
+
+    class _FetchClient(_SlowClassClient):
+        async def fetch_gpu_classes(self):
+            order.append("fetch-blocked")
+            await gate.wait()
+            order.append("fetch-resumed")
+            return []
+
+    class _PushClient(_SlowClassClient):
+        async def fetch_gpu_classes(self):
+            return []
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                controller_state=state,
+                reservation_client=_PushClient(),
+                config=_config_stub(),
+            )
+        )
+    )
+
+    async def scenario():
+        fetch = asyncio.create_task(
+            m._refresh_reservations(state, _FetchClient(), _config_stub())
+        )
+        await asyncio.sleep(0)  # let the fetch reach its blocked call
+
+        # The push must complete while the fetch is still stuck on HTTP.
+        await m.push_reservations(ReservationPushRequest(reservations=[]), request)
+        order.append("push-done")
+
+        gate.set()
+        await fetch
+
+    _run(scenario())
+
+    # "push-done" before "fetch-resumed" is the whole assertion: previously the
+    # push could not even start until the fetch released the lock.
+    assert order == ["fetch-blocked", "push-done", "fetch-resumed"]
