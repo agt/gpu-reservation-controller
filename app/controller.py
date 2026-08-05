@@ -164,6 +164,64 @@ def largest_node_free_by_class(
     }
 
 
+class LockContractError(RuntimeError):
+    """A ``reservation_lock`` contract violation — re-entry, or a missing hold.
+
+    Deliberately a real exception rather than an ``assert``: asserts vanish under
+    ``python -O``, and this guards an invariant whose violation is otherwise
+    *silent*.  Raising turns a permanent hang into a `task.crashed` CRITICAL and
+    a 503 from ``GET /health``, which is the whole point.
+    """
+
+
+class _OwnedLock:
+    """An ``asyncio.Lock`` that knows which task holds it.
+
+    ``asyncio.Lock`` is **not reentrant**, so a coroutine that takes
+    ``reservation_lock`` while already holding it does not raise — it waits on
+    itself, forever.  Nothing notices: ``_on_task_done`` records only
+    *exceptions*, so the deadlocked loop is never marked dead and ``GET /health``
+    keeps returning 200 while the controller quietly stops admitting pods.
+
+    Tracking the owning task converts that into an immediate, traceable
+    exception, and gives :meth:`held_by_current_task` exact semantics — plain
+    ``Lock.locked()`` is true when *anyone* holds it, so it can neither detect
+    re-entry nor tell a helper whether *its own* caller took the lock.
+
+    Drop-in for the ``async with`` sites (there are no direct
+    ``acquire``/``release`` callers, and none should be added).
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: Optional[asyncio.Task] = None
+
+    async def __aenter__(self) -> "_OwnedLock":
+        task = asyncio.current_task()
+        if task is not None and task is self._owner:
+            raise LockContractError(
+                "reservation_lock is not reentrant: this task already holds it. "
+                "A helper documented 'caller must hold the lock' must not take it "
+                "itself — see require_reservation_lock."
+            )
+        await self._lock.acquire()
+        self._owner = task
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self._owner = None
+        self._lock.release()
+
+    def held_by_current_task(self) -> bool:
+        """Whether the calling task is the one holding this lock."""
+        task = asyncio.current_task()
+        return task is not None and task is self._owner
+
+    def locked(self) -> bool:
+        """Whether anyone holds the lock (``asyncio.Lock`` parity)."""
+        return self._lock.locked()
+
+
 class CapacityDiff(NamedTuple):
     """One class where the app-side and physical GPU counts disagree.
 
@@ -712,7 +770,11 @@ class ControllerState:
         # could be clobbered by the fetch's wholesale replace, or double-evict.
         # (This is the one place the "no locking" note above is relaxed, now that
         # an inbound HTTP handler runs concurrently with the background loops.)
-        self.reservation_lock: asyncio.Lock = asyncio.Lock()
+        #
+        # _OwnedLock rather than a bare asyncio.Lock so a re-entry raises instead
+        # of deadlocking silently, and so require_reservation_lock below can ask
+        # "does *this task* hold it" rather than "does anyone".
+        self.reservation_lock: _OwnedLock = _OwnedLock()
 
         # Serialises the batch on-demand admission run (``_run_ondemand_admission``
         # in main): the pod-watch loop fires it immediately on a newly-discovered
@@ -723,6 +785,30 @@ class ControllerState:
         # ``reservation_lock`` (which the grant/admit step still takes briefly).
         self.ondemand_admission_lock: asyncio.Lock = asyncio.Lock()
         self.ondemand_rerun_requested: bool = False
+
+    # ------------------------------------------------------------------
+    # Lock contract
+    # ------------------------------------------------------------------
+
+    def require_reservation_lock(self, who: str) -> None:
+        """Assert that the calling task holds ``reservation_lock``.
+
+        Call this at the top of any helper whose docstring says "caller must
+        hold the lock".  That contract used to live only in prose, and prose
+        cannot be checked: a helper that silently ran unlocked would corrupt the
+        reservation set under a concurrent fetch, with no symptom at the call
+        site.
+
+        Note the asymmetry with the *other* direction.  A helper that **takes**
+        the lock (``_drain_pending_merge_cancels``, ``_teardown_ondemand_lease``,
+        …) must **not** call this — it is precisely the function that is allowed
+        to acquire, and ``_OwnedLock`` already raises if it is re-entered.
+        """
+        if not self.reservation_lock.held_by_current_task():
+            raise LockContractError(
+                f"{who} requires reservation_lock, but the calling task does not "
+                "hold it"
+            )
 
     # ------------------------------------------------------------------
     # No-show tracking
