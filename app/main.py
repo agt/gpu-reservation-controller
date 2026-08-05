@@ -323,6 +323,7 @@ async def _reconcile_after_reservation_change(
     detectors compare the incoming entries with ``state.reservations`` before it is
     replaced here).
     """
+    state.require_reservation_lock("_reconcile_after_reservation_change")
     # Refresh the full GPU class list (both label and JIT id-lookup maps).  A
     # failed bulk fetch keeps the previous cycle's maps rather than losing all
     # label resolution.
@@ -456,7 +457,13 @@ async def _handle_cancelled_reservations(
        visible to ``find_open_booking_for``.
     3. Emit a ReservationCancelled event on each pod still unclaimed, then
        delete it.
+
+    The caller must hold ``state.reservation_lock``: step 2 reads the merged
+    ``state.reservations`` and mutates occupancy, so a concurrent fetch's
+    wholesale replace landing mid-adoption would re-link a pod onto a booking
+    that is no longer in the set.
     """
+    state.require_reservation_lock("_handle_cancelled_reservations")
     # One pod snapshot serves the whole batch.
     pod_snapshot = []
     try:
@@ -537,7 +544,15 @@ async def _handle_owner_changes(
        still-active reservation on a subsequent tick / watch event.
 
     Unlike cancellation, the reservation stays active; it simply changes hands.
+
+    The caller must hold ``state.reservation_lock``.  Unlike its cancellation
+    sibling this helper reads ``state.reservations`` not at all — its only state
+    contact is ``release_pod``, a synchronous occupancy edit keyed by pod uid —
+    so the requirement is a **consistency choice**, not a data dependency: it
+    runs as one step of a reconcile that must appear atomic, and a caller that
+    could reach it without the lock would be a caller in the wrong place.
     """
+    state.require_reservation_lock("_handle_owner_changes")
     # One pod snapshot serves the whole batch.
     pod_snapshot = []
     try:
@@ -2024,6 +2039,7 @@ async def _adopt_pods(
     and never deletes the pod.  *pods* is mutated in place — an adopted entry
     is replaced with a view carrying the new reservation id.
     """
+    state.require_reservation_lock("_adopt_pods")
     if not config.pod_adoption_enabled:
         return
     for view, res_new in state.plan_pod_adoptions(pods, now):
@@ -2100,6 +2116,7 @@ async def _merge_ondemand_into_bookings(
     failure logs a warning and never deletes the pod.  *pods* is mutated in place
     so subsequent adoption planning in the same tick sees the new binding.
     """
+    state.require_reservation_lock("_merge_ondemand_into_bookings")
     if not config.ondemand_merge_enabled:
         return
     for view, res_new in state.plan_ondemand_merges(pods, now):
@@ -2168,6 +2185,7 @@ async def _cancel_merged_lease(
     longer an active lease is simply discarded from the retry set.  Idempotent
     and best-effort, mirroring ``_teardown_ondemand_lease``.
     """
+    state.require_reservation_lock("_cancel_merged_lease")
     res = next((r for r in state.reservations if r.id == lease_id), None)
     if res is None or res.status != "active" or res.kind != "on_demand":
         state.pending_ondemand_merge_cancels.discard(lease_id)

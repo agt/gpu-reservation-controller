@@ -2113,6 +2113,7 @@ class ControllerState:
         Pending JIT candidates are reported per class on bucket 0 as
         informational pressure only (see ``ForecastBucketSummary``).
         """
+        self.require_reservation_lock("forecast_preemption_risk")
         buckets = forecast_buckets(now)
         horizon_end = buckets[-1][1]
         free = free_capacity_by_class(capacity_by_class, pods)

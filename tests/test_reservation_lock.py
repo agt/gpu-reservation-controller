@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 
 import pytest
 
@@ -209,3 +210,105 @@ def test_no_direct_acquire_or_release_of_the_reservation_lock(main_module):
         source = inspect.getsource(module)
         assert "reservation_lock.acquire" not in source, module.__name__
         assert "reservation_lock.release" not in source, module.__name__
+
+
+# ---------------------------------------------------------------------------
+# The prose contract and the runtime guard must not drift apart again
+# ---------------------------------------------------------------------------
+
+
+# The docstring phrasings that claim the caller holds the lock: "caller must
+# hold", "Caller holds", "the caller holds", "The caller must already hold".
+# The optional adverb matters — `_reconcile_after_reservation_change` says
+# "must already hold", and a regex without it silently skipped that function.
+_CLAIMS_LOCK = re.compile(
+    r"caller\s+(?:must\s+)?(?:already\s+)?holds?\b", re.IGNORECASE
+)
+
+
+def _functions_claiming_the_lock(main_module):
+    """Every function whose docstring says its caller holds ``reservation_lock``.
+
+    Deduplicated by function object: ``app.main`` imports ``ControllerState``,
+    so a method reached through both modules is one function, not two.
+    """
+    import app.controller
+
+    found: dict[object, str] = {}
+    for module in (main_module, app.controller):
+        for name, obj in vars(module).items():
+            if inspect.isfunction(obj):
+                candidates = [(f"{module.__name__}.{name}", obj)]
+            elif inspect.isclass(obj):
+                candidates = [
+                    (f"{obj.__module__}.{obj.__name__}.{m}", fn)
+                    for m, fn in vars(obj).items()
+                    if inspect.isfunction(fn)
+                ]
+            else:
+                continue
+            for qualname, fn in candidates:
+                doc = inspect.getdoc(fn) or ""
+                if "reservation_lock" in doc and _CLAIMS_LOCK.search(doc):
+                    found.setdefault(fn, qualname)
+    return found
+
+
+def test_every_helper_claiming_the_lock_also_requires_it(main_module):
+    """A docstring contract must be backed by ``require_reservation_lock``.
+
+    This is how rank 29 happened in the first place: the claim was written
+    down, the check never was, and nothing tied the two together — so the
+    contract could rot silently while reading exactly as authoritative.
+
+    Modelled on ``tests/test_log_grammar.py``, which fails the build when a log
+    call site skips ``kv()``.
+    """
+    claimants = _functions_claiming_the_lock(main_module)
+    assert claimants, "the docstring scan found nothing — has the wording changed?"
+
+    missing = sorted(
+        qualname
+        for fn, qualname in claimants.items()
+        if "require_reservation_lock" not in inspect.getsource(fn)
+    )
+    assert not missing, (
+        "these functions document that their caller holds reservation_lock but "
+        "do not call require_reservation_lock(): " + ", ".join(missing)
+    )
+
+
+def test_the_scan_covers_the_helpers_we_expect():
+    """Pin the claimant set, so a helper losing its docstring is not silent.
+
+    Without this, deleting the sentence would make the drift test above pass
+    vacuously for that function.
+    """
+    import app.main  # noqa: F401 - imported via the fixture elsewhere
+
+    expected = {
+        "_reconcile_after_reservation_change",
+        "_handle_cancelled_reservations",
+        "_handle_owner_changes",
+        "_adopt_pods",
+        "_merge_ondemand_into_bookings",
+        "_cancel_merged_lease",
+        "forecast_preemption_risk",
+    }
+    found = {
+        qualname.rsplit(".", 1)[-1]
+        for qualname in _functions_claiming_the_lock(app.main).values()
+    }
+    assert expected <= found, f"lost the lock contract on: {sorted(expected - found)}"
+
+
+def test_a_helper_that_acquires_the_lock_is_not_guarded(main_module):
+    """``_drain_pending_merge_cancels`` acquires; it must not require.
+
+    The two directions are opposites and the docstrings read almost the same.
+    Guarding an acquirer would raise on every ordinary call — the mirror-image
+    mistake to the one the guards prevent.
+    """
+    source = inspect.getsource(main_module._drain_pending_merge_cancels)
+    assert "async with state.reservation_lock" in source
+    assert "require_reservation_lock" not in source

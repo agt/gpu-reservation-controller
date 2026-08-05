@@ -23,7 +23,13 @@ from types import SimpleNamespace
 from app.controller import ControllerState, OnDemandCandidate, reconcile_capacity
 from app.schemas import GpuClassDetail
 
-from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, OTHER_CLASS_LABEL, USERNAME
+from tests.conftest import (
+    GPU_CLASS_ID,
+    GPU_CLASS_LABEL,
+    OTHER_CLASS_LABEL,
+    USERNAME,
+    run_locked,
+)
 
 NOW = datetime(2024, 1, 15, 12, 0, tzinfo=timezone.utc)
 
@@ -127,10 +133,13 @@ class TestCapacityMapPopulation:
     def _reconcile(self, monkeypatch, classes):
         m = _main_module(monkeypatch)
         state = ControllerState()
-        asyncio.run(
+        # The reconcile requires the lock, so drive it the way both real
+        # callers do.
+        run_locked(
+            state,
             m._reconcile_after_reservation_change(
                 state, _ClassListClient(classes), SimpleNamespace(), [], [], [], NOW
-            )
+            ),
         )
         return state
 

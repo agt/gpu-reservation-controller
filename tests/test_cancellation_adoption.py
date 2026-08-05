@@ -20,7 +20,7 @@ from app.config import Config
 from app.controller import ControllerState
 from app.k8s_client import ToleratedPodInfo
 
-from tests.conftest import make_config, GPU_CLASS_LABEL, USERNAME, reservation
+from tests.conftest import make_config, run_locked, GPU_CLASS_LABEL, USERNAME, reservation
 
 NOW = datetime(2024, 1, 15, 15, 15, tzinfo=timezone.utc)
 
@@ -123,8 +123,9 @@ class TestAdoptBeforeEvict:
         state.reservations = [_replacement_booking(2)]
         state.record_placement(1, "uid-1", 1)
 
-        asyncio.run(
-            m._handle_cancelled_reservations(state, _config(), [_cancelled_source(1)], NOW)
+        run_locked(
+            state,
+            m._handle_cancelled_reservations(state, _config(), [_cancelled_source(1)], NOW),
         )
 
         assert patched_refs == [("pod-uid-1", "res-2")]  # re-linked, not evicted
@@ -142,10 +143,11 @@ class TestAdoptBeforeEvict:
         state.reservations = [_replacement_booking(2)]
         state.record_placement(1, "uid-1", 1)
 
-        asyncio.run(
+        run_locked(
+            state,
             m._handle_cancelled_reservations(
                 state, _config(pod_adoption_enabled=False), [_cancelled_source(1)], NOW
-            )
+            ),
         )
 
         assert patched_refs == []
@@ -161,8 +163,9 @@ class TestAdoptBeforeEvict:
         state.reservations = []  # nothing to adopt into
         state.record_placement(1, "uid-1", 1)
 
-        asyncio.run(
-            m._handle_cancelled_reservations(state, _config(), [_cancelled_source(1)], NOW)
+        run_locked(
+            state,
+            m._handle_cancelled_reservations(state, _config(), [_cancelled_source(1)], NOW),
         )
 
         assert patched_refs == []
@@ -179,8 +182,9 @@ class TestAdoptBeforeEvict:
         state.reservations = [_replacement_booking(2, gpu_count=1)]
         state.record_placement(1, "uid-1", 2)
 
-        asyncio.run(
-            m._handle_cancelled_reservations(state, _config(), [_cancelled_source(1)], NOW)
+        run_locked(
+            state,
+            m._handle_cancelled_reservations(state, _config(), [_cancelled_source(1)], NOW),
         )
 
         assert patched_refs == []
@@ -210,7 +214,7 @@ class TestSnapshotCarriesTheGroupLabel:
     could not have caught it.
     """
 
-    def _capture(self, monkeypatch, build_handler):
+    def _capture(self, monkeypatch, state, build_handler):
         """Run the handler and return the group_label_key it asked the snapshot for."""
         m = _main_module(monkeypatch)
         seen = {}
@@ -221,7 +225,9 @@ class TestSnapshotCarriesTheGroupLabel:
             return []
 
         monkeypatch.setattr(m, "snapshot_tolerated_pods", _snapshot)
-        asyncio.run(build_handler(m))
+        # Both handlers require the lock, so drive them the way their real
+        # caller does.
+        run_locked(state, build_handler(m))
         return seen
 
     def test_cancellation_path_passes_it(self, monkeypatch):
@@ -229,6 +235,7 @@ class TestSnapshotCarriesTheGroupLabel:
         config = _config(required_group_label="dsmlp/course")
         seen = self._capture(
             monkeypatch,
+            state,
             lambda m: m._handle_cancelled_reservations(state, config, [], NOW),
         )
         assert seen["group_label_key"] == "dsmlp/course"
@@ -238,6 +245,7 @@ class TestSnapshotCarriesTheGroupLabel:
         config = _config(required_group_label="dsmlp/course")
         seen = self._capture(
             monkeypatch,
+            state,
             lambda m: m._handle_owner_changes(state, config, []),
         )
         assert seen["group_label_key"] == "dsmlp/course"
@@ -247,6 +255,7 @@ class TestSnapshotCarriesTheGroupLabel:
         state = ControllerState()
         seen = self._capture(
             monkeypatch,
+            state,
             lambda m: m._handle_cancelled_reservations(state, _config(), [], NOW),
         )
         assert seen["group_label_key"] is None

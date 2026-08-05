@@ -26,6 +26,7 @@ from tests.conftest import (
 )
 from tests.conftest import make_state as _state
 from tests.conftest import reservation
+from tests.conftest import call_locked
 
 NOW = datetime(2024, 1, 15, 9, 20, tzinfo=timezone.utc)
 LEAD = timedelta(minutes=15)
@@ -78,7 +79,12 @@ def _booking(
 
 
 def _forecast(state, pods, *, capacity=None, pending=None, now=NOW, lead=LEAD):
-    return state.forecast_preemption_risk(
+    # forecast_preemption_risk is pure, but contractually requires the lock (its
+    # real caller holds it across the surrounding snapshot work), so drive it the
+    # way that caller does.
+    return call_locked(
+        state,
+        state.forecast_preemption_risk,
         capacity if capacity is not None else {GPU_CLASS_LABEL: 4},
         pods,
         pending or [],

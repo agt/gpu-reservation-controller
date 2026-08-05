@@ -11,6 +11,7 @@ Import from test modules with ``from tests.conftest import ...``.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 
 from app.config import Config
@@ -345,3 +346,39 @@ def kv_fields(message: str) -> dict[str, str]:
                 i += 1
             fields[key] = message[start:i]
     return fields
+
+
+# ---------------------------------------------------------------------------
+# Lock-holding call helpers
+# ---------------------------------------------------------------------------
+
+
+def run_locked(state: ControllerState, coro):
+    """Await *coro* while holding ``state.reservation_lock``.
+
+    Several helpers document "caller must hold ``state.reservation_lock``" and
+    now enforce it with ``require_reservation_lock``.  A unit test driving one
+    of them directly *is* that caller, so it has to take the lock — otherwise
+    the test asserts behaviour under a state the helper is never legitimately
+    in.  This is the seam that keeps that from being three lines at every call
+    site.
+    """
+    async def _held():
+        async with state.reservation_lock:
+            return await coro
+
+    return asyncio.run(_held())
+
+
+def call_locked(state: ControllerState, fn, *args, **kwargs):
+    """Call a *synchronous* lock-requiring helper with the lock held.
+
+    The synchronous sibling of :func:`run_locked` — ``forecast_preemption_risk``
+    is pure and sync, but still contractually requires the lock because its
+    caller holds it across the surrounding snapshot work.
+    """
+    async def _held():
+        async with state.reservation_lock:
+            return fn(*args, **kwargs)
+
+    return asyncio.run(_held())
