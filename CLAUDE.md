@@ -64,7 +64,7 @@ app/
 | `pod_watch_loop` | continuous (WATCH resumed by `resourceVersion`; LIST at start and every ~10 min resync) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease; **fast-path**: applies toleration immediately when a new pod arrives inside an open window.  Each event is handled under its own try/except, so one bad event cannot kill the consumer |
 | `queue_processor_loop` | every `QUEUE_PROCESSOR_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
 | `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee, only when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**) |
-| `capacity_audit_loop` | every `CAPACITY_CHECK_INTERVAL` s (default 3600) | Compares app-side per-class GPU capacity (`total_gpus`) against physical cluster capacity; logs any difference as a WARNING and pauses on-demand admission for over-committed classes (see **App-side vs physical capacity reconciliation**) |
+| `capacity_audit_loop` | every `CAPACITY_CHECK_INTERVAL` s (default 3600) | Compares app-side per-class GPU capacity (`effective_gpus_today`) against physical cluster capacity; logs any difference as a WARNING and pauses on-demand admission for over-committed classes (see **App-side vs physical capacity reconciliation**) |
 | `lease_guard_loop` | every 20 s (only when `SINGLETON_LEASE_ENABLED`) | Renews the singleton `coordination.k8s.io` Lease; terminates the process if another live instance takes it (see **Singleton lease guard**) |
 
 Every task is **supervised**: `_on_task_done` records an unhandled exception in
@@ -717,12 +717,23 @@ existing pod-patch path); `ONDEMAND_HORIZON_MINUTES` and
 The controller derives physical GPU capacity solely from Kubernetes node taints
 (`snapshot_node_gpu_capacity` — total allocatable `nvidia.com/gpu` per
 `gpu-class-reservation` taint value).  The reservation app has its **own**
-per-class GPU count, `total_gpus` (RESERVATION-API.md §4), now modelled on
-`schemas.GpuClassDetail` and cached per label in
+per-class GPU count, modelled on `schemas.GpuClassDetail` and cached per label in
 `ControllerState.gpu_class_capacity` — refreshed on every reconcile from the
-same `GET /api/gpu-classes` fetch that builds the label maps (only classes whose
-`total_gpus` is known are recorded; a payload omitting it degrades to
-"unknown").
+same `GET /api/gpu-classes` fetch that builds the label maps.
+
+**Which of the app's two counts to audit against.**  The app publishes both
+`total_gpus` (the class's configured default) and `effective_gpus_today` (that
+default after any date-span capacity override covering today) —
+RESERVATION-API.md §4.  The audit reads **`effective_gpus_today`**, because that
+is the number the app actually admits against; `total_gpus` is a figure nobody
+is enforcing while an override is in force.  Auditing the default instead was
+wrong in both directions: an override that lowers a class to match a genuine
+node drain read as a mismatch and **paused JIT admission via guard 4** for a
+class that was not over-committed, while an override *raising* a class above its
+default hid a real over-commit entirely.  `GpuClassDetail.audit_gpus` is the
+single accessor, falling back to `total_gpus` when the app publishes no
+effective count (an older app audits exactly as before).  Only classes whose
+count is known are recorded; a payload omitting both degrades to "unknown".
 
 `capacity_audit_loop` (`_run_capacity_audit` in `main.py`) runs every
 `CAPACITY_CHECK_INTERVAL` s (default hourly, plus once synchronously at

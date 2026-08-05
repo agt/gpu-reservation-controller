@@ -316,10 +316,12 @@ async def _reconcile_after_reservation_change(
             if gc.label_value:
                 new_labels[gc.id] = gc.label_value
                 new_ids[gc.label_value] = gc.id
-                # App-side GPU count for the hourly capacity audit; recorded
-                # only when known (see GpuClassDetail.total_gpus).
-                if gc.total_gpus is not None:
-                    new_capacity[gc.label_value] = gc.total_gpus
+                # App-side GPU count for the hourly capacity audit: the
+                # override-resolved count the app actually admits against, not
+                # the configured default.  Recorded only when known (see
+                # GpuClassDetail.audit_gpus).
+                if gc.audit_gpus is not None:
+                    new_capacity[gc.label_value] = gc.audit_gpus
     else:
         new_labels = dict(state.gpu_class_labels)
         new_ids = dict(state.gpu_class_ids)
@@ -336,8 +338,8 @@ async def _reconcile_after_reservation_change(
         if gpu_class and gpu_class.label_value:
             new_labels[cid] = gpu_class.label_value
             new_ids[gpu_class.label_value] = cid
-            if gpu_class.total_gpus is not None:
-                new_capacity[gpu_class.label_value] = gpu_class.total_gpus
+            if gpu_class.audit_gpus is not None:
+                new_capacity[gpu_class.label_value] = gpu_class.audit_gpus
             log.info("%s", kv(event="class.resolved", cid=cid, class_=gpu_class.name, clabel=gpu_class.label_value))
         else:
             log.warning("%s", kv(
@@ -2391,11 +2393,13 @@ async def _run_capacity_audit(
     """One capacity audit: compare app-side vs physical per-class GPU capacity.
 
     The app-side counts come from ``state.gpu_class_capacity`` (the reservation
-    app's ``total_gpus`` per class, refreshed each reservation fetch).  Physical
-    capacity is snapshotted live from Kubernetes node taints.  Any difference is
-    logged at WARNING; any class the app believes is larger than it physically
-    is (``app_side > physical``) is added to ``state.overcommitted_gpu_classes``,
-    which pauses new on-demand admissions for that class only.
+    app's ``effective_gpus_today`` per class — its ``total_gpus`` after any date-
+    span capacity override covering today, refreshed each reservation fetch; see
+    ``GpuClassDetail.audit_gpus``).  Physical capacity is snapshotted live from
+    Kubernetes node taints.  Any difference is logged at WARNING; any class the
+    app believes is larger than it physically is (``app_side > physical``) is
+    added to ``state.overcommitted_gpu_classes``, which pauses new on-demand
+    admissions for that class only.
 
     Fail-safe: if the node snapshot fails, the audit is skipped and the current
     pause set is left unchanged — a transient LIST failure must never silently

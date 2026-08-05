@@ -706,6 +706,7 @@ either service-key scope.
   "name": "H100",
   "description": "NVIDIA H100 80 GB SXM5",
   "total_gpus": 8,
+  "effective_gpus_today": 8,
   "label_value": "h100",
   "su_rate_per_hour": 4,
   "max_gpus_per_reservation": 2,
@@ -722,13 +723,22 @@ GPU count (`null` = no cap). `relax_min_available` is an admission-control
 buffer for borrowing (limit relaxation; `null` = no buffer); it does not affect the
 controller and can be ignored by API clients.
 
-`total_gpus` is the app's own count of GPUs in the class. The controller
-consumes it in its hourly capacity audit: it compares `total_gpus` against the
-GPUs physically present in the cluster (from Kubernetes node taints), logs any
-per-class difference as a WARNING, and pauses new on-demand admissions for any
-class whose `total_gpus` exceeds physical capacity. A response that omits
-`total_gpus` leaves that class out of the audit (treated as "unknown", never
-flagged over-committed).
+**Two GPU counts, and they can differ.** `total_gpus` is the class's configured
+default. `effective_gpus_today` is that default after applying any date-span
+capacity override covering today — a maintenance window, a partial drain, a
+loaned-out block. When no override is in force the two are equal. The app admits
+against `effective_gpus_today`, so that is the number that describes what the
+class is actually offering right now.
+
+The controller consumes `effective_gpus_today` in its hourly capacity audit: it
+compares that count against the GPUs physically present in the cluster (from
+Kubernetes node taints), logs any per-class difference as a WARNING, and pauses
+new on-demand admissions for any class whose count exceeds physical capacity.
+Auditing `total_gpus` instead would compare a figure the app is not enforcing —
+inventing a mismatch when an override matches a genuine drain, and hiding a real
+over-commit when an override raises the count. A response that omits
+`effective_gpus_today` falls back to `total_gpus`; a response with neither leaves
+that class out of the audit (treated as "unknown", never flagged over-committed).
 `attach_all_groups` makes the class bookable by every group without an explicit
 attachment.
 

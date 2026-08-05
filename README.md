@@ -116,7 +116,7 @@ system is designed to accommodate greater values in the future.)
            ▼
 ┌──────────────────────────────────────────────────────┐
 │ 5. Capacity audit   (every CAPACITY_CHECK_INTERVAL)  │
-│    Compare app-side per-class total_gpus against the │
+│    Compare app-side effective_gpus_today against the │
 │    GPUs physically present in the cluster:            │
 │      a. Log every per-class difference as a WARNING   │
 │      b. If app-side > physical for a class, pause new │
@@ -379,7 +379,7 @@ All settings are supplied via environment variables.
 | `PREEMPTION_LEAD_MINUTES` | no | `15` | Minutes before a reservation slot boundary that phase-A preemption runs, proactively freeing capacity from overstaying pods |
 | `PREEMPTION_CHECK_INTERVAL` | no | `60` | Seconds between preemption sweeps |
 | `PREEMPTION_DELEGATE_SELECTION` | no | `true` | Delegate preemption victim selection to the app (`POST /api/reservations/preemption-victims`) so prioritisation policy lives there; `false` (or any app-call failure) falls back to local uniform-random selection |
-| `CAPACITY_CHECK_INTERVAL` | no | `3600` | Seconds between app-side vs physical GPU capacity audits (default hourly). Each audit compares the reservation app's per-class `total_gpus` against the GPUs physically present in the cluster, logs any difference as a **WARNING**, and pauses new on-demand admissions for any class the app over-counts until the deficiency clears |
+| `CAPACITY_CHECK_INTERVAL` | no | `3600` | Seconds between app-side vs physical GPU capacity audits (default hourly). Each audit compares the reservation app's per-class `effective_gpus_today` (its `total_gpus` after any date-span capacity override covering today — the count the app actually admits against) with the GPUs physically present in the cluster, logs any difference as a **WARNING**, and pauses new on-demand admissions for any class the app over-counts until the deficiency clears |
 | `POD_ADOPTION_ENABLED` | no | `true` | Re-link an overstay pod to a reservation its user has since booked. Set to `false` to disable |
 | `ONDEMAND_MERGE_ENABLED` | no | `true` | Merge a JIT on-demand lease's pod into the user's matching booking the moment that booking's window opens — re-link the pod and retire the lease penalty-exempt (`reason="superseded"`), without waiting for the lease guarantee to lapse. Set to `false` to disable (the pod converges lazily via adoption once past its lease guarantee) |
 | `TERMINATION_WARNING_ENABLED` | no | `true` | After each preemption sweep, stamp pods still at risk of preemption at an upcoming boundary with informational `horae/termination-warning-*` annotations (projected kill instant, risk score, message). Purely informational — nothing is enforced. Set to `false` to disable |

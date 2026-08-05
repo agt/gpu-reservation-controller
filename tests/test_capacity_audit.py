@@ -21,8 +21,11 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from app.controller import ControllerState, OnDemandCandidate, reconcile_capacity
+from app.schemas import GpuClassDetail
 
 from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, OTHER_CLASS_LABEL, USERNAME
+
+NOW = datetime(2024, 1, 15, 12, 0, tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +75,88 @@ class TestReconcileCapacity:
         assert set(by_label) == {"h100", "v100", "t4"}
         assert over == {"h100", "v100"}
         assert by_label["t4"].overcommitted is False
+
+
+# ---------------------------------------------------------------------------
+# GpuClassDetail.audit_gpus — which of the app's two counts the audit reads
+# ---------------------------------------------------------------------------
+
+
+def _detail(**kw) -> GpuClassDetail:
+    return GpuClassDetail(id=10, name="H100", label_value=GPU_CLASS_LABEL, **kw)
+
+
+class TestAuditGpus:
+    def test_prefers_the_override_resolved_count(self):
+        # A maintenance window halves the class today: total_gpus is still the
+        # configured default, but 40 is what the app admits against.
+        assert _detail(total_gpus=80, effective_gpus_today=40).audit_gpus == 40
+
+    def test_falls_back_to_total_gpus_when_absent(self):
+        # An app predating the field audits exactly as it did before.
+        assert _detail(total_gpus=80).audit_gpus == 80
+
+    def test_unknown_when_neither_is_published(self):
+        assert _detail().audit_gpus is None
+
+    def test_zero_effective_count_is_not_treated_as_absent(self):
+        # A class fully withdrawn for today resolves to 0, which is a real
+        # count — not a missing one to fall back from.
+        assert _detail(total_gpus=80, effective_gpus_today=0).audit_gpus == 0
+
+
+# ---------------------------------------------------------------------------
+# The population site: what the reconcile records into gpu_class_capacity
+# ---------------------------------------------------------------------------
+
+
+class _ClassListClient:
+    """Stub client returning a fixed GPU-class list from the bulk fetch."""
+
+    def __init__(self, classes):
+        self._classes = classes
+
+    async def fetch_gpu_classes(self):
+        return self._classes
+
+    async def fetch_gpu_class(self, cid):  # pragma: no cover - bulk covers all
+        return None
+
+
+class TestCapacityMapPopulation:
+    def _reconcile(self, monkeypatch, classes):
+        m = _main_module(monkeypatch)
+        state = ControllerState()
+        asyncio.run(
+            m._reconcile_after_reservation_change(
+                state, _ClassListClient(classes), SimpleNamespace(), [], [], [], NOW
+            )
+        )
+        return state
+
+    def test_records_the_override_resolved_count(self, monkeypatch):
+        # The regression: recording total_gpus here made the audit compare a
+        # number the app is not enforcing.  With physical capacity drained to
+        # match the override, auditing 80 vs 40 invented a mismatch and paused
+        # JIT admission via guard 4 for a class that was not over-committed.
+        state = self._reconcile(
+            monkeypatch, [_detail(total_gpus=80, effective_gpus_today=40)]
+        )
+        assert state.gpu_class_capacity == {GPU_CLASS_LABEL: 40}
+
+        diffs, over = reconcile_capacity(state.gpu_class_capacity, {GPU_CLASS_LABEL: 40})
+        assert diffs == []
+        assert over == set()
+
+    def test_falls_back_to_total_gpus(self, monkeypatch):
+        state = self._reconcile(monkeypatch, [_detail(total_gpus=80)])
+        assert state.gpu_class_capacity == {GPU_CLASS_LABEL: 80}
+
+    def test_class_with_neither_count_is_left_out(self, monkeypatch):
+        state = self._reconcile(monkeypatch, [_detail()])
+        assert state.gpu_class_capacity == {}
+        # Still resolvable for matching — only the audit map skips it.
+        assert state.gpu_class_labels == {10: GPU_CLASS_LABEL}
 
 
 # ---------------------------------------------------------------------------

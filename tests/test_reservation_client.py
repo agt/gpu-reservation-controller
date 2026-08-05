@@ -117,6 +117,35 @@ def test_fetch_gpu_classes_returns_list():
     asyncio.run(client.aclose())
 
 
+def test_fetch_gpu_classes_parses_effective_gpus_today():
+    # The audit reads the override-resolved count, so it has to survive parsing.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                # A maintenance window has halved this class for today.
+                {
+                    "id": 10,
+                    "name": "H100",
+                    "label_value": "h100",
+                    "total_gpus": 80,
+                    "effective_gpus_today": 40,
+                },
+                # An app predating the field publishes only the default.
+                {"id": 20, "name": "A100", "label_value": "a100", "total_gpus": 8},
+            ],
+        )
+
+    client = _client_with_handler(_config(), handler)
+    result = asyncio.run(client.fetch_gpu_classes())
+    assert result is not None
+    assert (result[0].total_gpus, result[0].effective_gpus_today) == (80, 40)
+    assert result[0].audit_gpus == 40
+    assert result[1].effective_gpus_today is None
+    assert result[1].audit_gpus == 8
+    asyncio.run(client.aclose())
+
+
 def test_fetch_gpu_classes_returns_none_on_http_error():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500)

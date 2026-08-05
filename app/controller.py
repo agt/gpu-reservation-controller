@@ -598,16 +598,18 @@ class ControllerState:
         # against.  Refreshed alongside gpu_class_labels.
         self.gpu_class_ids: dict[str, int] = {}
 
-        # App-side per-class GPU capacity: label → total_gpus (the reservation
-        # app's own notion of how many GPUs a class has), refreshed alongside
-        # the label maps.  Keyed by label so it shares a key space with the
-        # physical snapshot (snapshot_node_gpu_capacity).  Populated only for
-        # classes whose total_gpus is known; the hourly capacity audit compares
-        # it against physical capacity (see main._run_capacity_audit).
+        # App-side per-class GPU capacity: label → effective_gpus_today (the
+        # count the reservation app actually admits against, i.e. total_gpus
+        # after any date-span override covering today), refreshed alongside the
+        # label maps.  Keyed by label so it shares a key space with the physical
+        # snapshot (snapshot_node_gpu_capacity).  Populated only for classes
+        # whose count is known (see schemas.GpuClassDetail.audit_gpus); the
+        # hourly capacity audit compares it against physical capacity (see
+        # main._run_capacity_audit).
         self.gpu_class_capacity: dict[str, int] = {}
 
         # GPU class labels the hourly audit found over-committed (app-side
-        # total_gpus > physical capacity).  New on-demand admissions are paused
+        # effective count > physical capacity).  New on-demand admissions are paused
         # for any class in this set (mirrors stuck_holder_gpu_classes above);
         # recomputed each audit tick, so a class clears automatically once the
         # deficiency is resolved.  Empty = no pause.
