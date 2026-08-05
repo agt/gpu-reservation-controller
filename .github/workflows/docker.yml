@@ -1,5 +1,18 @@
 name: Build and push image
 on:
+  # Rebuild weekly even with no commits, so the image picks up base-OS security
+  # patches. `python:3.13-slim` is rebuilt upstream as its Debian base is
+  # patched, but a `FROM` alone pulls that in only when something triggers a
+  # build — so a quiet period leaves the deployed image accumulating known
+  # unpatched CVEs it would otherwise have shed for free.
+  #
+  # Safe to do on a schedule only because the dependency locks make an unattended
+  # rebuild reproducible: it re-resolves nothing, so the sole difference from the
+  # previous build is the patched base layer. Adding this while the requirements
+  # were lower-bound only would have made an unreviewed dependency bump land in
+  # production every Sunday. Mirrors the reservation app's workflow.
+  schedule:
+    - cron: '0 0 * * 0'
   push:
 
 env:
