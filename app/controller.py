@@ -1010,9 +1010,21 @@ class ControllerState:
         assigned but not yet recorded (mirrors the ``available``-minus-running-tally
         shape ``plan_boundary_preemption`` uses).  Among candidates the
         latest-ending window wins (longest guarantee), ties broken by most free
-        capacity.
+        capacity — *net of ``extra_used``*, so a pass spreads its pods over the
+        reservations that still have room rather than packing them all onto
+        whichever one started out largest.  ``r.id`` breaks a remaining tie so
+        the pass is reproducible rather than resolved by list order.
+
+        Filter and tie-break share one ``_spare`` expression deliberately: when
+        they disagreed, the filter honoured the running tally while the key read
+        the untouched ``available``, which is constant across a pass because the
+        planners never mutate ``occupancy``.
         """
         extra_used = extra_used or {}
+
+        def _spare(r: ReservationResponse) -> int:
+            return self.available(r) - extra_used.get(r.id, 0)
+
         candidates = [
             r
             for r in self.reservations
@@ -1023,11 +1035,11 @@ class ControllerState:
             and self._group_ok(r, group_label)
             and slot_start(r) <= now < slot_end(r)
             and r.id not in self.noshow_reservation_ids
-            and self.available(r) - extra_used.get(r.id, 0) >= gpu_requested
+            and _spare(r) >= gpu_requested
         ]
         if not candidates:
             return None
-        return max(candidates, key=lambda r: (slot_end(r), self.available(r)))
+        return max(candidates, key=lambda r: (slot_end(r), _spare(r), r.id))
 
     # ------------------------------------------------------------------
     # Queue management
