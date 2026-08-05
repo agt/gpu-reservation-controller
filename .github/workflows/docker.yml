@@ -56,6 +56,20 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # The first four are metadata-action's own defaults, restated because
+          # supplying `tags` replaces them rather than adding to them.
+          #
+          # `latest` is the addition. The action's `flavor.latest=auto` default
+          # emits it only for a semver git-tag push, and this repository pushes
+          # no git tags — so nothing ever published `latest`, while the Helm
+          # chart asked for exactly that. The chart's default was unpullable
+          # regardless of registry.
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=tag
+            type=ref,event=pr
+            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push image
         uses: docker/build-push-action@v6

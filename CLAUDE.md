@@ -1110,3 +1110,16 @@ ServiceAccount, ClusterRole/Binding, Deployment, and `/health` Service; keep
 its `values.yaml`/`deployment.yaml` env wiring in sync when adding settings
 to `config.py`.  See README.md for RBAC requirements and a sample manual
 Deployment manifest.
+
+**The chart's default image reference must stay registry-qualified and must
+name a tag the workflow actually publishes.**  An unqualified repository
+resolves to `docker.io/library/…`, and `docker/metadata-action`'s
+`flavor.latest=auto` emits `latest` only for a semver git-tag push — which this
+repository never makes — so the workflow requests it explicitly via
+`type=raw,value=latest`.  The floating default tag is paired with
+`pullPolicy: Always`, without which a node holding an old `latest` layer never
+re-pulls and `helm upgrade` rolls nothing; pin an immutable tag and switch back
+to `IfNotPresent` for production.  `tests/test_chart_image.py` asserts all four
+properties by parsing the chart (helm is not a test dependency, so it does not
+render it) — the previous defaults were wrong on every one and nothing read the
+chart to notice.

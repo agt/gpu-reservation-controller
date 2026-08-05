@@ -4,9 +4,26 @@
 # in-memory queue state, so the Deployment hardcodes replicas: 1.
 
 image:
-  repository: gpu-reservation-controller
+  # -- Container image repository. Must be registry-qualified: an unqualified
+  # name resolves to docker.io/library/<name>, which is not where this image
+  # lives. `.github/workflows/docker.yml` pushes to
+  # ghcr.io/<github-owner>/<repo-name>; override this in a fork.
+  repository: ghcr.io/agt/gpu-reservation-controller
+  # -- Image tag. `latest` is published by the workflow on the default branch.
+  # Prefer pinning an immutable tag or a digest in production, and set
+  # pullPolicy: IfNotPresent alongside it.
   tag: "latest"
-  pullPolicy: IfNotPresent
+  # -- Always, because the default tag above is a floating one: with
+  # IfNotPresent a node that already has a `latest` layer never re-pulls, so
+  # `helm upgrade` produces no pod-spec diff and rolls nothing. Switch to
+  # IfNotPresent when you pin an immutable tag.
+  pullPolicy: Always
+
+# -- Image pull secrets for private registries. GHCR packages are private by
+# default, so an unmodified `ghcr.io/...` reference needs one of these until the
+# package is made public.
+imagePullSecrets: []
+# - name: ghcr-pull-secret
 
 nameOverride: ""
 fullnameOverride: ""
