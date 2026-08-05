@@ -1,11 +1,21 @@
 """Guards the Helm chart's default image reference.
 
-`helm` is not a test dependency, so these parse the chart's YAML rather than
-rendering it.  That is narrower than `helm template` but covers the defect these
-tests exist for: the chart shipped an *unqualified* `repository`, which Docker
-resolves to ``docker.io/library/gpu-reservation-controller`` — a registry the
-CI workflow does not push to and where no such image exists.  Nothing caught it
-because nothing here reads the chart at all.
+`helm` is not a test dependency — the suite also runs inside the Dockerfile's
+`test` stage, which has no helm and no network — so these parse the chart's YAML
+rather than rendering it.  That is narrower than `helm template`, and it is not
+the only check: the `chart` job in `.github/workflows/docker.yml` installs helm
+and renders the chart for real.
+
+The two layers catch different things and neither subsumes the other.  Rendering
+finds template syntax errors, bad indentation and undefined values, none of
+which are visible without a Go template engine.  These tests pin *policy* about
+the values themselves — that the default image reference is registry-qualified
+and names a tag the pipeline actually publishes — which renders perfectly well
+while being wrong, and which is precisely the defect that shipped: an
+unqualified `repository` silently resolving to
+``docker.io/library/gpu-reservation-controller``, a registry CI does not push to
+and where no such image exists.  Nothing caught it because nothing read the
+chart at all.
 """
 
 from __future__ import annotations

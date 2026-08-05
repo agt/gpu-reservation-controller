@@ -1119,7 +1119,20 @@ repository never makes — so the workflow requests it explicitly via
 `type=raw,value=latest`.  The floating default tag is paired with
 `pullPolicy: Always`, without which a node holding an old `latest` layer never
 re-pulls and `helm upgrade` rolls nothing; pin an immutable tag and switch back
-to `IfNotPresent` for production.  `tests/test_chart_image.py` asserts all four
-properties by parsing the chart (helm is not a test dependency, so it does not
-render it) — the previous defaults were wrong on every one and nothing read the
-chart to notice.
+to `IfNotPresent` for production.  The previous defaults were wrong on every one
+of those points, and nothing read the chart to notice.
+
+Two layers now do, and they are complementary rather than redundant:
+
+- **`tests/test_chart_image.py`** asserts the four properties above by *parsing*
+  the chart.  It cannot render — the suite also runs inside the Dockerfile's
+  `test` stage, which has no helm — but the defects it covers render perfectly
+  well while being wrong, so parsing is the right tool for them.
+- **The `chart` job in `.github/workflows/docker.yml`** installs the latest
+  stable helm and renders for real: `helm lint`, a default render asserting the
+  full object set, a render with the optional blocks (`imagePullSecrets`,
+  `INBOUND_API_TOKEN`, `REQUIRED_GROUP_LABEL`) populated — they are empty by
+  default, so the default render proves nothing about them — and a negative case
+  asserting the `reservationApiUrl` `required` guard still fires.  This is what
+  catches template syntax, indentation and undefined values.  `build-and-push-image`
+  needs it: an image whose chart cannot render is not deployable.
