@@ -27,7 +27,7 @@ from types import SimpleNamespace
 from app.config import Config
 from app.controller import PodRuntimeView
 
-from tests.conftest import make_config, GPU_CLASS_LABEL, USERNAME
+from tests.conftest import make_config, run_locked, GPU_CLASS_LABEL, USERNAME
 from tests.conftest import make_state as _state
 from tests.conftest import reservation
 
@@ -244,8 +244,8 @@ class TestMergeOrchestrator:
         pod = _view("p1", reservation_id=100)
         client = _FakeClient(ok=True)
 
-        asyncio.run(
-            m._merge_ondemand_into_bookings(state, client, _config(), [pod], NOW)
+        run_locked(
+            state, m._merge_ondemand_into_bookings(state, client, _config(), [pod], NOW)
         )
 
         assert patched == [("pod-p1", "res-200")]        # re-linked to the booking
@@ -263,8 +263,8 @@ class TestMergeOrchestrator:
         pod = _view("p1", reservation_id=100)
         client = _FakeClient(ok=False)
 
-        asyncio.run(
-            m._merge_ondemand_into_bookings(state, client, _config(), [pod], NOW)
+        run_locked(
+            state, m._merge_ondemand_into_bookings(state, client, _config(), [pod], NOW)
         )
 
         # The pod is still safely re-homed onto the booking; only the lease
@@ -281,10 +281,11 @@ class TestMergeOrchestrator:
         pod = _view("p1", reservation_id=100)
         client = _FakeClient(ok=True)
 
-        asyncio.run(
+        run_locked(
+            state,
             m._merge_ondemand_into_bookings(
                 state, client, _config(ondemand_merge_enabled=False), [pod], NOW
-            )
+            ),
         )
 
         assert patched == [] and client.cancels == []

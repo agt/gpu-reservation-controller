@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 from app.controller import ControllerState
 from app.k8s_client import ToleratedPodInfo
-from tests.conftest import make_config, GPU_CLASS_ID, GPU_CLASS_LABEL, reservation
+from tests.conftest import make_config, run_locked, GPU_CLASS_ID, GPU_CLASS_LABEL, reservation
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +169,21 @@ def _install_k8s_stubs(monkeypatch, m, snapshot):
     return deleted, events
 
 
+def _run_owner_changes(m, state, config, owner_changes):
+    """Plan under the lock, execute outside it — the shape the reconcile uses.
+
+    The eviction I/O deliberately runs with the lock released, so a test that
+    exercises the whole path has to span both halves.
+    """
+    async def _go():
+        snapshot = await m._snapshot_pods_for_eviction(config)
+        async with state.reservation_lock:
+            evictions = m._plan_owner_changes(state, owner_changes, snapshot)
+        await m._execute_evictions(state, evictions)
+
+    asyncio.run(_go())
+
+
 class TestHandleOwnerChanges:
     def test_evicts_prior_owner_pod_and_frees_capacity(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -180,7 +195,7 @@ class TestHandleOwnerChanges:
         state.reservations = [new_res]
         state.record_placement(1, "uid-1", 2)  # prior owner's pod occupies it
 
-        asyncio.run(m._handle_owner_changes(state, make_config(), [(new_res, "alice")]))
+        _run_owner_changes(m, state, make_config(), [(new_res, "alice")])
 
         assert deleted == [("pod-1", "alice")]        # prior owner's pod evicted
         assert events == [("pod-1", "alice", "to bob")]
@@ -197,7 +212,7 @@ class TestHandleOwnerChanges:
         state.reservations = [new_res]
         state.record_placement(1, "uid-2", 2)
 
-        asyncio.run(m._handle_owner_changes(state, make_config(), [(new_res, "alice")]))
+        _run_owner_changes(m, state, make_config(), [(new_res, "alice")])
 
         assert deleted == []                          # nothing in prior namespace
         assert events == []
@@ -212,7 +227,7 @@ class TestHandleOwnerChanges:
         new_res = _booking(1, user_id=2, username="bob")
         state.reservations = [new_res]
 
-        asyncio.run(m._handle_owner_changes(state, make_config(), [(new_res, "alice")]))
+        _run_owner_changes(m, state, make_config(), [(new_res, "alice")])
 
         assert deleted == []
         assert events == []

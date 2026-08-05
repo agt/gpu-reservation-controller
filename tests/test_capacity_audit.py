@@ -23,7 +23,13 @@ from types import SimpleNamespace
 from app.controller import ControllerState, OnDemandCandidate, reconcile_capacity
 from app.schemas import GpuClassDetail
 
-from tests.conftest import GPU_CLASS_ID, GPU_CLASS_LABEL, OTHER_CLASS_LABEL, USERNAME
+from tests.conftest import (
+    GPU_CLASS_ID,
+    GPU_CLASS_LABEL,
+    OTHER_CLASS_LABEL,
+    USERNAME,
+    run_locked,
+)
 
 NOW = datetime(2024, 1, 15, 12, 0, tzinfo=timezone.utc)
 
@@ -124,39 +130,65 @@ class _ClassListClient:
 
 
 class TestCapacityMapPopulation:
-    def _reconcile(self, monkeypatch, classes):
+    def _resolve(self, monkeypatch, classes):
+        """Resolve the class maps the way a reconcile's caller now does.
+
+        Deliberately *not* under the lock: ``_resolve_gpu_class_maps`` runs
+        before it, and that is the property the push endpoint's latency depends
+        on.  Calling it with the lock held would still pass, so this also
+        documents the intended call shape.
+        """
         m = _main_module(monkeypatch)
-        state = ControllerState()
-        asyncio.run(
-            m._reconcile_after_reservation_change(
-                state, _ClassListClient(classes), SimpleNamespace(), [], [], [], NOW
-            )
+        empty = m.GpuClassMaps({}, {}, {})
+        return asyncio.run(
+            m._resolve_gpu_class_maps(_ClassListClient(classes), set(), empty)
         )
-        return state
 
     def test_records_the_override_resolved_count(self, monkeypatch):
         # The regression: recording total_gpus here made the audit compare a
         # number the app is not enforcing.  With physical capacity drained to
         # match the override, auditing 80 vs 40 invented a mismatch and paused
         # JIT admission via guard 4 for a class that was not over-committed.
-        state = self._reconcile(
+        maps = self._resolve(
             monkeypatch, [_detail(total_gpus=80, effective_gpus_today=40)]
         )
-        assert state.gpu_class_capacity == {GPU_CLASS_LABEL: 40}
+        assert maps.capacity == {GPU_CLASS_LABEL: 40}
 
-        diffs, over = reconcile_capacity(state.gpu_class_capacity, {GPU_CLASS_LABEL: 40})
+        diffs, over = reconcile_capacity(maps.capacity, {GPU_CLASS_LABEL: 40})
         assert diffs == []
         assert over == set()
 
     def test_falls_back_to_total_gpus(self, monkeypatch):
-        state = self._reconcile(monkeypatch, [_detail(total_gpus=80)])
-        assert state.gpu_class_capacity == {GPU_CLASS_LABEL: 80}
+        assert self._resolve(monkeypatch, [_detail(total_gpus=80)]).capacity == {
+            GPU_CLASS_LABEL: 80
+        }
 
     def test_class_with_neither_count_is_left_out(self, monkeypatch):
-        state = self._reconcile(monkeypatch, [_detail()])
-        assert state.gpu_class_capacity == {}
+        maps = self._resolve(monkeypatch, [_detail()])
+        assert maps.capacity == {}
         # Still resolvable for matching — only the audit map skips it.
-        assert state.gpu_class_labels == {10: GPU_CLASS_LABEL}
+        assert maps.labels == {10: GPU_CLASS_LABEL}
+
+    def test_a_failed_bulk_fetch_keeps_the_prior_maps(self, monkeypatch):
+        # The fallback path is the only place the resolver reads anything the
+        # caller owns, so it is the one that had to be passed in by value.
+        m = _main_module(monkeypatch)
+
+        class _FailingClient:
+            async def fetch_gpu_classes(self):
+                return None
+
+            async def fetch_gpu_class(self, cid):  # pragma: no cover
+                return None
+
+        prior = m.GpuClassMaps(
+            {10: GPU_CLASS_LABEL}, {GPU_CLASS_LABEL: 10}, {GPU_CLASS_LABEL: 8}
+        )
+        maps = asyncio.run(m._resolve_gpu_class_maps(_FailingClient(), set(), prior))
+        assert maps == prior
+        # Copies, not aliases: mutating the result must not touch the caller's.
+        maps.labels[99] = "other"
+        assert 99 not in prior.labels
 
 
 # ---------------------------------------------------------------------------

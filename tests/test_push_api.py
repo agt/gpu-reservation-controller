@@ -181,6 +181,74 @@ def test_push_cancellation_evicts_admitted_pod(monkeypatch):
         assert [r.id for r in state.reservations] == [] # dropped from active set
 
 
+def test_push_supersede_relinks_instead_of_evicting(monkeypatch):
+    """The Continue/supersede flow: a pod is carried forward, not killed.
+
+    The app pushes the ``superseded`` cancellation **and** its replacement
+    booking in one body.  The eviction planner must run *after* the merged set
+    is installed, so ``find_open_booking_for`` can see the replacement — which is
+    exactly the invariant the plan/execute split is most likely to break.  Get
+    the ordering wrong and a user's running job is deleted instead of re-linked.
+    """
+    main = _patched_main(monkeypatch, token="secret")
+
+    pod = ToleratedPodInfo(
+        namespace=USERNAME, name="pod-1", uid="uid-1", gpu_class=GPU_CLASS_LABEL,
+        booking_reference="res-1", reservation_id=1, gpu_count=1,
+        phase="Running", scheduled_false=False,
+    )
+    deleted: list[tuple[str, str]] = []
+    relinked: list[tuple[str, str]] = []
+
+    async def _snapshot(_key, _group_label_key=None):
+        return [pod]
+
+    async def _delete(name, ns):
+        deleted.append((name, ns))
+
+    async def _read(name, ns):
+        return SimpleNamespace(status=SimpleNamespace(phase="Running", conditions=None))
+
+    async def _emit(*a, **k):
+        return None
+
+    async def _apply_toleration(name, ns, pod_obj, key, value, booking_reference):
+        relinked.append((name, booking_reference))
+
+    async def _record_guarantee(*a, **k):
+        return None
+
+    monkeypatch.setattr(main, "snapshot_tolerated_pods", _snapshot)
+    monkeypatch.setattr(main, "delete_pod", _delete)
+    monkeypatch.setattr(main, "read_pod", _read)
+    monkeypatch.setattr(main, "emit_reservation_cancelled_event", _emit)
+    monkeypatch.setattr(main, "emit_overstay_relinked_event", _emit)
+    monkeypatch.setattr(main, "apply_toleration", _apply_toleration)
+    monkeypatch.setattr(main, "_record_guarantee", _record_guarantee)
+
+    with TestClient(main.app) as client:
+        state = main.app.state.controller_state
+        state.reservations = [_booking(1, user_id=1, username=USERNAME)]
+        state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
+        state.record_placement(1, "uid-1", 1)
+
+        # Both entries in one push, as POST /continue sends them: the superseded
+        # source and its replacement booking.
+        resp = client.post(
+            "/api/reservations/push",
+            json=_json(
+                _booking(1, user_id=1, username=USERNAME, status="cancelled"),
+                _booking(2, user_id=1, username=USERNAME),
+            ),
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert resp.status_code == 200
+
+        assert deleted == [], "the pod was evicted instead of carried forward"
+        assert relinked == [("pod-1", "res-2")]
+        assert state.occupancy.get(2, {}) == {"uid-1": 1}  # occupancy re-homed
+        assert state.occupancy.get(1, {}) == {}
+
 def _booking(res_id, *, user_id, username, status="active"):
     """An open (now-1h … now+1h) booking reservation with an explicit owner."""
     from tests.conftest import reservation
