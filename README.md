@@ -758,8 +758,8 @@ gpu-reservation-controller/
 ├── helm/gpu-reservation-controller/  Helm chart (Deployment, RBAC, Service)
 ├── docs/
 │   ├── RESERVATION-API.md    Reservation management API specification
-│   │                         (identical copy of API.md in gpu-reservation-app —
-│   │                         update both together)
+│   │                         (identical copy of docs/contracts/RESERVATION-API.md
+│   │                         in gpu-reservation-app — update both together)
 │   ├── SCHEDULING.md         Reservation-app scheduling behaviour reference (shared copy)
 │   └── lifecycle.mmd/.png    Pod lifecycle state diagram (Mermaid + rendered)
 ├── requirements.txt

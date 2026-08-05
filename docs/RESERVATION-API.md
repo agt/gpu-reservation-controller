@@ -219,6 +219,11 @@ to a user's web booking.
 Retrieve reservations with optional filters and pagination. Service keys see
 all reservations across all users and groups.
 
+A non-privileged user's default scope is their own reservations, plus any in a
+group they **manage**, plus any in a group with `researcher_mode` set that they
+belong to. The last is **read-only** reach: `DELETE`, `waive-penalty`, `adopt`
+and `continue` are unchanged, so an observer may cancel only their own booking.
+
 **Query parameters**
 
 | Parameter | Type | Default | Description |
@@ -231,7 +236,7 @@ all reservations across all users and groups.
 | `user_id` | integer | — | Filter by user ID |
 | `username` | string | — | Filter by username (exact match) |
 | `group_id` | integer | — | Filter by usage group ID |
-| `include_teammates` | boolean | `false` | Switch to the personal *"me + my team"* scope — own reservations **plus** teammates' reservations in team-enabled groups (Team Mode). Replaces the default own+managed scope, and applies to **any** user token including admins and auditors (it is how the personal pages stay personal for a privileged viewer). Ignored for service keys, which have no user identity to scope to. |
+| `include_teammates` | boolean | `false` | Switch to the personal *"me + my team"* scope — own reservations **plus** teammates' reservations in team-enabled groups (Team Mode). Replaces the default own+managed scope (and is **not** widened by `researcher_mode` — the personal pages stay personal), and applies to **any** user token including admins and auditors. Ignored for service keys, which have no user identity to scope to. |
 | `include_consumed_cancellations` | boolean | `false` | Widen `status=active` to also return cancellations that consumed something: the reservation had already started, **or** it retained a late-cancellation SU charge (`su_cost_user > 0`). A cancellation that neither ran nor was charged is still excluded. No-op for `status=all`; ignored for `status=cancelled` (which it could only narrow) and for `status=recent` (which already returns every status inside its window). |
 | `created_after` | datetime | — | Include reservations created at or after this time |
 | `created_before` | datetime | — | Include reservations created at or before this time |
@@ -283,8 +288,10 @@ X-API-Key: gpures_...
 `start_dt` / `end_dt` are the booking's site-local wall-clock interval (naive, no
 timezone). A user-scheduled reservation (`kind: "booking"`) is a whole-hour range
 that **may cross midnight** (`end_dt` on the next calendar day); non-privileged
-members are limited to 48 hours, while admins and group managers have no
-server-side cap. An on-demand lease (`kind: "on_demand"`) starts and ends on
+members are limited to 48 hours, while admins, group managers, and members of a
+`researcher_mode` group are exempt from *that* cap. Every booking is additionally
+bounded by its group's `max_reservation_hours` (default 168 h), which has **no
+privilege exemption** — it binds admins and managers too. An on-demand lease (`kind: "on_demand"`) starts and ends on
 **arbitrary second-granularity timestamps** — clients must not assume the hourly
 grid. `date` mirrors `start_dt`'s date
 and is provided for convenience filtering. `su_cost_user` is the Service Units
@@ -340,7 +347,16 @@ Semantics:
 - **The app anchors `start_dt` at its own "now"** (avoiding controller/app clock
   skew) and sets `end_dt = start + duration_seconds`. The controller typically
   sends `duration_seconds = min_runtime_seconds + buffer`. Bounds: 60 s ≤
-  `duration_seconds` ≤ 604 800 (7 days).
+  `duration_seconds` ≤ 31 622 400 (366 days) — a malformed-input guard only. The
+  **effective** limit is the group's `max_reservation_hours` (default 168 h),
+  enforced in the handler and returned as **409**, not 422.
+
+  > **Contract change.** This upper bound was previously 604 800 (7 days), which
+  > made 168 h a hard limit on this path. That ceiling is now the per-group
+  > `max_reservation_hours` with the same 168 default, so **behaviour is
+  > unchanged in the default configuration**; the bound was raised only so a
+  > deliberately-raised group ceiling is reachable here rather than 422'ing at
+  > schema validation. Controllers need no change.
 - `username` / `group_name` are natural keys. The user must be an **active
   member** of the named active group, and the GPU class must be attached to that
   group (or `attach_all_groups`). Users supply the group via a pod annotation
@@ -353,7 +369,9 @@ Semantics:
   `max_gpus_per_reservation`, and the group's validity dates (±90-day grace for
   those privileged users).
 - **Timing policy does not apply**: no 15-minute lead requirement, no whole-hour
-  alignment, no 48-hour cap, no `min/max_days_ahead` window.
+  alignment, no 48-hour cap, no `min/max_days_ahead` window. The group's
+  `max_reservation_hours` ceiling **does** apply — it is resource protection
+  rather than timing policy, and has no exemption for any caller.
 - The lease is charged Service Units exactly like a booking (`su_cost_user` /
   `su_cost_group` stored at creation).
 - No confirmation email is sent and nothing is pushed to the controller — the
@@ -367,7 +385,7 @@ Semantics:
 | 200 | `idempotency_key` matched an existing reservation — that original reservation is returned unchanged (idempotent retry) |
 | 403 | Missing/`read_only` key, or a human session sent `on_demand: true` |
 | 404 | Unknown `username` / `group_name` / `gpu_class_id` (or inactive) |
-| 409 | Denied — insufficient capacity **or** a policy gate (membership, class access, SU budget, GPU cap, validity dates). Human-readable JSON `detail` explains which |
+| 409 | Denied — insufficient capacity **or** a policy gate (membership, class access, SU budget, GPU cap, validity dates, `max_reservation_hours`). Human-readable JSON `detail` explains which |
 | 422 | Malformed body (e.g. `duration_seconds` out of bounds) |
 
 Send a fresh `idempotency_key` per lease attempt (e.g. derived from the pod
@@ -433,7 +451,7 @@ reservation, so the job keeps running with no relaunch. Callable by the source's
 
 | Field | Meaning |
 |-------|---------|
-| `duration_seconds` | Length of the new guaranteed window from now (60 … 604 800). Required. |
+| `duration_seconds` | Length of the new guaranteed window from now (60 … 31 622 400; previously capped at 604 800 — see the contract note under on-demand creation). Required. Also bounded by the group's `max_reservation_hours`, which is enforced in the handler and returned as **400**. |
 | `gpu_count` | GPUs for the new reservation; defaults to the source's count. Optional. |
 | `notes` | Stored on the new reservation; defaults to the source's notes. Optional. |
 
@@ -906,6 +924,34 @@ then use IDs for all membership operations below.
 
 ---
 
+#### `GET /api/groups/oversight`
+
+List the active groups whose reservations the caller may see on the group
+reservations page: the union of groups they **manage** and groups with
+`researcher_mode` set that they **belong to**. Ordered by name; empty when the
+caller has neither.
+
+Frontend-facing (session auth only) — it exists so the sidebar and the group
+page can decide every manager/observer affordance from one small payload.
+`GET /api/groups/managed` is unchanged and still means exactly "groups I
+manage"; this route is additive.
+
+**Response** `200` — array of `GroupOversight`: `id`, `name`,
+`provisioning_source`, `allow_manager_impersonation`, `researcher_mode`, and
+`can_manage` (boolean). `can_manage: false` means the reach comes from
+`researcher_mode` and is **read-only** — the caller may not cancel, waive, or
+book on behalf of others in that group.
+
+```json
+[
+  { "id": 3, "name": "vision-lab", "provisioning_source": "admin",
+    "allow_manager_impersonation": false, "researcher_mode": true,
+    "can_manage": false }
+]
+```
+
+---
+
 #### `GET /api/groups/{group_id}/members`
 
 List all members of a group, ordered by username.
@@ -1124,6 +1170,8 @@ entry is a full GpuClassResponse.
 | `sync_with_sicad` | boolean | Read-only derived flag (`provisioning_source == "sicad"`). When `true`, the app's built-in SICAD roster sync keeps this group's membership in sync with the course roster (add-only). Retained for backward compatibility; set `provisioning_source` to change it |
 | `sicad_course_id` | string \| null | Remote SICAD/AWSEd courseID backing the roster sync. `null` = fall back to `name`, letting the group name differ from the SICAD courseID. Only meaningful when `provisioning_source` is `"sicad"` |
 | `allow_manager_impersonation` | boolean | Whether this group's **managers** may impersonate its members (`POST /api/users/{id}/impersonate`). Default `false`; administrators may impersonate regardless. Granting it on a group whose `provisioning_source` is `"manager"` also lets those managers impersonate anyone they choose to add. Settable only by an admin via `POST`/`PUT /api/groups` |
+| `researcher_mode` | boolean | Whether this group's **ordinary members** may read every reservation in it and book past the 48-hour duration cap. Default `false`. Read-only: cancel, waive, adopt and continue are unaffected, and no other admission gate is relaxed (SU budget and pool, `min/max_days_ahead`, the strict `valid_from`/`valid_until` boundary with no manager grace, capacity, `max_gpus_per_reservation` all still bind). Settable only by an admin via `POST`/`PUT /api/groups` |
+| `max_reservation_hours` | integer | Hard ceiling on the length of a **single** reservation, in hours. Default `168` (7 days); always present and always finite — there is no "unlimited". Applies on **every** creation path (booking, on-demand lease, continue) and to **every** caller, including group managers and admins; unlike the 48-hour cap it has no exemption. A non-exempt member is therefore bounded by `min(48, max_reservation_hours)`. Settable only by an admin via `POST`/`PUT /api/groups` |
 | `is_active` | boolean | Inactive groups cannot accept new reservations |
 | `created_at` | datetime | UTC |
 | `members` | array of [GroupMemberBrief](#groupmemberbrief) | |
@@ -1197,7 +1245,7 @@ Returned by `GET /api/groups/{group_id}/members`.
 | `gpu_class_id` | integer | |
 | `gpu_class` | `{id, name, label_value}` | |
 | `start_dt` | datetime (local, no suffix) | Reservation start in site-local wall-clock; may cross midnight. Whole-hour for `kind="booking"`; arbitrary for `kind="on_demand"` |
-| `end_dt` | datetime (local, no suffix) | Reservation end; ≤ 48h after `start_dt` for non-privileged members' bookings; no server-side cap for admins/managers; `start + duration_seconds` for leases |
+| `end_dt` | datetime (local, no suffix) | Reservation end; ≤ 48h after `start_dt` for non-privileged members' bookings (admins/managers and members of a `researcher_mode` group are exempt from that cap), and in all cases ≤ the group's `max_reservation_hours` after `start_dt`; `start + duration_seconds` for leases |
 | `date` | date | Calendar date of `start_dt` (convenience for filtering) |
 | `start_utc` | string (ISO 8601, `Z`) | Reservation start converted to UTC; use this for time comparisons |
 | `end_utc` | string (ISO 8601, `Z`) | Reservation end converted to UTC; the end of the pod's *guaranteed* window, not a hard runtime cap — see §6 above |

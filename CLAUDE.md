@@ -485,8 +485,8 @@ ns/name` becomes `ns=… pod=…`), arrows or `a..b` ranges inside a value.
 (`kv()`) is the only thing that renders it.
 
 Both are **duplicated verbatim in the reservation app**, the same arrangement
-`docs/RESERVATION-API.md` / the app's `API.md` already use — update the copies
-together.  Sharing the dictionary is the point: a controller line and an app line
+`docs/RESERVATION-API.md` / the app's `docs/contracts/RESERVATION-API.md` already
+use — update the copies together.  Sharing the dictionary is the point: a controller line and an app line
 join on the same key (`rid`, `poduid`, `cid`), which the old vocabularies could
 not do (`uid=` meant the pod UID here and nothing there; a reservation was `#42`
 here and `id=42` there).

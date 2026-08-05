@@ -28,12 +28,20 @@ content. Both repositories carry an identical manifest, and
 `tests/test_shared_artifacts.py` in each repo fails when a local copy no longer
 matches it.
 
+The manifest keys on the **logical name**, not the path, which is what let the
+app reorganise its documentation without either repo's manifest changing: only
+this table and each repo's `_ARTIFACTS` map had to follow.
+
 | logical name | path in gpu-reservation-app | path in gpu-reservation-controller |
 |---|---|---|
 | `log_fields.py` | `app/log_fields.py` | `app/log_fields.py` |
-| `LOG-FIELDS.md` | `docs/LOG-FIELDS.md` | `docs/LOG-FIELDS.md` |
-| `RESERVATION-API.md` | `API.md` | `docs/RESERVATION-API.md` |
-| `SCHEDULING.md` | `SCHEDULING.md` | `docs/SCHEDULING.md` |
+| `LOG-FIELDS.md` | `docs/contracts/LOG-FIELDS.md` | `docs/LOG-FIELDS.md` |
+| `RESERVATION-API.md` | `docs/contracts/RESERVATION-API.md` | `docs/RESERVATION-API.md` |
+| `SCHEDULING.md` | `docs/contracts/SCHEDULING.md` | `docs/SCHEDULING.md` |
+
+The app's manifest now lives at `docs/contracts/SHARED-ARTIFACTS.sha256`; the
+controller's stays at `docs/SHARED-ARTIFACTS.sha256`. The bodies are identical —
+only the two files' locations differ.
 
 ## Changing a shared artifact
 
