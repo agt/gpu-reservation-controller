@@ -363,8 +363,10 @@ Semantics:
   and are responsible for matching the usage-group name exactly.
 - **Feasibility is the same analysis as a web booking**: the three capacity
   tiers (physical / cohort / group, including borrowing when the group's
-  resolved relaxation flag is on, clamped by the class's `relax_min_available`
-  buffer), the per-member/team SU budget and group SU pool (skipped when the
+  resolved relaxation flag is on, clamped by the class's borrowing buffer — and
+  since a lease is anchored at "now", by that buffer's near value
+  `relax_min_available` rather than its at-horizon value), the per-member/team SU
+  budget and group SU pool (skipped when the
   user is an admin or a manager of the group — as if they booked themselves),
   `max_gpus_per_reservation`, and the group's validity dates (±90-day grace for
   those privileged users).
@@ -745,6 +747,7 @@ either service-key scope.
   "su_rate_per_hour": 4,
   "max_gpus_per_reservation": 2,
   "relax_min_available": null,
+  "relax_min_available_far": null,
   "attach_all_groups": false,
   "is_active": true,
   "created_at": "2026-01-15T09:00:00Z"
@@ -753,9 +756,12 @@ either service-key scope.
 
 `su_rate_per_hour` is the base Service Units charged per GPU per hour (before
 discount-schedule multipliers). `max_gpus_per_reservation` caps a single booking's
-GPU count (`null` = no cap). `relax_min_available` is an admission-control
-buffer for borrowing (limit relaxation; `null` = no buffer); it does not affect the
-controller and can be ignored by API clients.
+GPU count (`null` = no cap). `relax_min_available` and `relax_min_available_far`
+are an admission-control buffer for borrowing (limit relaxation): the GPUs withheld
+from borrowing for an hour starting now and for one starting at the borrowing
+horizon respectively, interpolated linearly in between (`relax_min_available:
+null` = no buffer; `relax_min_available_far: null` = no ramp, flat at the near
+value). Neither affects the controller and both can be ignored by API clients.
 
 **Two GPU counts, and they can differ.** `total_gpus` is the class's configured
 default. `effective_gpus_today` is that default after applying any date-span

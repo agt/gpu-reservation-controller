@@ -370,7 +370,10 @@ Consequences for the scheduling model:
 - An admitted lease **holds its capacity until it ends or is cancelled** — a web
   booking cannot displace on-demand usage. The per-class borrowing buffer
   (`relax_min_available`) is the operator's lever for keeping headroom open for
-  interactive users on a busy class.
+  interactive users on a busy class. Note that a lease is anchored at "now",
+  which is the *shallow* end of that buffer's lead-time ramp (below), so
+  `relax_min_available` — not `relax_min_available_far` — is the value protecting
+  interactive capacity.
 - Leases are charged Service Units and budget-gated exactly like bookings, so
   heavy on-demand use draws down the same per-member/team budget.
 - The controller cancels a lease it no longer needs
@@ -414,8 +417,28 @@ bounds, active flag, and the list of GPU classes the schedule applies to
 (`gpu_class_ids`; a schedule with no attached classes has no effect).
 
 Site-wide: timezone; the borrowing default (`relax_limits`, Admin → Settings)
-with per-group/per-cohort tri-state overrides; and each class's borrowing buffer
-(`relax_min_available`).
+with per-group/per-cohort tri-state overrides; the borrowing time horizon
+(`borrow_horizon_hours`, Admin → Settings — how far ahead borrowed headroom may
+breach a group/cohort ceiling; `0` disables borrowing, a negative value means no
+horizon); and each class's borrowing buffer.
+
+That buffer is a **linear ramp over the horizon**, not a constant:
+`relax_min_available` is the GPUs withheld from borrowing for an hour starting
+now, `relax_min_available_far` the GPUs withheld for an hour starting at the
+horizon, and hours in between interpolate (rounded up). What the buffer protects
+is capacity for groups still inside their own ceilings who have not booked yet,
+and how much of that demand is still coming is a function of lead time — an hour
+twelve hours out will still absorb ordinary bookings, an hour thirty minutes out
+will not. `relax_min_available_far` unset means **no ramp** (flat at
+`relax_min_available`), which is not the same as zero; with no horizon at all
+there is no span to interpolate over and the far value applies at every date.
+
+Two consequences worth stating, because they are what make the ramp safe. The
+buffer only ever *falls* as an hour approaches, so an already-admitted booking
+can never become retroactively infeasible, and an availability preview can only
+be more conservative than the submit that follows it. And because the ramp is
+normalised to the horizon, shortening the horizon steepens every class's ramp
+rather than merely truncating it.
 
 ## 10. Open questions, future work
 
