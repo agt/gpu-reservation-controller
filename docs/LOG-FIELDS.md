@@ -145,6 +145,8 @@ follow this grammar and are not expected to.
 | `user` | string | username (controller: also the pod's namespace) |
 | `gid` | int | usage group id |
 | `group` | string | usage group name |
+| `src_gid` | int | lending usage group id (GPU loan; a loan names two groups, so neither can be plain `gid`) |
+| `dst_gid` | int | borrowing usage group id (GPU loan) |
 | `cid` | int | GPU class id |
 | `class` | string | GPU class display name |
 | `clabel` | string | GPU class Kubernetes node-label value |
@@ -172,6 +174,8 @@ follow this grammar and are not expected to.
 | `role` | `admin` \| `auditor` \| `user`, or `member` \| `manager` | scoped by `event=` |
 | `scope` | `read_only` \| `read_write` | service-key privilege |
 | `bootstrap` | bool | whether `BOOTSTRAP_ADMIN_USERNAME` granted the new account admin (emitted only when it did) |
+| `direction` | `offer` \| `request` | which side proposed a GPU loan, and therefore which side approves it |
+| `forced` | bool | whether an administrator overrode a GPU-loan accommodation check, leaving a group over its resulting limit (emitted only when they did) |
 | `banner` | bool | whether an effective-date shift announces itself on screen; `false` means this line is the only record of it |
 
 `reason` enums by event: `auth.login_failed` → `no_such_user`, `inactive`,
