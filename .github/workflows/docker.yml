@@ -14,6 +14,14 @@ on:
   schedule:
     - cron: '0 0 * * 0'
   push:
+  # Manual trigger from the Actions tab. Kept because a push is not always
+  # enough on its own: during the August 2026 Actions outage, pushes were
+  # accepted and recorded but created no workflow runs at all, leaving no way
+  # to build a commit that was already on the remote short of an empty commit.
+  # Note this button only appears once the workflow file carrying it is on the
+  # default branch — GitHub reads the trigger list from there, not from the
+  # branch being dispatched. Mirrors the reservation app's workflow.
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
