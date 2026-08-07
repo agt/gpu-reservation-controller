@@ -359,7 +359,8 @@ it *requests a lease* from the app (`POST /api/reservations` with
 count + duration. The app anchors the lease at its own "now" and admits it with
 the **same admission control as a web booking** — the three capacity tiers
 (physical / cohort / group, including borrowing when the group's resolved
-relaxation flag is on, clamped by the per-class `relax_min_available` buffer),
+relaxation mode permits it, clamped by the per-class `relax_min_available` buffer
+— or by `relax_min_available_junior` for a `junior` group),
 the SU budget and pool gates, `max_gpus_per_reservation`, and the group validity
 window — while timing policy (15-minute lead, whole-hour grid, 48-hour cap,
 `min/max_days_ahead`) does not apply. Denials return 409; requests are
@@ -373,7 +374,8 @@ Consequences for the scheduling model:
   interactive users on a busy class. Note that a lease is anchored at "now",
   which is the *shallow* end of that buffer's lead-time ramp (below), so
   `relax_min_available` — not `relax_min_available_far` — is the value protecting
-  interactive capacity.
+  interactive capacity. A `junior` group's leases are the exception: its buffer
+  does not ramp, so they face the same floor as its bookings do at any lead time.
 - Leases are charged Service Units and budget-gated exactly like bookings, so
   heavy on-demand use draws down the same per-member/team budget.
 - The controller cancels a lease it no longer needs
@@ -416,8 +418,9 @@ Per **SU discount schedule**: days-of-week, start/end time-of-day window
 bounds, active flag, and the list of GPU classes the schedule applies to
 (`gpu_class_ids`; a schedule with no attached classes has no effect).
 
-Site-wide: timezone; the borrowing default (`relax_limits`, Admin → Settings)
-with per-group/per-cohort tri-state overrides; the borrowing time horizon
+Site-wide: timezone; the borrowing default (`relax_limits`, Admin → Settings —
+on/off only) with per-group/per-cohort `relax_mode` overrides (`off`/`on`/`junior`,
+unset = inherit); the borrowing time horizon
 (`borrow_horizon_hours`, Admin → Settings — how far ahead borrowed headroom may
 breach a group/cohort ceiling; `0` disables borrowing, a negative value means no
 horizon); and each class's borrowing buffer.
@@ -439,6 +442,18 @@ can never become retroactively infeasible, and an availability preview can only
 be more conservative than the submit that follows it. And because the ramp is
 normalised to the horizon, shortening the horizon steepens every class's ramp
 rather than merely truncating it.
+
+A group or cohort set to **`junior`** borrows against a **second, fixed** buffer
+instead: `relax_min_available_junior`, the same number at every lead time. Set
+deeper than the pair above — which is what it is for — it means a junior scope
+reaches idle capacity only once it runs past what the ordinary buffer was
+protecting, so ordinary borrowers keep first claim on the shallower hours. Being
+constant, it satisfies the falling-buffer property above trivially. It is bounded
+by the same borrowing horizon, and it has no site-wide or per-scope resolution of
+its own — it is per class only. `relax_min_available_junior` unset means the class
+opens **no junior lane at all** (a junior scope borrows nothing there), which is a
+third distinct null and makes the tier an explicit per-class opt-in rather than
+something a class acquires by default.
 
 ## 10. Open questions, future work
 
