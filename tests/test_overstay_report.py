@@ -6,7 +6,7 @@ app's ``POST /api/reservations/{id}/overstay`` endpoint — but only for a genui
 overstay (the pod ran past its runtime guarantee) and only when
 ``OVERSTAY_REPORT_ENABLED`` is on. The overstay start is the live ``guarantee_end``
 when the reservation is still resolvable, else the pod's frozen
-``horae/guaranteed-until`` annotation.
+``galends/guaranteed-until`` annotation.
 """
 
 from __future__ import annotations
@@ -61,9 +61,9 @@ def _pod(
 ) -> SimpleNamespace:
     annotations: dict = {}
     if reservation_id is not None:
-        annotations["horae/booking-reference"] = make_booking_reference(reservation_id)
+        annotations["galends/booking-reference"] = make_booking_reference(reservation_id)
     if guaranteed_until is not None:
-        annotations["horae/guaranteed-until"] = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+        annotations["galends/guaranteed-until"] = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
     container = SimpleNamespace(
         resources=SimpleNamespace(requests={"nvidia.com/gpu": gpu_count}, limits=None)
     )
@@ -133,7 +133,7 @@ def test_no_report_when_within_guarantee():
 
 def test_falls_back_to_annotation_when_reservation_gone():
     # Reservation no longer in the list → guarantee_end is None → use the pod's
-    # frozen horae/guaranteed-until annotation as the overstay start.
+    # frozen galends/guaranteed-until annotation as the overstay start.
     ge = NOW - timedelta(minutes=45)
     state = _state_with(500, start_utc=ge, end_utc=ge, in_list=False)
     client = _FakeClient()

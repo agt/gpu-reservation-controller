@@ -81,7 +81,7 @@ config:
   # on-demand lease instead of waiting.
   ondemandHorizonMinutes: 30
 
-  # Minutes added to a pod's horae/minimum-runtime-seconds annotation when
+  # Minutes added to a pod's galends/minimum-runtime-seconds annotation when
   # sizing the duration of a requested JIT lease.
   ondemandLeaseBufferMinutes: 10
 
@@ -150,7 +150,7 @@ config:
   ondemandMergeEnabled: true
 
   # Stamp pods at risk of demand-driven preemption with informational
-  # horae/termination-warning-* annotations (projected termination time, risk
+  # galends/termination-warning-* annotations (projected termination time, risk
   # score, and a human-readable message) after each preemption sweep.  Purely
   # informational — nothing is enforced.  Set to false to disable.
   terminationWarningEnabled: true

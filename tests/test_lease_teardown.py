@@ -7,7 +7,7 @@ preempted, ``pod_watch_loop`` cancels the lease via
 letting it linger active until it expires.
 
 The on-demand-vs-booking distinction is read live off the reservation's ``kind``
-field (no in-memory tracking): the pod's ``horae/booking-reference`` annotation
+field (no in-memory tracking): the pod's ``galends/booking-reference`` annotation
 resolves to the lease id, and only ``kind == "on_demand"`` rows are cancelled.
 """
 
@@ -55,7 +55,7 @@ class _FakeClient:
 def _pod(uid: str, *, reservation_id: int | None, phase: str = "Running") -> SimpleNamespace:
     annotations = None
     if reservation_id is not None:
-        annotations = {"horae/booking-reference": make_booking_reference(reservation_id)}
+        annotations = {"galends/booking-reference": make_booking_reference(reservation_id)}
     return SimpleNamespace(
         metadata=SimpleNamespace(
             uid=uid,

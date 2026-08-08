@@ -634,7 +634,7 @@ this best-effort when an overstay **ends** (the pod is deleted, terminates on
 its own, or is preempted), so the full duration is known.
 
 `{id}` is the parent reservation the overstaying pod was admitted under (its
-`horae/booking-reference`). The GPU class, owner, and group are copied from that
+`galends/booking-reference`). The GPU class, owner, and group are copied from that
 reservation (authoritative); the controller supplies only the pod's `gpu_count`,
 the overstay window in **UTC**, and a machine-readable `end_reason`.
 
@@ -700,7 +700,7 @@ it. Two reasons the distinction is load-bearing:
   express, since it forbids raising an existing deadline.
 - Killing at the boundary destroys work that nobody is waiting on. The reference
   controller instead records the instant as an informational
-  `horae/guaranteed-until` annotation and preempts on demand.
+  `galends/guaranteed-until` annotation and preempts on demand.
 
 An integrator who genuinely wants a hard cap should set one from their own
 policy, not from `end_utc`.

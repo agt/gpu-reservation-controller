@@ -7,8 +7,8 @@ Public surface
 --------------
 init_k8s(kubeconfig_path)                    — load credentials once at startup
 get_pod_gpu_count(pod)                       — sum nvidia.com/gpu requests
-get_pod_booking_reference(pod)               — read horae/booking-reference annotation
-get_pod_usage_group(pod)                     — read horae/usage-group annotation (JIT lease group)
+get_pod_booking_reference(pod)               — read galends/booking-reference annotation
+get_pod_usage_group(pod)                     — read galends/usage-group annotation (JIT lease group)
 parse_booking_reference(ref)                 — reservation id from a booking-reference
 pod_has_toleration(pod, ...)                 — check for a specific toleration
 is_gpu_only_pending(pod)                      — guard 1: GPU-only scheduling failure check
@@ -110,13 +110,13 @@ def get_unschedulable_message(pod) -> str:
 
 
 def get_pod_min_runtime_seconds(pod) -> Optional[int]:
-    """Read the ``horae/minimum-runtime-seconds`` annotation from *pod*.
+    """Read the ``galends/minimum-runtime-seconds`` annotation from *pod*.
 
     Returns the integer value if the annotation is present and parseable as a
     positive integer, or ``None`` otherwise.
     """
     annotations: dict = pod.metadata.annotations or {}
-    raw = annotations.get("horae/minimum-runtime-seconds")
+    raw = annotations.get("galends/minimum-runtime-seconds")
     if raw is None:
         return None
     try:
@@ -126,13 +126,13 @@ def get_pod_min_runtime_seconds(pod) -> Optional[int]:
         log.warning("%s", kv(
             event="pod.annotation_invalid",
             ns=pod.metadata.namespace, pod=pod.metadata.name,
-            annotation="horae/minimum-runtime-seconds", value=raw,
+            annotation="galends/minimum-runtime-seconds", value=raw,
         ))
         return None
 
 
 def get_pod_usage_group(pod) -> Optional[str]:
-    """Read the ``horae/usage-group`` annotation from *pod*.
+    """Read the ``galends/usage-group`` annotation from *pod*.
 
     Names the usage group a JIT on-demand lease should be created under —
     ``group_name`` is a required natural key on the app's lease-create endpoint
@@ -143,7 +143,7 @@ def get_pod_usage_group(pod) -> Optional[str]:
     the annotation is absent or empty.
     """
     annotations: dict = getattr(pod.metadata, "annotations", None) or {}
-    return annotations.get("horae/usage-group") or None
+    return annotations.get("galends/usage-group") or None
 
 
 def get_pod_gpu_count(pod) -> int:
@@ -161,18 +161,18 @@ def get_pod_gpu_count(pod) -> int:
 
 
 def get_pod_booking_reference(pod) -> Optional[str]:
-    """Return the ``horae/booking-reference`` annotation value, or ``None``."""
+    """Return the ``galends/booking-reference`` annotation value, or ``None``."""
     annotations: dict = getattr(pod.metadata, "annotations", None) or {}
-    return annotations.get("horae/booking-reference")
+    return annotations.get("galends/booking-reference")
 
 
 # Annotation keys for the informational termination-warning stamped on a pod at
 # risk of demand-driven preemption (see main._apply_termination_warnings).  Like
 # the runtime-guarantee annotations, these are best-effort and never read back
 # to make a decision; the sweep recomputes risk live from reservation state.
-TERMINATION_WARNING_AT = "horae/termination-warning-at"
-TERMINATION_WARNING_RISK = "horae/termination-warning-risk"
-TERMINATION_WARNING_MESSAGE = "horae/termination-warning-message"
+TERMINATION_WARNING_AT = "galends/termination-warning-at"
+TERMINATION_WARNING_RISK = "galends/termination-warning-risk"
+TERMINATION_WARNING_MESSAGE = "galends/termination-warning-message"
 
 
 def get_pod_termination_warning(pod) -> tuple[Optional[str], Optional[str]]:
@@ -191,12 +191,12 @@ def get_pod_termination_warning(pod) -> tuple[Optional[str], Optional[str]]:
 
 # Annotation key for the pod's live guarantee status: whether it is still inside
 # its runtime guarantee (``"guaranteed"``) or running past it (``"overstay"``).
-# It rides alongside the existing ``horae/guaranteed-until`` (the guarantee-end
+# It rides alongside the existing ``galends/guaranteed-until`` (the guarantee-end
 # instant, kept live) as a general status surface, stamped at admission and
 # refreshed as the status changes (guarantee lapsing, adoption/merge).  Like the
 # other guarantee/termination annotations it is best-effort and never read back
 # to make a decision.
-GUARANTEE_STATUS = "horae/guarantee-status"
+GUARANTEE_STATUS = "galends/guarantee-status"
 GUARANTEE_STATUS_GUARANTEED = "guaranteed"
 GUARANTEE_STATUS_OVERSTAY = "overstay"
 
@@ -211,11 +211,11 @@ def get_pod_guarantee_status(pod) -> tuple[Optional[str], Optional[str]]:
     annotations: dict = getattr(pod.metadata, "annotations", None) or {}
     return (
         annotations.get(GUARANTEE_STATUS),
-        annotations.get("horae/guaranteed-until"),
+        annotations.get("galends/guaranteed-until"),
     )
 
 
-# Prefix recorded in a horae/booking-reference value.  Every admitted pod is a
+# Prefix recorded in a galends/booking-reference value.  Every admitted pod is a
 # real reservation now (the lease model requests one just-in-time rather than
 # placing onto an ad-hoc block), so there is only one kind.  Construction
 # (make_booking_reference) and parsing (parse_booking_reference) live together
@@ -224,7 +224,7 @@ _BOOKING_REFERENCE_PREFIX = "res-"
 
 
 def make_booking_reference(reservation_id: int) -> str:
-    """Build a ``horae/booking-reference`` value for *reservation_id*.
+    """Build a ``galends/booking-reference`` value for *reservation_id*.
 
     The result round-trips through ``parse_booking_reference``.
     """
@@ -232,7 +232,7 @@ def make_booking_reference(reservation_id: int) -> str:
 
 
 def parse_booking_reference(reference: Optional[str]) -> Optional[int]:
-    """Extract the reservation id embedded in a ``horae/booking-reference`` value.
+    """Extract the reservation id embedded in a ``galends/booking-reference`` value.
 
     ``"res-42"`` returns ``42``.  Returns ``None`` for an unrecognised prefix,
     a non-integer suffix, or ``None``/empty input.  This is the single key
@@ -511,7 +511,7 @@ async def apply_toleration(
     booking_reference: str,
 ) -> None:
     """Patch *pod* to add toleration ``tol_key=tol_value:NoSchedule`` and set
-    the ``horae/booking-reference`` annotation.
+    the ``galends/booking-reference`` annotation.
 
     The booking-reference is the single key from which occupancy is later
     reconstructed (see parse_booking_reference).  The patch preserves all
@@ -540,7 +540,7 @@ async def apply_toleration(
         existing.append(entry)
 
     patch = {
-        "metadata": {"annotations": {"horae/booking-reference": booking_reference}},
+        "metadata": {"annotations": {"galends/booking-reference": booking_reference}},
         "spec": {"tolerations": existing + [new_tol]},
     }
     log.debug("%s", kv(
@@ -585,10 +585,10 @@ async def annotate_runtime_guarantee(
 ) -> None:
     """Annotate *pod_name* with its runtime guarantee.
 
-    Writes ``horae/pod-runtime-limit-seconds`` (the guaranteed duration in
-    seconds, consumed by in-pod countdown widgets), ``horae/guaranteed-until``
+    Writes ``galends/pod-runtime-limit-seconds`` (the guaranteed duration in
+    seconds, consumed by in-pod countdown widgets), ``galends/guaranteed-until``
     (the same instant as an absolute UTC ISO-8601 timestamp), and
-    ``horae/guarantee-status`` (``"guaranteed"`` — recording a guarantee always
+    ``galends/guarantee-status`` (``"guaranteed"`` — recording a guarantee always
     means the pod is inside one; the reconcile in ``main`` flips this to
     ``"overstay"`` once the guarantee lapses).  Informational only: this never
     patches ``spec.activeDeadlineSeconds`` — demand-driven preemption enforces
@@ -604,8 +604,8 @@ async def annotate_runtime_guarantee(
     patch = {
         "metadata": {
             "annotations": {
-                "horae/pod-runtime-limit-seconds": str(seconds),
-                "horae/guaranteed-until": until_str,
+                "galends/pod-runtime-limit-seconds": str(seconds),
+                "galends/guaranteed-until": until_str,
                 GUARANTEE_STATUS: GUARANTEE_STATUS_GUARANTEED,
             }
         },
@@ -623,11 +623,11 @@ async def annotate_guarantee_status(
     status: str,
     guaranteed_until: Optional[datetime],
 ) -> None:
-    """Update *pod_name*'s live ``horae/guarantee-status`` (+ ``guaranteed-until``).
+    """Update *pod_name*'s live ``galends/guarantee-status`` (+ ``guaranteed-until``).
 
-    Writes ``horae/guarantee-status`` (``"guaranteed"`` | ``"overstay"``) and,
+    Writes ``galends/guarantee-status`` (``"guaranteed"`` | ``"overstay"``) and,
     **only when** *guaranteed_until* is provided, refreshes
-    ``horae/guaranteed-until`` to that absolute UTC ISO-8601 instant.  For an
+    ``galends/guaranteed-until`` to that absolute UTC ISO-8601 instant.  For an
     overstay pod *guaranteed_until* is ``None`` so the existing (now-past)
     ``guaranteed-until`` value is left frozen — only the status key flips.
     Informational only, mirroring ``annotate_runtime_guarantee``: nothing is
@@ -635,7 +635,7 @@ async def annotate_guarantee_status(
     """
     annotations: dict = {GUARANTEE_STATUS: status}
     if guaranteed_until is not None:
-        annotations["horae/guaranteed-until"] = guaranteed_until.strftime(
+        annotations["galends/guaranteed-until"] = guaranteed_until.strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
     log.debug("%s", kv(
@@ -656,7 +656,7 @@ async def annotate_termination_warning(
 ) -> None:
     """Stamp *pod_name* with the informational termination-warning annotations.
 
-    Writes ``horae/termination-warning-at`` (the projected preemption instant,
+    Writes ``galends/termination-warning-at`` (the projected preemption instant,
     absolute UTC ISO-8601, matching ``guaranteed-until``), ``-risk`` (a value in
     (0, 1] as a pre-rounded string), and ``-message`` (human-readable).  Purely
     informational — nothing is enforced Kubernetes-side and these are never read

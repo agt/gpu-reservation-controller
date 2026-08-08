@@ -66,7 +66,7 @@ system is designed to accommodate greater values in the future.)
 │      a. Count nvidia.com/gpu already in use by other │
 │         sibling pods that hold the toleration for    │
 │         the same booking (matched via the            │
-│         horae/booking-reference annotation)          │
+│         galends/booking-reference annotation)          │
 │      b. If pod_gpus + sibling_gpus ≤ reserved_gpus:  │
 │           PATCH pod → add toleration + annotations   │
 │           PATCH pod → annotate runtime guarantee      │
@@ -144,8 +144,8 @@ than preempting them.)
    `ONDEMAND_HORIZON_MINUTES` **and** has spare budget → the pod is queued for
    it, same as any reserved-path pod.
 2. Otherwise, if the pod is **JIT-eligible** — `Pending`, carries
-   `horae/minimum-runtime-seconds`, and names its usage group (the group label
-   when `REQUIRED_GROUP_LABEL` is set, else the `horae/usage-group`
+   `galends/minimum-runtime-seconds`, and names its usage group (the group label
+   when `REQUIRED_GROUP_LABEL` is set, else the `galends/usage-group`
    annotation; the lease request's `group_name` is a required natural key
    app-side) — it becomes an on-demand candidate and, when
    first discovered, kicks an immediate admission batch covering it plus every
@@ -212,7 +212,7 @@ from the app's active set, so there is nothing to re-arm.
 **Occupancy tracking across restarts** — capacity for every admitted pod is
 tracked in one occupancy map keyed by reservation id.  The map is rebuilt
 from the cluster — the reservation id parsed from each pod's
-`horae/booking-reference` — by the startup pod LIST and, on every
+`galends/booking-reference` — by the startup pod LIST and, on every
 queue-processor tick, from a live snapshot, so a missed event or a restart
 self-heals within one tick.
 
@@ -229,14 +229,14 @@ effect:   NoSchedule
 
 | Annotation | Written when | Purpose |
 |------------|--------------|---------|
-| `horae/booking-reference` | toleration applied | Identifies the reservation the pod was admitted under (`res-<id>` — the only prefix, since every admitted pod is tied to a real reservation, JIT or otherwise); the id is the key for the per-reservation GPU budget and for rebuilding occupancy from the cluster |
-| `horae/pod-runtime-limit-seconds` | guarantee recorded | The runtime guarantee's duration in seconds at admission time, for operator visibility and in-pod notification widgets; see *Runtime guarantees and demand-driven preemption* |
-| `horae/guaranteed-until` | guarantee recorded | The same guarantee as an absolute UTC ISO-8601 instant |
-| `horae/termination-warning-at` | at risk of preemption | Projected kill instant `max(boundary − lead, guarantee_end)` (the start of the sweep's kill window at the soonest boundary the pod is an eligible victim at, absolute UTC ISO-8601); cleared when the pod is no longer at risk. See *Termination-warning annotations* |
-| `horae/termination-warning-risk` | at risk of preemption | Preemption risk in (0, 1] at that boundary (`min(1, shortfall/pool_gpus)`, 2 decimals) |
-| `horae/termination-warning-message` | at risk of preemption | Human-readable warning text |
+| `galends/booking-reference` | toleration applied | Identifies the reservation the pod was admitted under (`res-<id>` — the only prefix, since every admitted pod is tied to a real reservation, JIT or otherwise); the id is the key for the per-reservation GPU budget and for rebuilding occupancy from the cluster |
+| `galends/pod-runtime-limit-seconds` | guarantee recorded | The runtime guarantee's duration in seconds at admission time, for operator visibility and in-pod notification widgets; see *Runtime guarantees and demand-driven preemption* |
+| `galends/guaranteed-until` | guarantee recorded | The same guarantee as an absolute UTC ISO-8601 instant |
+| `galends/termination-warning-at` | at risk of preemption | Projected kill instant `max(boundary − lead, guarantee_end)` (the start of the sweep's kill window at the soonest boundary the pod is an eligible victim at, absolute UTC ISO-8601); cleared when the pod is no longer at risk. See *Termination-warning annotations* |
+| `galends/termination-warning-risk` | at risk of preemption | Preemption risk in (0, 1] at that boundary (`min(1, shortfall/pool_gpus)`, 2 decimals) |
+| `galends/termination-warning-message` | at risk of preemption | Human-readable warning text |
 
-(`horae/minimum-runtime-seconds` and `horae/usage-group` — the usage-group
+(`galends/minimum-runtime-seconds` and `galends/usage-group` — the usage-group
 name a JIT lease is created under when `REQUIRED_GROUP_LABEL` is not in use —
 are the two annotations **consumed** rather
 than written — see *Just-in-time (JIT) on-demand leases* above.  Both
@@ -287,7 +287,7 @@ Kubernetes Event with reason `Preempted` before deletion.
 
 **Termination-warning annotations** (`TERMINATION_WARNING_ENABLED`, default on).
 After the sweep executes its kills, it stamps the **survivors still at risk** of
-preemption at an upcoming boundary with informational `horae/termination-warning-*`
+preemption at an upcoming boundary with informational `galends/termination-warning-*`
 annotations (see the annotations table above): the projected kill instant
 `max(boundary − lead, guarantee_end)` — the start of the kill window, so a pod
 killed proactively `lead` minutes before its boundary reports that earlier time
@@ -313,7 +313,7 @@ GPU class, and GPU count), the guarantee chaining above already extends the
 pod's guarantee onto it — no action needed. For the cases chaining cannot
 reach (a non-abutting follow-on window, or a different GPU count), and only
 once the pod is **past its runtime guarantee**, the controller instead
-*re-links* the pod: it re-annotates the pod's `horae/booking-reference` to
+*re-links* the pod: it re-annotates the pod's `galends/booking-reference` to
 the new reservation and moves the pod's occupancy accordingly, so it is
 credited against the new reservation. This runs before each preemption sweep
 plans any kills (so a just-re-booked pod is never a victim) and once per
@@ -378,7 +378,7 @@ All settings are supplied via environment variables.
 | `TZ` | no | system default | **Log timestamp display only** — not read by application code; reservation window arithmetic is UTC-based and does not depend on it |
 | `ONDEMAND_LEASE_ENABLED` | no | `true` | Set to `false` to disable the JIT on-demand lease path entirely |
 | `ONDEMAND_HORIZON_MINUTES` | no | `30` | JIT routing horizon: a pod is queued for a reservation opening within this many minutes (with budget) instead of requesting a lease |
-| `ONDEMAND_LEASE_BUFFER_MINUTES` | no | `10` | Minutes added to a pod's `horae/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
+| `ONDEMAND_LEASE_BUFFER_MINUTES` | no | `10` | Minutes added to a pod's `galends/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
 | `ONDEMAND_DELEGATE_ADMISSION` | no | `false` | Delegate on-demand admission selection to the app for LAS prioritization (`POST /api/reservations/ondemand-admission`); `false` (or any app-call failure) grants every eligible candidate. The app endpoint is shipped but selects grant-all today, so enabling this changes no behaviour until the app carries real admission policy |
 | `NOSHOW_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and cancelling it app-side |
 | `NOSHOW_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress |
@@ -391,7 +391,7 @@ All settings are supplied via environment variables.
 | `CAPACITY_CHECK_INTERVAL` | no | `3600` | Seconds between app-side vs physical GPU capacity audits (default hourly). Each audit compares the reservation app's per-class `effective_gpus_today` (its `total_gpus` after any date-span capacity override covering today — the count the app actually admits against) with the GPUs physically present in the cluster, logs any difference as a **WARNING**, and pauses new on-demand admissions for any class the app over-counts until the deficiency clears |
 | `POD_ADOPTION_ENABLED` | no | `true` | Re-link an overstay pod to a reservation its user has since booked. Set to `false` to disable |
 | `ONDEMAND_MERGE_ENABLED` | no | `true` | Merge a JIT on-demand lease's pod into the user's matching booking the moment that booking's window opens — re-link the pod and retire the lease penalty-exempt (`reason="superseded"`), without waiting for the lease guarantee to lapse. Set to `false` to disable (the pod converges lazily via adoption once past its lease guarantee) |
-| `TERMINATION_WARNING_ENABLED` | no | `true` | After each preemption sweep, stamp pods still at risk of preemption at an upcoming boundary with informational `horae/termination-warning-*` annotations (projected kill instant, risk score, message). Purely informational — nothing is enforced. Set to `false` to disable |
+| `TERMINATION_WARNING_ENABLED` | no | `true` | After each preemption sweep, stamp pods still at risk of preemption at an upcoming boundary with informational `galends/termination-warning-*` annotations (projected kill instant, risk score, message). Purely informational — nothing is enforced. Set to `false` to disable |
 | `TERMINATION_WARNING_LEAD_MINUTES` | no | `30` | How far ahead (minutes) the termination-warning look-ahead scans, decoupled from `PREEMPTION_LEAD_MINUTES` so a pod killed proactively at `boundary − lead` (a phase-A victim) is warned before its boundary enters the kill window; larger = more advance notice but more speculative warnings |
 | `REQUIRED_GROUP_LABEL` | no | *(absent)* | Pod label naming the usage group a pod belongs to (e.g. `dsmlp/course`). When set, the pod's value for this label must equal the reservation's group name — an additional match constraint alongside `gpu-class` — before the controller admits it, adopts it, or chain-extends its guarantee; a pod without the label is also never JIT-eligible. Unset disables the group constraint |
 | `SINGLETON_LEASE_ENABLED` | no | `true` | Hold a `coordination.k8s.io` Lease so a **second** controller instance refuses to run (two would issue duplicate toleration patches). A duplicate-instance guard, not leader election: there is no waiting to take over. Startup aborts (non-zero exit, kubelet backs off and retries) if another live instance holds the lease; if the coordination API is unreachable — e.g. an upgrade whose ClusterRole predates the leases rule — the controller logs a warning and runs unguarded. Set to `false` to disable |

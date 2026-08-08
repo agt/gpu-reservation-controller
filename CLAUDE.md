@@ -134,7 +134,7 @@ When patching, all existing tolerations are preserved (Kubernetes rejects
 patches that remove tolerations from running pods).  The pod is re-fetched
 immediately before patching to avoid working with a stale toleration list.
 
-The patch also stamps the pod with the `horae/booking-reference` annotation:
+The patch also stamps the pod with the `galends/booking-reference` annotation:
 `res-<id>`, where `<id>` is the reservation the pod was admitted under —
 whether it pre-existed or was requested just-in-time on the pod's behalf, every
 admitted pod is a reserved-path holder under a real reservation, so there is
@@ -146,8 +146,8 @@ reservation has an independent budget; the id parsed from this annotation
 (`parse_booking_reference`) is also how occupancy is rebuilt from the cluster
 after a restart.
 
-`annotate_runtime_guarantee` additionally writes `horae/pod-runtime-limit-seconds`
-and `horae/guaranteed-until` — see **Runtime guarantees and demand-driven
+`annotate_runtime_guarantee` additionally writes `galends/pod-runtime-limit-seconds`
+and `galends/guaranteed-until` — see **Runtime guarantees and demand-driven
 preemption** below.  Neither is enforced by Kubernetes; both are
 informational only.
 
@@ -182,9 +182,9 @@ now that on-demand jobs are ordinary reservations too.
 `_record_guarantee` in `main.py`:
 
 - Annotates the pod (`annotate_runtime_guarantee`) with informational-only
-  `horae/pod-runtime-limit-seconds` (guaranteed duration in seconds),
-  `horae/guaranteed-until` (the same instant as an absolute UTC ISO-8601
-  timestamp), and `horae/guarantee-status` (`guaranteed` at admission — see
+  `galends/pod-runtime-limit-seconds` (guaranteed duration in seconds),
+  `galends/guaranteed-until` (the same instant as an absolute UTC ISO-8601
+  timestamp), and `galends/guarantee-status` (`guaranteed` at admission — see
   **Live guarantee-status annotations** below).  A guarantee can technically
   shrink after the annotation is written (a window shortened server-side, or a
   merge component vanishing) — nothing re-reads these
@@ -261,18 +261,18 @@ state.
 
 After each preemption sweep executes its kills, it stamps the **survivors that
 are still at risk** of being preempted at an upcoming boundary with a set of
-informational `horae/termination-warning-*` annotations (`TERMINATION_WARNING_ENABLED`,
+informational `galends/termination-warning-*` annotations (`TERMINATION_WARNING_ENABLED`,
 default on).  Like the runtime-guarantee annotations these enforce nothing and
 are never read back to make a decision — a widget should treat them as a
 best-effort heads-up so a job can checkpoint, extend, or re-book.
 
 - **Annotations** (written by `k8s_client.annotate_termination_warning`):
-  `horae/termination-warning-at` (the projected **kill instant** —
+  `galends/termination-warning-at` (the projected **kill instant** —
   `max(boundary − PREEMPTION_LEAD_MINUTES, guarantee_end)`, the start of the
   sweep's kill window and the earliest the pod could actually be deleted,
-  absolute UTC ISO-8601), `horae/termination-warning-risk`
+  absolute UTC ISO-8601), `galends/termination-warning-risk`
   (`min(1, shortfall/pool_gpus)` at that boundary, rounded to 2 decimals), and
-  `horae/termination-warning-message` (human-readable, rendered deterministically
+  `galends/termination-warning-message` (human-readable, rendered deterministically
   from the two).  A pod killed proactively at a boundary (a **phase-A** victim,
   already past its guarantee) therefore reports the earlier `boundary − lead`
   kill time, not the boundary; a **phase-B** victim whose guarantee ends at the
@@ -323,9 +323,9 @@ carries a **general, always-present status** so a widget can show a job's
 guarantee standing regardless of whether preemption is imminent.  Two keys,
 both informational-only and never read back to make a decision:
 
-- `horae/guarantee-status` — `guaranteed` while the pod is inside its live
+- `galends/guarantee-status` — `guaranteed` while the pod is inside its live
   (chain-aware) runtime guarantee, `overstay` once it is running past it.
-- `horae/guaranteed-until` — the guarantee-end instant (the *same* key
+- `galends/guaranteed-until` — the guarantee-end instant (the *same* key
   `annotate_runtime_guarantee` writes at admission), kept **live**: future while
   in-guarantee, and left at its now-past value once overstay.
 
@@ -334,7 +334,7 @@ itself changes, plus a periodic reconcile for the one transition no event
 covers:
 
 - **Admission / adoption / merge** — `annotate_runtime_guarantee` (called by
-  `_record_guarantee`) now also stamps `horae/guarantee-status: guaranteed`
+  `_record_guarantee`) now also stamps `galends/guarantee-status: guaranteed`
   alongside the runtime-limit and `guaranteed-until` keys, so a freshly admitted
   or re-linked pod is immediately `guaranteed` with a forward end.
 - **Expiration** — `main._apply_guarantee_status` runs once per
@@ -365,9 +365,9 @@ ships dark).  The report is filed when the overstay *ends* (the moment the full
 duration is known), never during the run.
 
 `main._report_overstay_if_any` is the single shared helper.  Given a pod at
-teardown it: resolves the reservation id from `horae/booking-reference`; takes the
+teardown it: resolves the reservation id from `galends/booking-reference`; takes the
 overstay **start** as the live chain-aware `guarantee_end` when the reservation is
-still resolvable, else the pod's frozen `horae/guaranteed-until` annotation (the
+still resolvable, else the pod's frozen `galends/guaranteed-until` annotation (the
 reservation has often already left `state.reservations` by teardown); takes the
 **end** as now; and **skips** the pod unless that is a genuine overstay
 (`start` resolved and `now > start`) — a pod that finished within its guarantee
@@ -412,7 +412,7 @@ currently-open booking the same user holds that has spare budget
 admitted pod is already tied to a real reservation (JIT or otherwise), so
 there is nothing to "upgrade" — only overstay pods are ever rescued.
 
-`_adopt_pods` in `main.py` then re-annotates the pod's `horae/booking-reference`
+`_adopt_pods` in `main.py` then re-annotates the pod's `galends/booking-reference`
 to `res-<new id>` (the toleration is already present, so this patch only
 rewrites the annotation) and, **only on patch success**, re-homes occupancy
 (`relink_occupancy`) and refreshes the in-memory `PodRuntimeView`.  It emits an
@@ -455,7 +455,7 @@ untouched (a pod still in its **pre-booking** window stays on its lease —
 correctly — until the booking opens).
 
 `_merge_ondemand_into_bookings` in `main.py` executes it, modelled on
-`_adopt_pods`: re-annotate the pod's `horae/booking-reference` to the booking
+`_adopt_pods`: re-annotate the pod's `galends/booking-reference` to the booking
 (annotation-only patch), and **only on patch success** re-home occupancy
 (`relink_occupancy`), refresh the in-memory view, re-record the guarantee
 (now the booking's — up to its chain end), and emit an `OverstayRelinked` event.
@@ -601,9 +601,9 @@ without the toleration,
    queued for it (`enqueue_pod`), with the same fast-path immediate-apply
    when the window is already open.
 2. Otherwise, if the pod is **JIT-eligible** — `ONDEMAND_LEASE_ENABLED`,
-   `Pending`, carries `horae/minimum-runtime-seconds`, and names its usage
+   `Pending`, carries `galends/minimum-runtime-seconds`, and names its usage
    group (the group label when `REQUIRED_GROUP_LABEL` is set, else the
-   `horae/usage-group` annotation — the lease request's `group_name` is a
+   `galends/usage-group` annotation — the lease request's `group_name` is a
    **required** natural key app-side) — it becomes an
    `OnDemandCandidate` and, on the **ADDED** event, kicks an immediate
    admission batch (`main._run_ondemand_admission`) covering it plus every
@@ -710,7 +710,7 @@ is preempted, the lease is no longer needed and the controller cancels it
 capacity and stopping SU accrual instead of letting the lease linger until it
 expires.  `pod_watch_loop` calls this from both its DELETED and terminal-phase
 branches, right after `release_pod`.  **No on-demand-vs-booking state is tracked
-in memory**: the pod's `horae/booking-reference` annotation resolves to the
+in memory**: the pod's `galends/booking-reference` annotation resolves to the
 reservation id, and the reservation's own `kind` field — the app returns leases
 as `kind="on_demand"` and the pull keeps them in `state.reservations` — is read
 live to decide.  Only `kind == "on_demand"` rows are touched (a booking's pod
@@ -991,7 +991,7 @@ Kubernetes API and the reservation API within one fetch cycle.  Queue entries
 that were waiting for a window that has already opened will be re-evaluated
 immediately on the next processor tick.
 
-Occupancy is reconstructed from the `horae/booking-reference` annotation: the
+Occupancy is reconstructed from the `galends/booking-reference` annotation: the
 reservation id parsed from each admitted pod's booking-reference is summed into
 the unified occupancy map.  The startup pod LIST seeds this, and every
 queue-processor tick rebuilds the map wholesale from a live cluster snapshot
@@ -1043,7 +1043,7 @@ the claimed set and the grace re-arm path above applies.
 | `TZ` | system default | Affects log timestamp display only; window arithmetic is UTC-based and does not depend on it |
 | `ONDEMAND_LEASE_ENABLED` | `true` | Set to `false` to disable the JIT on-demand lease path entirely (a non-JIT-eligible pod still waits for a matching reservation; an ineligible one is left Pending) |
 | `ONDEMAND_HORIZON_MINUTES` | `30` | JIT routing horizon: a pod is queued for a reservation that opens within this many minutes (with budget) instead of requesting a lease |
-| `ONDEMAND_LEASE_BUFFER_MINUTES` | `10` | Minutes added to a pod's `horae/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
+| `ONDEMAND_LEASE_BUFFER_MINUTES` | `10` | Minutes added to a pod's `galends/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
 | `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch (`POST /api/reservations/ondemand-admission`) for LAS prioritization; `false` (or any app-call failure) grants every eligible candidate — the prior greedy per-pod behaviour. The app endpoint **is shipped**, but its selection is currently grant-all, so turning this on changes nothing yet; enable it once the app carries real admission policy |
 | `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
 | `NOSHOW_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared |
@@ -1056,7 +1056,7 @@ the claimed set and the grace re-arm path above applies.
 | `PREEMPTION_DELEGATE_SELECTION` | `true` | Ask the app to choose preemption victims from the eligible pool (`POST /api/reservations/preemption-victims`); `false` (or any app-call failure) falls back to local uniform-random selection |
 | `POD_ADOPTION_ENABLED` | `true` | Re-link an overstay pod to a reservation its user has since booked (see **Adopting overstay pods into a re-booked reservation**); `false` disables |
 | `ONDEMAND_MERGE_ENABLED` | `true` | Merge a JIT on-demand lease's pod into the user's matching booking the moment that booking's window opens — re-link the pod and retire the lease penalty-exempt, without waiting for the lease guarantee to lapse (see **Merging a JIT lease into a matching booking**); `false` disables (the pod then converges lazily via adoption once past its lease guarantee) |
-| `TERMINATION_WARNING_ENABLED` | `true` | After each preemption sweep, stamp pods still at risk of preemption at an upcoming boundary with informational `horae/termination-warning-*` annotations — projected termination time, risk score, and a message (see **Termination-warning annotations**); `false` disables |
+| `TERMINATION_WARNING_ENABLED` | `true` | After each preemption sweep, stamp pods still at risk of preemption at an upcoming boundary with informational `galends/termination-warning-*` annotations — projected termination time, risk score, and a message (see **Termination-warning annotations**); `false` disables |
 | `TERMINATION_WARNING_LEAD_MINUTES` | `30` | How far ahead (minutes) the termination-warning look-ahead scans, decoupled from `PREEMPTION_LEAD_MINUTES` so a pod killed proactively at `boundary − lead` (a phase-A victim) is warned before its boundary enters the kill window; larger = more advance notice but more speculative warnings |
 | `OVERSTAY_REPORT_ENABLED` | `false` | When on, report each ended overstay's duration to the app for offline analysis (`POST /api/reservations/{id}/overstay`) — see **Overstay reporting**. Best-effort and analysis-only; ships dark (default off) |
 | `SINGLETON_LEASE_ENABLED` | `true` | Hold a `coordination.k8s.io` Lease so a second controller instance refuses to run (see **Singleton lease guard**); `false` disables |

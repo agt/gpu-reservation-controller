@@ -214,6 +214,6 @@ def test_the_observability_doc_describes_no_events_that_no_longer_exist():
     stale = {
         d for d in documented - emitted
         if not d.endswith((".py", ".md", ".log", ".json"))
-        and not d.startswith(("app.", "docs.", "tests.", "horae."))
+        and not d.startswith(("app.", "docs.", "tests.", "galends."))
     }
     assert not stale, f"OBSERVABILITY.md documents events that are not emitted: {sorted(stale)}"

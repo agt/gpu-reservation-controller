@@ -1326,7 +1326,7 @@ async def _teardown_ondemand_lease(
     The on-demand-vs-booking distinction is read live off the reservation's
     ``kind`` field (the app returns leases as ``kind="on_demand"`` and the pull
     keeps them in ``state.reservations``), so nothing about which reservations
-    are leases is tracked in memory — the pod's ``horae/booking-reference``
+    are leases is tracked in memory — the pod's ``galends/booking-reference``
     annotation resolves to the lease id, and its ``kind`` is looked up there.
 
     Best-effort: only ``kind == "on_demand"`` rows are ever touched (a user
@@ -1354,7 +1354,7 @@ async def _teardown_ondemand_lease(
 
 
 def _parse_guaranteed_until(value: Optional[str]) -> Optional[datetime]:
-    """Parse a ``horae/guaranteed-until`` annotation (``…Z`` UTC ISO-8601).
+    """Parse a ``galends/guaranteed-until`` annotation (``…Z`` UTC ISO-8601).
 
     Returns a tz-aware UTC ``datetime`` or ``None`` if absent/unparseable.
     """
@@ -1380,7 +1380,7 @@ async def _report_overstay_if_any(
     preempted) — the moment the full overstay duration is known.  The overstay
     window is ``[guarantee-end, now)``: the start is the live chain-aware
     ``guarantee_end`` when the reservation is still resolvable, else the pod's
-    frozen ``horae/guaranteed-until`` annotation (the reservation may already have
+    frozen ``galends/guaranteed-until`` annotation (the reservation may already have
     left ``state.reservations`` by teardown).  A pod that finished **within** its
     guarantee (start unresolved, or ``now <= start``) is not an overstay and is
     skipped, so nothing is reported for the common case.
@@ -1427,9 +1427,9 @@ async def pod_watch_loop(
     JIT on-demand path (when ``config.ondemand_lease_enabled``): a pod with
     no reservation admittable now or within ``ONDEMAND_HORIZON_MINUTES`` is
     routed here instead of waiting — see ``_try_request_lease``.
-    - ADDED, Pending, has ``horae/minimum-runtime-seconds`` annotation, and
+    - ADDED, Pending, has ``galends/minimum-runtime-seconds`` annotation, and
       names its usage group (the group label when REQUIRED_GROUP_LABEL is set,
-      else the ``horae/usage-group`` annotation — the lease ask's required
+      else the ``galends/usage-group`` annotation — the lease ask's required
       ``group_name``) → add as a candidate and attempt a lease request
       immediately
     - MODIFIED carrying the scheduler's verdict (``PodScheduled`` now set) for a
@@ -1588,7 +1588,7 @@ async def pod_watch_loop(
                     # *required* natural key on the app's lease-create endpoint, so a
                     # pod must name its group to be JIT-eligible — via the group label
                     # when REQUIRED_GROUP_LABEL is on (the label doubles as the group
-                    # source), else via the horae/usage-group annotation.
+                    # source), else via the galends/usage-group annotation.
                     usage_group: str | None = (
                         group_label if config.required_group_label else get_pod_usage_group(pod)
                     )
@@ -1651,7 +1651,7 @@ async def pod_watch_loop(
                         continue
 
                     # Not JIT-eligible (missing the min-runtime annotation, the
-                    # required group label, or the horae/usage-group annotation):
+                    # required group label, or the galends/usage-group annotation):
                     # preserve the existing wait-for-window behaviour if some future
                     # reservation matches, however far off or over budget; otherwise
                     # leave the pod Pending.
@@ -2005,7 +2005,7 @@ async def _preempt_pod(
 
 
 def _termination_warning_message(at_str: str, risk_str: str) -> str:
-    """Build the human-readable ``horae/termination-warning-message`` value.
+    """Build the human-readable ``galends/termination-warning-message`` value.
 
     Rendered deterministically from the projected instant and risk so it only
     changes when they do (keeping the no-op-skip comparison stable).
@@ -2075,7 +2075,7 @@ async def _apply_guarantee_status(
     snapshot: "list",
     status_plan: dict[str, GuaranteeStatus],
 ) -> None:
-    """Reconcile the live ``horae/guarantee-status`` annotations against *status_plan*.
+    """Reconcile the live ``galends/guarantee-status`` annotations against *status_plan*.
 
     *snapshot* is a ``snapshot_tolerated_pods`` list (each entry carries the
     pod's current status annotations); *status_plan* is
