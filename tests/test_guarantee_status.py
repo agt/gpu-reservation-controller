@@ -117,7 +117,7 @@ def _pod_with_annotations(annotations: dict | None):
 class TestGetPodGuaranteeStatus:
     def test_both_present(self):
         pod = _pod_with_annotations(
-            {GUARANTEE_STATUS: "guaranteed", "horae/guaranteed-until": FUTURE_ISO}
+            {GUARANTEE_STATUS: "guaranteed", "galends/guaranteed-until": FUTURE_ISO}
         )
         assert get_pod_guarantee_status(pod) == ("guaranteed", FUTURE_ISO)
 
@@ -147,8 +147,8 @@ class TestAnnotateGuaranteeStatus:
         asyncio.run(annotate_runtime_guarantee("pod-x", USERNAME, 7200, FUTURE))
         _name, _ns, body = core.patches[0]
         annotations = body["metadata"]["annotations"]
-        assert annotations["horae/pod-runtime-limit-seconds"] == "7200"
-        assert annotations["horae/guaranteed-until"] == FUTURE_ISO
+        assert annotations["galends/pod-runtime-limit-seconds"] == "7200"
+        assert annotations["galends/guaranteed-until"] == FUTURE_ISO
         assert annotations[GUARANTEE_STATUS] == "guaranteed"
 
     def test_guaranteed_writes_status_and_refreshes_until(self, monkeypatch):
@@ -159,7 +159,7 @@ class TestAnnotateGuaranteeStatus:
         annotations = body["metadata"]["annotations"]
         assert annotations == {
             GUARANTEE_STATUS: "guaranteed",
-            "horae/guaranteed-until": FUTURE_ISO,
+            "galends/guaranteed-until": FUTURE_ISO,
         }
 
     def test_overstay_writes_status_only(self, monkeypatch):

@@ -310,13 +310,13 @@ class OnDemandCandidate:
     pod_namespace: str
     gpu_class_label: str   # value of pod label "gpu-class" (e.g. "h100")
     gpu_requested: int     # nvidia.com/gpu units requested by this pod
-    min_runtime_seconds: int  # horae/minimum-runtime-seconds annotation value
+    min_runtime_seconds: int  # galends/minimum-runtime-seconds annotation value
     pod_created_at: datetime  # metadata.creationTimestamp; used for FIFO ordering
     next_attempt_at: datetime  # earliest time to try requesting a lease
     group_label: Optional[str] = None  # value of REQUIRED_GROUP_LABEL pod label; None when disabled
     # Usage group the lease ask carries as its required group_name: the group
     # label value when REQUIRED_GROUP_LABEL is on, else the pod's
-    # horae/usage-group annotation.  JIT eligibility requires it, so it is only
+    # galends/usage-group annotation.  JIT eligibility requires it, so it is only
     # Optional to keep dataclass field ordering.
     usage_group: Optional[str] = None
     # Set True only while the candidate is parked on an indeterminate guard-1
@@ -614,7 +614,7 @@ class GuaranteeStatus:
     Produced by ``ControllerState.plan_guarantee_status``.  ``status`` is
     ``"guaranteed"`` while the pod is inside its live (chain-aware) runtime
     guarantee, else ``"overstay"``.  ``guaranteed_until`` is the live guarantee
-    end when guaranteed (written to ``horae/guaranteed-until``), or ``None`` when
+    end when guaranteed (written to ``galends/guaranteed-until``), or ``None`` when
     overstay — the reconcile then leaves the pod's existing (now-past)
     ``guaranteed-until`` frozen and flips only the status.  Purely informational:
     the controller stamps these onto the pod and never reads them back to make a
@@ -689,7 +689,7 @@ class ControllerState:
         self.task_queue: dict[str, QueueEntry] = {}
 
         # Pods eligible for on-demand placement, keyed by pod UID.
-        # These have the horae/minimum-runtime-seconds annotation and are
+        # These have the galends/minimum-runtime-seconds annotation and are
         # Pending, but do not match any user reservation.
         self.ondemand_candidates: dict[str, OnDemandCandidate] = {}
 
@@ -701,7 +701,7 @@ class ControllerState:
         # vacate) and rebuilt from a live cluster snapshot each queue-processor
         # tick (reconcile_occupancy), so a missed watch event self-heals within
         # one tick.  Each pod is bucketed by the reservation id parsed from its
-        # horae/booking-reference, so no separate annotation is needed.
+        # galends/booking-reference, so no separate annotation is needed.
         self.occupancy: dict[int, dict[str, int]] = {}
 
         # Safety interlock (guard 3): set of GPU class labels that currently

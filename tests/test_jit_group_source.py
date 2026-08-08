@@ -5,7 +5,7 @@ endpoint (RESERVATION-API.md §"Creating on-demand reservations"), so a pod is
 JIT-eligible only when it names its usage group:
 
 - ``REQUIRED_GROUP_LABEL`` on → the group label value (also the match axis);
-- feature off → the ``horae/usage-group`` pod annotation;
+- feature off → the ``galends/usage-group`` pod annotation;
 - neither → not JIT-eligible (previously such a pod became a candidate whose
   lease request carried ``group_name: null`` and was 422-rejected app-side,
   forever).
@@ -95,8 +95,8 @@ class TestJitGroupSource:
         pod = _pod(
             "uid-1",
             annotations={
-                "horae/minimum-runtime-seconds": "600",
-                "horae/usage-group": GROUP_NAME,
+                "galends/minimum-runtime-seconds": "600",
+                "galends/usage-group": GROUP_NAME,
             },
         )
         state, batches = _run_watch(monkeypatch, m, _config(), pod)
@@ -109,10 +109,10 @@ class TestJitGroupSource:
 
     def test_no_group_source_means_not_jit_eligible(self, monkeypatch):
         # min-runtime is present but no group label feature and no
-        # horae/usage-group annotation: the lease ask could not carry the
+        # galends/usage-group annotation: the lease ask could not carry the
         # required group_name, so the pod must not become a candidate.
         m = _main_module(monkeypatch)
-        pod = _pod("uid-2", annotations={"horae/minimum-runtime-seconds": "600"})
+        pod = _pod("uid-2", annotations={"galends/minimum-runtime-seconds": "600"})
         state, batches = _run_watch(monkeypatch, m, _config(), pod)
 
         assert state.ondemand_candidates == {}
@@ -126,8 +126,8 @@ class TestJitGroupSource:
             "uid-3",
             labels={GROUP_LABEL_NAME: "cse251a"},
             annotations={
-                "horae/minimum-runtime-seconds": "600",
-                "horae/usage-group": "something-else",
+                "galends/minimum-runtime-seconds": "600",
+                "galends/usage-group": "something-else",
             },
         )
         config = _config(required_group_label=GROUP_LABEL_NAME)
@@ -144,8 +144,8 @@ class TestJitGroupSource:
         pod = _pod(
             "uid-4",
             annotations={
-                "horae/minimum-runtime-seconds": "600",
-                "horae/usage-group": GROUP_NAME,
+                "galends/minimum-runtime-seconds": "600",
+                "galends/usage-group": GROUP_NAME,
             },
         )
         config = _config(required_group_label=GROUP_LABEL_NAME)
@@ -177,8 +177,8 @@ class TestPreflightAskCarriesUsageGroup:
             return _pod(
                 "uid-9",
                 annotations={
-                    "horae/minimum-runtime-seconds": "600",
-                    "horae/usage-group": GROUP_NAME,
+                    "galends/minimum-runtime-seconds": "600",
+                    "galends/usage-group": GROUP_NAME,
                 },
             )
 

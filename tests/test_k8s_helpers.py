@@ -145,11 +145,11 @@ class TestGetPodGpuCount:
 
 class TestGetPodMinRuntimeSeconds:
     def test_valid_annotation(self):
-        pod = _pod(annotations={"horae/minimum-runtime-seconds": "3600"})
+        pod = _pod(annotations={"galends/minimum-runtime-seconds": "3600"})
         assert get_pod_min_runtime_seconds(pod) == 3600
 
     def test_minimum_positive_value(self):
-        pod = _pod(annotations={"horae/minimum-runtime-seconds": "1"})
+        pod = _pod(annotations={"galends/minimum-runtime-seconds": "1"})
         assert get_pod_min_runtime_seconds(pod) == 1
 
     def test_missing_annotation_returns_none(self):
@@ -161,15 +161,15 @@ class TestGetPodMinRuntimeSeconds:
         assert get_pod_min_runtime_seconds(pod) is None
 
     def test_non_integer_value_returns_none(self):
-        pod = _pod(annotations={"horae/minimum-runtime-seconds": "abc"})
+        pod = _pod(annotations={"galends/minimum-runtime-seconds": "abc"})
         assert get_pod_min_runtime_seconds(pod) is None
 
     def test_zero_returns_none(self):
-        pod = _pod(annotations={"horae/minimum-runtime-seconds": "0"})
+        pod = _pod(annotations={"galends/minimum-runtime-seconds": "0"})
         assert get_pod_min_runtime_seconds(pod) is None
 
     def test_negative_returns_none(self):
-        pod = _pod(annotations={"horae/minimum-runtime-seconds": "-100"})
+        pod = _pod(annotations={"galends/minimum-runtime-seconds": "-100"})
         assert get_pod_min_runtime_seconds(pod) is None
 
 

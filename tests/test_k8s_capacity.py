@@ -252,7 +252,7 @@ def _tolerated_pod(
             name=name,
             uid=uid,
             labels={"gpu-class": gpu_class},
-            annotations=annotations or {"horae/booking-reference": "res-1"},
+            annotations=annotations or {"galends/booking-reference": "res-1"},
             deletion_timestamp=None,
         ),
         status=SimpleNamespace(phase="Running", conditions=None),
@@ -289,9 +289,9 @@ class TestSnapshotToleratedPodsNodeName:
             _tolerated_pod(
                 "p1", uid="u1", node_name="n1",
                 annotations={
-                    "horae/booking-reference": "res-1",
-                    "horae/termination-warning-at": "2024-01-15T10:00:00Z",
-                    "horae/termination-warning-risk": "0.50",
+                    "galends/booking-reference": "res-1",
+                    "galends/termination-warning-at": "2024-01-15T10:00:00Z",
+                    "galends/termination-warning-risk": "0.50",
                 },
             ),
             _tolerated_pod("p2", uid="u2", node_name="n1"),  # no warning annotations

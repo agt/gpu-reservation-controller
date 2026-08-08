@@ -207,7 +207,7 @@ follow this grammar and are not expected to.
 | `date` | ISO-8601 date | the single calendar date a line is about (the effective date under a debug date shift) |
 | `days` | int | signed whole-day count a value is shifted by (the debug effective-date offset) |
 | `dur_s` | int seconds | duration, where a line carries only one |
-| `min_runtime_s` | int seconds | a pod's `horae/minimum-runtime-seconds` ask |
+| `min_runtime_s` | int seconds | a pod's `galends/minimum-runtime-seconds` ask |
 | `lease_dur_s` | int seconds | granted JIT lease length (`min_runtime_s` + buffer) |
 | `waited_s` | int seconds | how long a JIT candidate waited before being deleted unplaced |
 | `guarantee_s` | int seconds | runtime-guarantee duration |

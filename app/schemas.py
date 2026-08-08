@@ -147,7 +147,7 @@ class OnDemandReservationRequest(BaseModel):
     ``username`` / ``group_name`` are both **required** natural keys on the
     app side (the user must be an active member of the named group) — the
     JIT-eligibility gate guarantees a group source (the REQUIRED_GROUP_LABEL
-    value, or the pod's ``horae/usage-group`` annotation) before an ask is
+    value, or the pod's ``galends/usage-group`` annotation) before an ask is
     built, and requiring it here catches a regression at construction time
     rather than as a 422 on the wire.  ``notes`` is stored on the lease for
     admin traceability (which pod it covers).

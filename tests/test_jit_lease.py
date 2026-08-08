@@ -1026,8 +1026,8 @@ def _pending_jit_pod(*, uid="uid-1", conditions=None):
         metadata=SimpleNamespace(
             uid=uid, name="pod-1", namespace=USERNAME,
             annotations={
-                "horae/minimum-runtime-seconds": "600",
-                "horae/usage-group": GROUP_NAME,
+                "galends/minimum-runtime-seconds": "600",
+                "galends/usage-group": GROUP_NAME,
             },
             labels={"gpu-class": GPU_CLASS_LABEL},
         ),

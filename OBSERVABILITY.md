@@ -319,7 +319,7 @@ DEBUG only, unless noted.
 | DEBUG | `k8s.create_event` / `k8s.delete_pod` | `ns pod` (+ `reason`) |
 | DEBUG | `pod.already_gone` | `ns pod status` (404 on delete) |
 | WARNING | `k8s.node_allocatable_invalid` | `node resource value` — treated as 0 |
-| WARNING | `pod.annotation_invalid` | `ns pod annotation value` — malformed `horae/minimum-runtime-seconds` |
+| WARNING | `pod.annotation_invalid` | `ns pod annotation value` — malformed `galends/minimum-runtime-seconds` |
 | DEBUG | `k8s.watch_open` / `k8s.watch_event` | `selector rv timeout_s mode` / `watch_event ns pod` — `mode=seed` after a LIST, `mode=resume` when continuing from the last resourceVersion (no LIST, no replay) |
 | DEBUG | `k8s.watch_bookmark` | `rv` — server bookmark advanced the resourceVersion; never forwarded as a pod event |
 | INFO | `k8s.watch_expired` | `rv` — HTTP 410: the resourceVersion expired server-side; re-LISTing immediately (no backoff) |
