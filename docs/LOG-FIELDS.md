@@ -230,6 +230,19 @@ follow this grammar and are not expected to.
 | `phase` | `Pending` \| `Running` \| `Succeeded` \| `Failed` \| `Unknown` | pod lifecycle phase |
 | `risk` | float 0..1 | termination-warning risk score |
 | `gstatus` | `guaranteed` \| `overstay` | live guarantee standing |
+| `borrowed` | int | peak GPUs admitted only because borrowing raised a ceiling (emitted only when it did) |
+| `borrowed_gpu_h` | float | the same, integrated over the reservation's hours |
+| `borrow_mode` | `off` \| `on` \| `junior` | resolved borrowing mode at admission |
+| `borrow_tier` | `none` \| `group` \| `cohort` \| `both` | which ceiling the borrowing carried |
+
+The four `borrow*` fields answer "did this reservation need borrowing to be
+admitted?" — not "was borrowing available?", which is nearly always true and
+therefore says nothing. They appear only on the reservation-creation events
+(`reservation.created`, `reservation.lease_created`, `reservation.continued`)
+and only when borrowing was **load-bearing**, i.e. the reservation would have
+been refused under its own group/cohort ceilings. A creation line carrying no
+`borrowed=` fit inside its ceilings. Only the app emits them; the controller is
+not told which reservations borrowed, because it enforces no ceilings of its own.
 
 ### Service Units
 
