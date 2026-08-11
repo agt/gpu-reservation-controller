@@ -231,7 +231,8 @@ effect:   NoSchedule
 |------------|--------------|---------|
 | `galends/booking-reference` | toleration applied | Identifies the reservation the pod was admitted under (`res-<id>` — the only prefix, since every admitted pod is tied to a real reservation, JIT or otherwise); the id is the key for the per-reservation GPU budget and for rebuilding occupancy from the cluster |
 | `galends/pod-runtime-limit-seconds` | guarantee recorded | The runtime guarantee's duration in seconds at admission time, for operator visibility and in-pod notification widgets; see *Runtime guarantees and demand-driven preemption* |
-| `galends/guaranteed-until` | guarantee recorded | The same guarantee as an absolute UTC ISO-8601 instant |
+| `galends/guaranteed-until` | guarantee recorded, kept live | The same guarantee as an absolute UTC ISO-8601 instant; refreshed while the pod is in guarantee (it can move later when an abutting window is booked), frozen at its now-past value once the pod overstays |
+| `galends/guarantee-status` | guarantee recorded, kept live | `guaranteed` while the pod is inside its runtime guarantee, `overstay` once it is running past it; see *Live guarantee-status annotations* |
 | `galends/termination-warning-at` | at risk of preemption | Projected kill instant `max(boundary − lead, guarantee_end)` (the start of the sweep's kill window at the soonest boundary the pod is an eligible victim at, absolute UTC ISO-8601); cleared when the pod is no longer at risk. See *Termination-warning annotations* |
 | `galends/termination-warning-risk` | at risk of preemption | Preemption risk in (0, 1] at that boundary (`min(1, shortfall/pool_gpus)`, 2 decimals) |
 | `galends/termination-warning-message` | at risk of preemption | Human-readable warning text |
@@ -244,6 +245,11 @@ guarantee annotations are **informational only**: nothing in the controller
 reads them back to make a decision, and a guarantee can technically shrink
 after being written — e.g. a window shortened server-side — so treat them as
 best-effort, not authoritative.)
+
+`docs/POD-ANNOTATIONS.md` is the consumer-facing reference for these: value
+formats, lifecycle, propagation latency, and how to project them into a
+container with a downward-API volume — written for in-pod widgets (JupyterLab,
+VS Code, MOTD) that surface guarantee and preemption status to the user.
 
 ### Runtime guarantees and demand-driven preemption
 
@@ -761,6 +767,8 @@ gpu-reservation-controller/
 │   │                         (identical copy of docs/contracts/RESERVATION-API.md
 │   │                         in gpu-reservation-app — update both together)
 │   ├── SCHEDULING.md         Reservation-app scheduling behaviour reference (shared copy)
+│   ├── POD-ANNOTATIONS.md    Pod-annotation reference for in-pod consumers
+│   │                         (Jupyter/VS Code widgets) reading them via downwardAPI
 │   └── lifecycle.mmd/.png    Pod lifecycle state diagram (Mermaid + rendered)
 ├── requirements.txt
 ├── requirements-dev.txt
