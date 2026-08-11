@@ -261,7 +261,10 @@ pod's first admission.
 `docs/POD-ANNOTATIONS.md` is the consumer-facing reference for these: value
 formats, lifecycle, propagation latency, and how to project them into a
 container with a downward-API volume — written for in-pod widgets (JupyterLab,
-VS Code, MOTD) that surface guarantee and preemption status to the user.
+VS Code, MOTD) that surface guarantee and preemption status to the user.  Its
+§6 goes further, for the workload rather than the widget: how a PyTorch training
+job should turn a termination warning into a checkpoint, per fine-tuning and
+from-scratch scenario.
 
 ### Runtime guarantees and demand-driven preemption
 
