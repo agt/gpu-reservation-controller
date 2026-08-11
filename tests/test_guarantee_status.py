@@ -21,6 +21,7 @@ from app import k8s_client
 from app.controller import GuaranteeStatus, PodRuntimeView
 from app.k8s_client import (
     GUARANTEE_STATUS,
+    ReservationFacts,
     ToleratedPodInfo,
     annotate_guarantee_status,
     annotate_runtime_guarantee,
@@ -34,6 +35,16 @@ from tests.conftest import reservation
 NOW = datetime(2024, 1, 15, 9, 0, tzinfo=timezone.utc)
 FUTURE = NOW + timedelta(hours=2)
 FUTURE_ISO = "2024-01-15T11:00:00Z"
+
+# The reservation facts that ride the runtime-guarantee patch; their own
+# coverage is tests/test_reservation_facts.py.
+_FACTS = ReservationFacts(
+    kind="booking",
+    start_utc=NOW,
+    end_utc=FUTURE,
+    gpu_count=1,
+    gpu_class_name="NVIDIA A100",
+)
 
 
 def _view(uid: str, *, reservation_id: int | None = None) -> PodRuntimeView:
@@ -144,7 +155,9 @@ class TestAnnotateGuaranteeStatus:
     def test_runtime_guarantee_also_stamps_guaranteed_status(self, monkeypatch):
         core = _CapturingCore()
         monkeypatch.setattr(k8s_client, "_core_v1", core)
-        asyncio.run(annotate_runtime_guarantee("pod-x", USERNAME, 7200, FUTURE))
+        asyncio.run(
+            annotate_runtime_guarantee("pod-x", USERNAME, 7200, FUTURE, _FACTS)
+        )
         _name, _ns, body = core.patches[0]
         annotations = body["metadata"]["annotations"]
         assert annotations["galends/pod-runtime-limit-seconds"] == "7200"

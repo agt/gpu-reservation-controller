@@ -287,9 +287,13 @@ class TestTryApplyToleration:
             calls["booking"] = booking
             calls["value"] = value
 
-        async def fake_annotate(pod_name, namespace, seconds, guaranteed_until):
+        async def fake_annotate(
+            pod_name, namespace, seconds, guaranteed_until, facts, admitted_at=None
+        ):
             calls["seconds"] = seconds
             calls["guaranteed_until"] = guaranteed_until
+            calls["facts"] = facts
+            calls["admitted_at"] = admitted_at
 
         async def fake_emit(*args, **kwargs):
             pass
@@ -306,6 +310,15 @@ class TestTryApplyToleration:
         assert calls["seconds"] > 0              # never 0 (B3 floor, now in _record_guarantee)
         assert calls["guaranteed_until"] == res.end_utc  # no chain, window end
         assert state.available(res) == 1         # 1 GPU now recorded as used
+        # The reservation's own facts ride the same patch, describing the
+        # reservation (its window, its reserved count) rather than the pod.
+        assert calls["facts"].kind == res.kind
+        assert calls["facts"].start_utc == res.start_utc
+        assert calls["facts"].end_utc == res.end_utc
+        assert calls["facts"].gpu_count == res.gpu_count
+        assert calls["facts"].gpu_class_name == res.gpu_class.name
+        # A genuine admission stamps admitted-at (unlike a re-link).
+        assert calls["admitted_at"] is not None
 
     def test_already_tolerated_pod_is_dequeued_without_reapplying(self, monkeypatch):
         m = _main_module(monkeypatch)

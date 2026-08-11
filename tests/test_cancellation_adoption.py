@@ -94,7 +94,7 @@ def _install_stubs(monkeypatch, m, snapshot):
     async def _apply_toleration(name, ns, pod, key, value, booking_reference):
         patched_refs.append((name, booking_reference))
 
-    async def _record_guarantee(name, ns, pod, guaranteed_until, now):
+    async def _record_guarantee(name, ns, pod, guaranteed_until, now, reservation, **kw):
         return None
 
     async def _emit_relinked(pod, name, ns, res_id, guaranteed_until):

@@ -148,8 +148,42 @@ after a restart.
 
 `annotate_runtime_guarantee` additionally writes `galends/pod-runtime-limit-seconds`
 and `galends/guaranteed-until` — see **Runtime guarantees and demand-driven
-preemption** below.  Neither is enforced by Kubernetes; both are
-informational only.
+preemption** below — plus the **reservation facts** described next.  None of
+them is enforced by Kubernetes; all are informational only.
+
+### Reservation-fact annotations
+
+`booking-reference` names *which* reservation a pod runs under, but an in-pod
+consumer cannot resolve an id — it has no API access.  So the same
+`annotate_runtime_guarantee` patch also stamps the reservation's own facts, for
+free (one patch, no extra API call):
+
+| Annotation | Value |
+|------------|-------|
+| `galends/reservation-kind` | `booking` \| `on_demand` — whether the user reserved this window or the controller minted a JIT lease for them |
+| `galends/reservation-start` / `-end` | The reservation's **own** window (UTC ISO-8601), which is *not* `guaranteed-until` — that is the end of the back-to-back chain |
+| `galends/reservation-gpu-count` | GPUs the reservation holds; against the pod's own request this yields "using 1 of the 4 you booked" |
+| `galends/gpu-class-name` | The class's display name (`gpu_class.name`), as opposed to the `label_value` used for matching |
+| `galends/admitted-at` | When this pod was first admitted |
+
+`main._reservation_facts` digests a `ReservationResponse` into the plain-field
+`k8s_client.ReservationFacts` — the mirror of the `PodRuntimeView` digest that
+keeps `controller.py` free of Kubernetes shapes, here keeping `k8s_client.py`
+free of the Pydantic response models.
+
+Because these describe the reservation a pod is **currently** linked to, every
+re-link path (adoption, JIT-lease-to-booking merge) re-stamps them by calling
+`_record_guarantee` with the new reservation — which those paths already did for
+the guarantee, so nothing new had to be wired.  `galends/admitted-at` is the one
+exception: `_record_guarantee(..., first_admission=True)`, passed only from
+`_try_apply_toleration`, so a re-link cannot restart a session-elapsed clock
+mid-job.
+
+`k8s_client.utc_iso` is the single definition of the `YYYY-MM-DDTHH:MM:SSZ` wire
+format `docs/POD-ANNOTATIONS.md` promises consumers.  It matters that writers and
+the diff-and-skip comparisons in `main` share it: those rebuild the string to
+decide whether a re-patch is needed, so a format that drifted between the two
+sides would re-patch every pod on every tick.
 
 ### Runtime guarantees and demand-driven preemption
 

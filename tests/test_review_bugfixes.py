@@ -24,7 +24,7 @@ def test_record_guarantee_floors_at_one_second_for_past_guarantee(monkeypatch):
 
     calls = {}
 
-    async def fake_annotate(pod_name, namespace, seconds, guaranteed_until):
+    async def fake_annotate(pod_name, namespace, seconds, guaranteed_until, facts, **kw):
         calls["seconds"] = seconds
 
     async def fake_emit(*args, **kwargs):
@@ -36,6 +36,15 @@ def test_record_guarantee_floors_at_one_second_for_past_guarantee(monkeypatch):
     now = datetime.now(timezone.utc)
     guaranteed_until = now - timedelta(seconds=5)
     fresh_pod = SimpleNamespace(metadata=SimpleNamespace(uid="uid-1"))
-    asyncio.run(main._record_guarantee("pod-1", "ns", fresh_pod, guaranteed_until, now))
+    reservation = SimpleNamespace(
+        kind="booking",
+        start_utc=now - timedelta(hours=1),
+        end_utc=guaranteed_until,
+        gpu_count=1,
+        gpu_class=SimpleNamespace(name="NVIDIA A100"),
+    )
+    asyncio.run(
+        main._record_guarantee("pod-1", "ns", fresh_pod, guaranteed_until, now, reservation)
+    )
 
     assert calls["seconds"] == 1
