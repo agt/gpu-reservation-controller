@@ -5,11 +5,11 @@ controller's status — a JupyterLab extension, a VS Code status-bar item, a she
 prompt/MOTD, a checkpointing wrapper.
 
 The controller stamps every pod it admits with a small set of annotations
-describing **how long the pod's GPU access is guaranteed** and **whether it is
-currently at risk of being terminated to free capacity**. Everything below is
-readable from inside the container through a downward-API volume — no
-Kubernetes API access, no service account, no network call to the reservation
-app.
+describing **what reservation the pod is running under**, **how long its GPU
+access is guaranteed**, and **whether it is currently at risk of being
+terminated to free capacity**. Everything below is readable from inside the
+container through a downward-API volume — no Kubernetes API access, no service
+account, no network call to the reservation app.
 
 > **All of these annotations are informational.** Nothing is enforced through
 > Kubernetes (`spec.activeDeadlineSeconds` is never set), and the controller
@@ -52,10 +52,16 @@ is refreshed by the kubelet.
 One line per annotation, sorted by key, rendered by the kubelet as Go `%q`:
 
 ```
+galends/admitted-at="2026-08-11T17:02:11Z"
 galends/booking-reference="res-4812"
+galends/gpu-class-name="H100"
 galends/guarantee-status="guaranteed"
 galends/guaranteed-until="2026-08-11T20:00:00Z"
 galends/pod-runtime-limit-seconds="10800"
+galends/reservation-end="2026-08-11T19:00:00Z"
+galends/reservation-gpu-count="4"
+galends/reservation-kind="booking"
+galends/reservation-start="2026-08-11T17:00:00Z"
 kubectl.kubernetes.io/last-applied-configuration="{\"apiVersion\":\"v1\",...}"
 ```
 
@@ -106,11 +112,45 @@ def parse_downward_annotations(path="/etc/podinfo/annotations") -> dict[str, str
 | `galends/guarantee-status` | at admission, refreshed | `guaranteed` \| `overstay` | `guaranteed` at admission; flips to `overstay` once the guarantee lapses. Never removed while the pod lives. |
 | `galends/guaranteed-until` | at admission, refreshed | absolute UTC instant, `YYYY-MM-DDTHH:MM:SSZ` | Kept *live* while `guaranteed` — it can move **later** if the user books an abutting follow-on window. Once `overstay` it is frozen at its now-past value. |
 | `galends/pod-runtime-limit-seconds` | at admission | integer seconds, e.g. `10800` | The guaranteed *duration* at the moment it was recorded. **Not** refreshed as the guarantee grows — for a countdown, use `guaranteed-until`, not this. |
+| `galends/reservation-kind` | at admission, on re-link | `booking` \| `on_demand` | Describes the reservation the pod is *currently* linked to, so it changes if the pod is re-linked. |
+| `galends/reservation-start` / `galends/reservation-end` | at admission, on re-link | absolute UTC instant, same format | The reservation's **own** window. Same lifecycle. |
+| `galends/reservation-gpu-count` | at admission, on re-link | integer, e.g. `4` | GPUs the *reservation* holds, not what the pod requested. Same lifecycle. |
+| `galends/gpu-class-name` | at admission, on re-link | display name, e.g. `H100` | Same lifecycle. |
+| `galends/admitted-at` | at first admission only | absolute UTC instant, same format | Written once and never rewritten — a re-link is not a new admission. Never removed while the pod lives. |
 | `galends/termination-warning-at` | while at risk | absolute UTC instant, same format | **Appears and disappears.** Present only while the pod is in the at-risk pool; all three warning keys are removed together when the risk clears. |
 | `galends/termination-warning-risk` | while at risk | decimal string in `(0, 1]`, 2 dp, e.g. `0.33` | Same lifecycle. |
 | `galends/termination-warning-message` | while at risk | human-readable English sentence | Same lifecycle. Rendered deterministically from the other two; safe to display verbatim. |
 
 ### What each one means
+
+**`galends/reservation-*` — what the pod is running under.** The `booking-reference`
+names *which* reservation; these describe it.
+
+`reservation-kind` is the one that changes your copy the most. `booking` means the
+user reserved this window themselves, through the reservation app. `on_demand`
+means no reservation was open when their pod started, so the controller requested a
+short lease on their behalf, just-in-time — that lease is a real reservation, SU is
+charged for it, and it is protected by the same runtime guarantee, but the user
+never asked for it and will not recognise it from their calendar. Say so plainly
+("started on an on-demand lease until 16:10") rather than calling it "your
+reservation".
+
+`reservation-start`/`-end` are that reservation's **own** window, which is *not*
+the same as `guaranteed-until`: the guarantee runs to the end of the back-to-back
+chain, so a user with three abutting bookings has one window here and a
+guarantee three windows long. Show the window for "what you booked" and the
+guarantee for "how long you are safe".
+
+`reservation-gpu-count` is how many GPUs the *reservation* holds — compare it
+against the pod's own `nvidia.com/gpu` request to tell a user they are using 1 of
+the 4 GPUs they booked. It is not a per-pod figure: a user running several pods
+under one booking sees the same count on each.
+
+**`galends/admitted-at` — when this pod got its GPU.** Written once, on the pod's
+first admission, and never rewritten — including when the pod is re-linked to a
+different reservation. That makes it the right anchor for a session-elapsed
+clock; `reservation-start` is not (it moves on a re-link, and can predate the pod
+by hours when the pod started mid-window).
 
 **`galends/guaranteed-until` — the runtime guarantee.** The instant until which
 this pod's GPU access is protected. It is the end of the pod's current
@@ -196,10 +236,17 @@ Countdowns should target `guaranteed-until` (state `guaranteed`) or
 current time. All timestamps are UTC with an explicit `Z`; parse as
 timezone-aware and render in the user's local zone.
 
-Two things to *avoid* claiming in copy: don't say the job "will be terminated
-at" the warning time (it is the earliest possible moment, not a schedule), and
-don't say an overstaying job is "over its limit" or "in violation" — overstay is
-a normal, permitted mode.
+The state above is orthogonal to `reservation-kind`, which sets the *noun* in
+that copy: a `guaranteed` pod on a `booking` has "your reservation until 20:00",
+the same pod on an `on_demand` lease has "an on-demand lease until 20:00". Both
+are real reservations charged in SU, so neither is "free" or "best-effort"
+capacity — the difference is only whether the user asked for it.
+
+Three things to *avoid* claiming in copy: don't say the job "will be terminated
+at" the warning time (it is the earliest possible moment, not a schedule); don't
+say an overstaying job is "over its limit" or "in violation" — overstay is a
+normal, permitted mode; and don't describe an `on_demand` lease as the user's own
+booking, since it will not appear in their calendar as one.
 
 ---
 
@@ -226,7 +273,8 @@ kubelet. Worst-case in-pod visibility, with default settings:
 
 | Change | Controller cadence | + kubelet | Worst case |
 |--------|--------------------|-----------|------------|
-| Admission (`booking-reference`, `guaranteed-until`, `guarantee-status`) | immediate, on admission | ~60 s | ~1 min |
+| Admission (`booking-reference`, `guaranteed-until`, `guarantee-status`, `admitted-at`, all `reservation-*`, `gpu-class-name`) | immediate, on admission | ~60 s | ~1 min |
+| Re-link (`booking-reference` and every `reservation-*` key change together) | every queue-processor tick, `QUEUE_PROCESSOR_INTERVAL` = 300 s, or immediately during a preemption sweep | ~60 s | ~6 min |
 | Termination warning appears / changes / clears | every preemption sweep, `PREEMPTION_CHECK_INTERVAL` = 60 s | ~60 s | ~2 min |
 | `guarantee-status` flips to `overstay`; `guaranteed-until` extended by a follow-on booking | every queue-processor tick, `QUEUE_PROCESSOR_INTERVAL` = 300 s | ~60 s | ~6 min |
 
@@ -264,12 +312,22 @@ Two consequences worth designing around:
 5. **`pod-runtime-limit-seconds` goes stale by design.** It is the duration at
    admission and is not refreshed. Use `guaranteed-until` for anything the user
    sees.
-6. **Parse defensively.** `risk` is a decimal string (`float()` it, and clamp to
+6. **A pod's reservation can change under it.** `booking-reference` and every
+   `reservation-*` key are rewritten together when the controller re-links a pod
+   — to a window its user booked after the pod was already running, or from a
+   just-in-time lease onto the matching booking once that booking opens. A pod
+   can therefore go from `on_demand` to `booking` mid-session, with a new window
+   and a new GPU count. Re-read the set rather than caching it at startup, and
+   anchor anything cumulative (a session clock, an accrual estimate) on
+   `admitted-at`, which does not move.
+7. **Parse defensively.** `risk` is a decimal string (`float()` it, and clamp to
    `[0, 1]`); the timestamps are `YYYY-MM-DDTHH:MM:SSZ` (Python's
-   `datetime.fromisoformat` accepts the `Z` suffix from 3.11 on); the id in
-   `res-<id>` is an integer. Ignore a value that does not parse instead of
-   erroring the whole widget.
-7. **Nothing here is authoritative.** These are best-effort stamps. For
+   `datetime.fromisoformat` accepts the `Z` suffix from 3.11 on); `res-<id>` and
+   `reservation-gpu-count` are integers. Treat `reservation-kind` as an open set
+   — match `booking` and `on_demand` explicitly and fall back to neutral copy for
+   anything else, rather than assuming a value you do not recognise is a lease.
+   Ignore a value that does not parse instead of erroring the whole widget.
+8. **Nothing here is authoritative.** These are best-effort stamps. For
    authoritative, richer risk data — per-hour buckets, cluster-wide class
    summaries — the controller exposes
    `GET /api/forecast/preemption-risk` (bearer-token guarded, see README), but

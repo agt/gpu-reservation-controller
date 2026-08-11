@@ -166,6 +166,69 @@ def get_pod_booking_reference(pod) -> Optional[str]:
     return annotations.get("galends/booking-reference")
 
 
+def utc_iso(dt: datetime) -> str:
+    """Render *dt* in the wire format every ``galends/*`` timestamp annotation uses.
+
+    ``YYYY-MM-DDTHH:MM:SSZ``, the format ``docs/POD-ANNOTATIONS.md`` promises
+    in-pod consumers.  This is its single definition, so a writer here and the
+    diff-and-skip comparisons in ``main`` (which rebuild the string to decide
+    whether a re-patch is needed) cannot drift apart into a per-tick re-patch
+    loop.
+
+    An aware datetime is normalised to UTC first, so a value that reached us on
+    a non-UTC offset is not mislabelled ``Z``.  A naive one is assumed to
+    already be UTC — every datetime in this codebase is built with
+    ``timezone.utc``, so that is a defensive fallback, not a supported input.
+    """
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Annotation keys describing the reservation an admitted pod is running under,
+# stamped alongside the runtime guarantee (see annotate_runtime_guarantee).
+# ``galends/guaranteed-until`` is the end of the guarantee *chain*, which says
+# nothing about the pod's own window or how it was obtained — these fill that
+# gap so an in-pod widget can distinguish "your 14:00 booking" from "a
+# just-in-time lease the controller minted for you", and show how much of a
+# booking the pod is actually using.  Informational only, like every other
+# galends/* annotation the controller writes: nothing reads them back.
+RESERVATION_KIND = "galends/reservation-kind"
+RESERVATION_START = "galends/reservation-start"
+RESERVATION_END = "galends/reservation-end"
+RESERVATION_GPU_COUNT = "galends/reservation-gpu-count"
+GPU_CLASS_NAME = "galends/gpu-class-name"
+
+# Write-once: the instant the controller first admitted this pod.  Deliberately
+# NOT rewritten when the pod is re-linked to another reservation (adoption /
+# lease-to-booking merge) — a re-link is not a new admission, and resetting it
+# would restart a session-elapsed clock mid-job.  See ReservationFacts.
+ADMITTED_AT = "galends/admitted-at"
+
+
+@dataclass(frozen=True)
+class ReservationFacts:
+    """Plain-field digest of the reservation a pod is admitted under.
+
+    Built in ``main`` from a ``schemas.ReservationResponse`` so this module
+    stays free of the Pydantic response models — the mirror of the
+    ``PodRuntimeView`` convention that keeps ``controller`` free of Kubernetes
+    shapes.
+
+    Every field describes the *reservation*, not the pod: ``gpu_count`` is what
+    the reservation reserves (which a consumer compares against the pod's own
+    request to show "using 1 of the 4 GPUs you booked"), and
+    ``start_utc``/``end_utc`` are its own window — not the guarantee chain end
+    that ``galends/guaranteed-until`` carries.
+    """
+
+    kind: str            # "booking" | "on_demand" (a just-in-time lease)
+    start_utc: datetime
+    end_utc: datetime
+    gpu_count: int
+    gpu_class_name: str  # human display name, e.g. "NVIDIA H100 80GB"
+
+
 # Annotation keys for the informational termination-warning stamped on a pod at
 # risk of demand-driven preemption (see main._apply_termination_warnings).  Like
 # the runtime-guarantee annotations, these are best-effort and never read back
@@ -581,35 +644,55 @@ async def remove_scheduling_gate(
 
 
 async def annotate_runtime_guarantee(
-    pod_name: str, namespace: str, seconds: int, guaranteed_until: datetime
+    pod_name: str,
+    namespace: str,
+    seconds: int,
+    guaranteed_until: datetime,
+    facts: ReservationFacts,
+    admitted_at: Optional[datetime] = None,
 ) -> None:
-    """Annotate *pod_name* with its runtime guarantee.
+    """Annotate *pod_name* with its runtime guarantee and the reservation behind it.
 
     Writes ``galends/pod-runtime-limit-seconds`` (the guaranteed duration in
     seconds, consumed by in-pod countdown widgets), ``galends/guaranteed-until``
     (the same instant as an absolute UTC ISO-8601 timestamp), and
     ``galends/guarantee-status`` (``"guaranteed"`` — recording a guarantee always
     means the pod is inside one; the reconcile in ``main`` flips this to
-    ``"overstay"`` once the guarantee lapses).  Informational only: this never
-    patches ``spec.activeDeadlineSeconds`` — demand-driven preemption enforces
-    nothing through a Kubernetes-side deadline, and never reads these
-    annotations back to make a decision; it recomputes the guarantee live from
-    reservation state (``ControllerState.guarantee_end``).
+    ``"overstay"`` once the guarantee lapses).
+
+    It also stamps *facts* — the reservation's kind, own window, reserved GPU
+    count, and display name of its GPU class — in the **same patch**, so the
+    whole descriptive set costs no extra API call.  Because these describe the
+    reservation the pod is currently linked to, every caller that re-links a pod
+    (adoption, lease-to-booking merge) must call this again with the new
+    reservation or the stamps would keep describing the old one.
+    ``admitted_at`` is passed only on a pod's **first** admission, and is
+    omitted (left at whatever the pod already carries) on those re-links.
+
+    Informational only: this never patches ``spec.activeDeadlineSeconds`` —
+    demand-driven preemption enforces nothing through a Kubernetes-side
+    deadline, and never reads these annotations back to make a decision; it
+    recomputes the guarantee live from reservation state
+    (``ControllerState.guarantee_end``).
     """
-    until_str = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+    until_str = utc_iso(guaranteed_until)
     log.debug("%s", kv(
         event="k8s.patch_pod", ns=namespace, pod=pod_name, patch="runtime_guarantee",
         guarantee_s=seconds, until=until_str,
     ))
-    patch = {
-        "metadata": {
-            "annotations": {
-                "galends/pod-runtime-limit-seconds": str(seconds),
-                "galends/guaranteed-until": until_str,
-                GUARANTEE_STATUS: GUARANTEE_STATUS_GUARANTEED,
-            }
-        },
+    annotations = {
+        "galends/pod-runtime-limit-seconds": str(seconds),
+        "galends/guaranteed-until": until_str,
+        GUARANTEE_STATUS: GUARANTEE_STATUS_GUARANTEED,
+        RESERVATION_KIND: facts.kind,
+        RESERVATION_START: utc_iso(facts.start_utc),
+        RESERVATION_END: utc_iso(facts.end_utc),
+        RESERVATION_GPU_COUNT: str(facts.gpu_count),
+        GPU_CLASS_NAME: facts.gpu_class_name,
     }
+    if admitted_at is not None:
+        annotations[ADMITTED_AT] = utc_iso(admitted_at)
+    patch = {"metadata": {"annotations": annotations}}
     await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
     log.info("%s", kv(
         event="pod.guarantee_recorded", ns=namespace, pod=pod_name,
@@ -635,9 +718,7 @@ async def annotate_guarantee_status(
     """
     annotations: dict = {GUARANTEE_STATUS: status}
     if guaranteed_until is not None:
-        annotations["galends/guaranteed-until"] = guaranteed_until.strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        annotations["galends/guaranteed-until"] = utc_iso(guaranteed_until)
     log.debug("%s", kv(
         event="k8s.patch_pod", ns=namespace, pod=pod_name,
         patch="guarantee_status", gstatus=status,
@@ -663,7 +744,7 @@ async def annotate_termination_warning(
     back to make a decision (the sweep recomputes risk live from reservation
     state); a widget should treat them as a best-effort heads-up.
     """
-    at_str = terminate_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+    at_str = utc_iso(terminate_at)
     log.debug("%s", kv(
         event="k8s.patch_pod", ns=namespace, pod=pod_name,
         patch="termination_warning", at=at_str, risk=risk,
@@ -768,7 +849,7 @@ async def emit_runtime_guaranteed_event(
         if hours
         else f"{minutes}m{secs:02d}s"
     )
-    until_str = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+    until_str = utc_iso(guaranteed_until)
     await _emit_pod_event(
         pod,
         pod_name,
@@ -891,7 +972,7 @@ async def emit_overstay_relinked_event(
     overstay.  Distinct from ReservationReassigned (which evicts a pod on an
     owner change) — here the *same* pod keeps running under a new reservation id.
     """
-    until_str = guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+    until_str = utc_iso(guaranteed_until)
     await _emit_pod_event(
         pod,
         pod_name,

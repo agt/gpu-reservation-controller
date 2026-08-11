@@ -67,7 +67,7 @@ def _install_merge_stubs(monkeypatch, m):
     async def _apply_toleration(name, ns, pod, key, value, booking_reference):
         patched.append((name, booking_reference))
 
-    async def _record_guarantee(name, ns, pod, guaranteed_until, now):
+    async def _record_guarantee(name, ns, pod, guaranteed_until, now, reservation, **kw):
         return None
 
     async def _emit_relinked(pod, name, ns, res_id, guaranteed_until):

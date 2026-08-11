@@ -71,6 +71,7 @@ from .k8s_client import (
     LEASE_NAME,
     TERMINAL_PHASES,
     PodWatcher,
+    ReservationFacts,
     acquire_singleton_lease,
     annotate_guarantee_status,
     annotate_runtime_guarantee,
@@ -103,6 +104,7 @@ from .k8s_client import (
     snapshot_node_gpu_capacity,
     snapshot_node_gpu_inventory,
     snapshot_tolerated_pods,
+    utc_iso,
 )
 from .reservation_client import ReservationClient
 from .schemas import (
@@ -710,8 +712,32 @@ async def _execute_evictions(
 # ---------------------------------------------------------------------------
 
 
+def _reservation_facts(reservation: ReservationResponse) -> ReservationFacts:
+    """Digest *reservation* into the plain fields stamped onto an admitted pod.
+
+    Keeps ``k8s_client`` free of the Pydantic response models, the mirror of the
+    ``PodRuntimeView`` digest that keeps ``controller`` free of Kubernetes
+    shapes.  The window goes through ``slot_start``/``slot_end`` so these stamps
+    cannot disagree with the window arithmetic every other consumer uses.
+    """
+    return ReservationFacts(
+        kind=reservation.kind,
+        start_utc=slot_start(reservation),
+        end_utc=slot_end(reservation),
+        gpu_count=reservation.gpu_count,
+        gpu_class_name=reservation.gpu_class.name,
+    )
+
+
 async def _record_guarantee(
-    pod_name: str, namespace: str, fresh_pod, guaranteed_until: datetime, now: datetime
+    pod_name: str,
+    namespace: str,
+    fresh_pod,
+    guaranteed_until: datetime,
+    now: datetime,
+    reservation: ReservationResponse,
+    *,
+    first_admission: bool = False,
 ) -> None:
     """Annotate the pod with its runtime guarantee and emit a RuntimeGuaranteed Event.
 
@@ -724,12 +750,27 @@ async def _record_guarantee(
     (``ControllerState.guarantee_end``) — never by reading these annotations
     back.
 
+    *reservation* is the one the pod is now linked to; its descriptive facts ride
+    the same patch as the guarantee (no extra API call).  This runs again on every
+    re-link (adoption, lease-to-booking merge), which is what keeps those facts
+    describing the pod's *current* reservation rather than a retired one.
+    *first_admission* distinguishes those re-links from a genuine admission: only
+    the latter stamps ``galends/admitted-at``, so a re-link cannot restart a
+    session-elapsed clock mid-job.
+
     Best-effort: logs a warning on failure but does not raise, so a failure to
     record the guarantee never rolls back an already-applied toleration.
     """
     try:
         seconds = max(1, int((guaranteed_until - now).total_seconds()))
-        await annotate_runtime_guarantee(pod_name, namespace, seconds, guaranteed_until)
+        await annotate_runtime_guarantee(
+            pod_name,
+            namespace,
+            seconds,
+            guaranteed_until,
+            _reservation_facts(reservation),
+            admitted_at=now if first_admission else None,
+        )
         await emit_runtime_guaranteed_event(
             fresh_pod, pod_name, namespace, seconds, guaranteed_until
         )
@@ -826,7 +867,13 @@ async def _try_apply_toleration(
             now = datetime.now(timezone.utc)
             guaranteed_until = state.compute_guaranteed_until(now, entry.reservation)
             await _record_guarantee(
-                entry.pod_name, entry.pod_namespace, fresh_pod, guaranteed_until, now
+                entry.pod_name,
+                entry.pod_namespace,
+                fresh_pod,
+                guaranteed_until,
+                now,
+                entry.reservation,
+                first_admission=True,
             )
             await _enforce_scheduling_gate_removal(
                 entry.pod_name, entry.pod_namespace, fresh_pod, scheduling_gate_name
@@ -2047,7 +2094,7 @@ async def _apply_termination_warnings(
         try:
             if desired is not None:
                 risk_str = f"{desired.risk:.2f}"
-                at_str = desired.terminate_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                at_str = utc_iso(desired.terminate_at)
                 if (
                     p.termination_warning_at == at_str
                     and p.termination_warning_risk == risk_str
@@ -2100,7 +2147,7 @@ async def _apply_guarantee_status(
             continue
         try:
             if desired.guaranteed_until is not None:
-                until_str = desired.guaranteed_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+                until_str = utc_iso(desired.guaranteed_until)
                 if (
                     p.guarantee_status == desired.status
                     and p.guaranteed_until == until_str
@@ -2177,7 +2224,7 @@ async def _adopt_pods(
             rid=res_new.id, until=guaranteed_until, reason="adoption",
         ))
         await _record_guarantee(
-            view.name, view.namespace, fresh_pod, guaranteed_until, now
+            view.name, view.namespace, fresh_pod, guaranteed_until, now, res_new
         )
         try:
             await emit_overstay_relinked_event(
@@ -2256,7 +2303,7 @@ async def _merge_ondemand_into_bookings(
             **{"old.rid": lease_id},
         ))
         await _record_guarantee(
-            view.name, view.namespace, fresh_pod, guaranteed_until, now
+            view.name, view.namespace, fresh_pod, guaranteed_until, now, res_new
         )
         try:
             await emit_overstay_relinked_event(

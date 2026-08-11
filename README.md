@@ -233,6 +233,11 @@ effect:   NoSchedule
 | `galends/pod-runtime-limit-seconds` | guarantee recorded | The runtime guarantee's duration in seconds at admission time, for operator visibility and in-pod notification widgets; see *Runtime guarantees and demand-driven preemption* |
 | `galends/guaranteed-until` | guarantee recorded, kept live | The same guarantee as an absolute UTC ISO-8601 instant; refreshed while the pod is in guarantee (it can move later when an abutting window is booked), frozen at its now-past value once the pod overstays |
 | `galends/guarantee-status` | guarantee recorded, kept live | `guaranteed` while the pod is inside its runtime guarantee, `overstay` once it is running past it; see *Live guarantee-status annotations* |
+| `galends/reservation-kind` | guarantee recorded, re-stamped on re-link | `booking` (a window the user reserved) or `on_demand` (a just-in-time lease the controller minted on the pod's behalf) |
+| `galends/reservation-start` / `-end` | guarantee recorded, re-stamped on re-link | The reservation's **own** window as absolute UTC ISO-8601 instants — distinct from `guaranteed-until`, which is the end of the back-to-back guarantee *chain* |
+| `galends/reservation-gpu-count` | guarantee recorded, re-stamped on re-link | GPUs the reservation reserves; against the pod's own request this shows how much of a booking the pod is using |
+| `galends/gpu-class-name` | guarantee recorded, re-stamped on re-link | The GPU class's human display name (e.g. `H100`), as opposed to the `gpu-class` label value used for matching |
+| `galends/admitted-at` | first admission only | When the controller admitted this pod, absolute UTC ISO-8601. Deliberately **not** rewritten on a re-link — a re-link is not a new admission |
 | `galends/termination-warning-at` | at risk of preemption | Projected kill instant `max(boundary − lead, guarantee_end)` (the start of the sweep's kill window at the soonest boundary the pod is an eligible victim at, absolute UTC ISO-8601); cleared when the pod is no longer at risk. See *Termination-warning annotations* |
 | `galends/termination-warning-risk` | at risk of preemption | Preemption risk in (0, 1] at that boundary (`min(1, shortfall/pool_gpus)`, 2 decimals) |
 | `galends/termination-warning-message` | at risk of preemption | Human-readable warning text |
@@ -240,11 +245,18 @@ effect:   NoSchedule
 (`galends/minimum-runtime-seconds` and `galends/usage-group` — the usage-group
 name a JIT lease is created under when `REQUIRED_GROUP_LABEL` is not in use —
 are the two annotations **consumed** rather
-than written — see *Just-in-time (JIT) on-demand leases* above.  Both
-guarantee annotations are **informational only**: nothing in the controller
-reads them back to make a decision, and a guarantee can technically shrink
-after being written — e.g. a window shortened server-side — so treat them as
-best-effort, not authoritative.)
+than written — see *Just-in-time (JIT) on-demand leases* above.  Every
+annotation the controller writes is **informational only**: nothing in the
+controller reads them back to make a decision, and a guarantee can technically
+shrink after being written — e.g. a window shortened server-side — so treat
+them as best-effort, not authoritative.)
+
+The guarantee and reservation-fact annotations are written in a **single patch**
+(`annotate_runtime_guarantee`), so the descriptive set costs no extra API call.
+Because the facts describe the reservation the pod is *currently* linked to,
+every path that re-links a pod — adoption, and the JIT-lease-to-booking merge —
+re-stamps them; `galends/admitted-at` is the one exception, written only on the
+pod's first admission.
 
 `docs/POD-ANNOTATIONS.md` is the consumer-facing reference for these: value
 formats, lifecycle, propagation latency, and how to project them into a
