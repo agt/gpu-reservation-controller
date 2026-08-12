@@ -220,6 +220,8 @@ All on `UsageGroup`, enforced for regular members in both
 | `su_budget` | Cap on a member's Service Units (`su_cost_user`) **per budget window** (see `su_anchor_mode`); `NULL` = unlimited; skipped for privileged users | Per-member SU budget |
 | `pool_su_budget` | Cap on the group's Service Units (`su_cost_group`) across all members, per the same window; `NULL` = unlimited; enforced for all non-admin users including managers | Group-wide SU pool |
 | `su_anchor_mode` | How the SU budget accrues: `weekly` (default), `open`, `monthly`, `quarterly`, or `since_creation` — see table below. Each window carries its own allowance | Budget window |
+| `on_demand_only` | Group accepts controller on-demand leases only; every web booking is refused with 400. **No privilege exemption** — managers and admins too (§7.1) | Creation-path restriction |
+| `on_demand_auto_join` | An on-demand lease may enrol (and provision) the user it names instead of requiring existing membership. Affects that path alone (§7.1) | Roster admission |
 
 Additional hard constraints:
 - `start_dt` must be at least 15 minutes in the future.
@@ -366,6 +368,18 @@ window — while timing policy (15-minute lead, whole-hour grid, 48-hour cap,
 `min/max_days_ahead`) does not apply. Denials return 409; requests are
 idempotent on an `idempotency_key`.
 
+Two per-group flags qualify that symmetry, both default off and both
+administrator-only. `usage_groups.on_demand_only` makes the group
+**one-directional**: it accepts leases on this path and refuses web bookings
+entirely (400 to every caller, group managers and administrators included), so
+its allocation cannot be pre-committed by a human ahead of the pods it exists to
+back. `usage_groups.on_demand_auto_join` relaxes the **membership** gate on this
+path only — an unenrolled `username` is added as a member, and one with no
+account is provisioned an ordinary account, rather than being refused — so the
+group's roster is filled by the workload instead of curated ahead of it. Neither
+flag touches capacity, the SU budgets, `max_reservation_hours`, or the validity
+window, and neither changes any other creation path.
+
 Consequences for the scheduling model:
 
 - An admitted lease **holds its capacity until it ends or is cancelled** — a web
@@ -407,7 +421,11 @@ Consequences for the scheduling model:
 Per **course (group)**: validity dates, booking horizon (`min/max_days_ahead`),
 per-member SU budget (`su_budget`), group-wide SU pool (`pool_su_budget`), SU
 budget window mode (`su_anchor_mode`), per-class GPU ceiling (with date-span
-boosts), and which GPU classes are visible.
+boosts), which GPU classes are visible, and — for a group that exists to back
+on-demand work rather than calendar bookings — the `on_demand_only` and
+`on_demand_auto_join` flags (§7.1). Set a `pool_su_budget` alongside auto-join:
+the per-member budget bounds each member separately, so on a group whose
+membership grows by itself the pool is the only ceiling on the total.
 
 Per **GPU class**: total GPUs, `su_rate_per_hour` (base SU rate), optional
 per-reservation GPU cap, and date-span capacity overrides (each with their own
