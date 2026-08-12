@@ -156,6 +156,15 @@ than preempting them.)
 4. Otherwise the pod is left **Pending** (a pod missing its usage-group source
    or the minimum-runtime annotation is not guessed at).
 
+Steps 1–2 read a pod's minimum runtime and usage group through
+`DEFAULT_MINIMUM_RUNTIME_SECONDS` / `DEFAULT_USAGE_GROUP`, which stand in when
+the pod declares neither.  Both ship disabled, so by default step 4 still
+catches an undeclared pod; configure them for a cluster where every unannotated
+pod should fall into a house default instead.  `DEFAULT_USAGE_GROUP` substitutes
+for the `REQUIRED_GROUP_LABEL` label *wholesale* — the pod also matches that
+group's reservations in step 1 — so it is a statement about which group
+unlabelled workloads belong to, not merely a JIT lease detail.
+
 **Batch admission** — each attempt gathers all due candidates, vets each
 (re-routing, the guards below, and resolving its `gpu-class` label to a numeric
 `gpu_class_id`), and — when `ONDEMAND_DELEGATE_ADMISSION` is enabled — offers the
@@ -245,7 +254,9 @@ effect:   NoSchedule
 (`galends/minimum-runtime-seconds` and `galends/usage-group` — the usage-group
 name a JIT lease is created under when `REQUIRED_GROUP_LABEL` is not in use —
 are the two annotations **consumed** rather
-than written — see *Just-in-time (JIT) on-demand leases* above.  Every
+than written — see *Just-in-time (JIT) on-demand leases* above, and
+`DEFAULT_MINIMUM_RUNTIME_SECONDS` / `DEFAULT_USAGE_GROUP` for the deployment-wide
+stand-ins when a pod carries neither.  Every
 annotation the controller writes is **informational only**: nothing in the
 controller reads them back to make a decision, and a guarantee can technically
 shrink after being written — e.g. a window shortened server-side — so treat
@@ -418,6 +429,8 @@ All settings are supplied via environment variables.
 | `HEADROOM_NOTICE_MINUTES` | no | `15` | Notice a headroom victim gets before it becomes killable: it is stamped with a `galends/termination-warning-at` deadline first and only becomes eligible once that deadline elapses, so a job can checkpoint, extend, or re-book. `0` means no notice. Requires `TERMINATION_WARNING_ENABLED` — with warnings off the gate is bypassed |
 | `HEADROOM_CHECK_INTERVAL` | no | `600` | Seconds between headroom evaluations. Headroom rides the preemption sweep but is throttled to this slower cadence, so an otherwise-idle cluster is not LISTed on `PREEMPTION_CHECK_INTERVAL` just to re-check headroom. Kill latency is therefore between `HEADROOM_NOTICE_MINUTES` and `HEADROOM_NOTICE_MINUTES` + this interval after a pod is warned |
 | `REQUIRED_GROUP_LABEL` | no | *(absent)* | Pod label naming the usage group a pod belongs to (e.g. `dsmlp/course`). When set, the pod's value for this label must equal the reservation's group name — an additional match constraint alongside `gpu-class` — before the controller admits it, adopts it, or chain-extends its guarantee; a pod without the label is also never JIT-eligible. Unset disables the group constraint |
+| `DEFAULT_MINIMUM_RUNTIME_SECONDS` | no | `0` | Minimum runtime to assume for a pod that carries no usable `galends/minimum-runtime-seconds` annotation, so it can still be JIT-eligible. `0` disables the fallback (such a pod is left Pending, the historical behaviour) |
+| `DEFAULT_USAGE_GROUP` | no | *(absent)* | Usage group to assume for a pod that names none. With `REQUIRED_GROUP_LABEL` set it stands in for the missing **label** — the pod matches that group's reservations on the reserved path exactly as if it carried the label, and a JIT lease for it is created under that group. With the label feature off it stands in for a missing `galends/usage-group` **annotation** (the JIT lease's group only). Unset disables the fallback |
 | `SINGLETON_LEASE_ENABLED` | no | `true` | Hold a `coordination.k8s.io` Lease so a **second** controller instance refuses to run (two would issue duplicate toleration patches). A duplicate-instance guard, not leader election: there is no waiting to take over. Startup aborts (non-zero exit, kubelet backs off and retries) if another live instance holds the lease; if the coordination API is unreachable — e.g. an upgrade whose ClusterRole predates the leases rule — the controller logs a warning and runs unguarded. Set to `false` to disable |
 | `K8S_TLS_STRICT_VERIFY` | no | `true` | OpenSSL strict X.509 verification on the connection to the Kubernetes API server. Python 3.13 enables these checks by default, and they require an Authority Key Identifier extension on the certificates the chain runs through — a cluster PKI built by older tooling may not carry one, and every API call then fails with `CERTIFICATE_VERIFY_FAILED ... Missing Authority Key Identifier` despite a correctly mounted service-account `ca.crt`. Regenerating the apiserver certificate with an AKID is the real fix; `false` is the escape hatch until then, and logs `k8s.tls_relaxed` at WARNING on every startup. **Not** `insecure-skip-tls-verify`: the chain is still verified against the mounted CA, validity dates still apply, and the hostname is still matched |
 | `POD_NAME` | no | *(hostname)* | This pod's name, from the downward API; used as the singleton Lease holder identity. Falls back to `HOSTNAME`, then the system hostname |

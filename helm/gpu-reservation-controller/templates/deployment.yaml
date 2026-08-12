@@ -90,6 +90,12 @@ spec:
             - name: REQUIRED_GROUP_LABEL
               value: {{ .Values.config.requiredGroupLabel | quote }}
             {{- end }}
+            - name: DEFAULT_MINIMUM_RUNTIME_SECONDS
+              value: {{ .Values.config.defaultMinimumRuntimeSeconds | quote }}
+            {{- if .Values.config.defaultUsageGroup }}
+            - name: DEFAULT_USAGE_GROUP
+              value: {{ .Values.config.defaultUsageGroup | quote }}
+            {{- end }}
             - name: PREEMPTION_LEAD_MINUTES
               value: {{ .Values.config.preemptionLeadMinutes | quote }}
             - name: PREEMPTION_CHECK_INTERVAL

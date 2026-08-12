@@ -836,6 +836,45 @@ independently.
 existing pod-patch path); `ONDEMAND_HORIZON_MINUTES` and
 `ONDEMAND_LEASE_BUFFER_MINUTES` tune the routing horizon and lease sizing.
 
+### Defaults for pods that declare neither
+
+JIT eligibility asks a pod for two things it must declare itself — a minimum
+runtime and a usage group — and a pod declaring neither is left Pending
+(routing step 4).  That is right where users are expected to annotate their
+workloads and wrong where the operator would rather every unannotated pod fall
+into a house default.  Two settings supply that, both **shipping disabled** so
+an unconfigured deployment behaves exactly as before:
+
+- **`DEFAULT_MINIMUM_RUNTIME_SECONDS`** (default `0` = off) stands in when
+  `get_pod_min_runtime_seconds` yields nothing — annotation absent, or present
+  but junk/non-positive, which that function already rejects.  A zero default is
+  indistinguishable from no default (the same rejection floor), which is why
+  `0` is the "off" value rather than a sentinel.
+- **`DEFAULT_USAGE_GROUP`** (unset = off) stands in for whichever group source
+  is in force.  With `REQUIRED_GROUP_LABEL` on it substitutes for the missing
+  **label**, and it does so *wholesale*: the pod matches that group's
+  reservations on the **reserved path** exactly as if it carried the label, not
+  merely on the JIT lease ask.  So this is a statement about which group
+  unlabelled workloads belong to.  With the label feature off it substitutes for
+  a missing `galends/usage-group` annotation, which only ever fed the lease ask,
+  so there it changes nothing else.  It is not a wildcard — it names one group,
+  and another group's booking still does not match.
+
+The pod's own annotation/label always wins; the default only fills a gap.
+
+`snapshot_tolerated_pods` takes the group default alongside the label key and
+applies the same fallback, so a pod **admitted** under the default group reads
+back carrying it.  Without that, `ToleratedPodInfo.group_label` would be `None`
+for exactly the pods routing had treated as grouped, `_group_ok` would reject
+every reservation for them, and adoption / JIT-lease merge would evict a job
+they were meant to carry forward.  Every call site passes
+`config.default_usage_group` next to `config.required_group_label` for that
+reason — the two travel together.
+
+**RBAC / observability**: none new.  There is deliberately no "a default was
+applied" log event: `ondemand.candidate_added` already prints the effective
+`min_runtime_s` and `group`, which is the value that matters.
+
 ### App-side vs physical capacity reconciliation
 
 The controller derives physical GPU capacity solely from Kubernetes node taints
@@ -1202,6 +1241,8 @@ the claimed set and the grace re-arm path above applies.
 | `QUEUE_PROCESSOR_INTERVAL` | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST |
 | `POD_SCHEDULING_GATE_NAME` | *(absent)* | Name of the SchedulingGate to remove after admitting a pod; unset = disabled |
 | `REQUIRED_GROUP_LABEL` | *(absent)* | Pod label naming the usage group (e.g. `dsmlp/course`); when set, the pod's value must equal the reservation's `group.name` — an extra match axis alongside `gpu-class` (see **Matching pods to reservations**), and a pod without the label is never JIT-eligible either. Unset = disabled |
+| `DEFAULT_MINIMUM_RUNTIME_SECONDS` | `0` | Minimum runtime assumed for a pod with no usable `galends/minimum-runtime-seconds` annotation, so it is still JIT-eligible; `0` = disabled (see **Defaults for pods that declare neither**) |
+| `DEFAULT_USAGE_GROUP` | *(absent)* | Usage group assumed for a pod that names none — standing in for the `REQUIRED_GROUP_LABEL` label when that feature is on (and therefore for the reserved-path match too), else for the `galends/usage-group` annotation. Unset = disabled |
 | `PREEMPTION_LEAD_MINUTES` | `15` | Minutes before a reservation slot boundary that phase-A preemption runs |
 | `PREEMPTION_CHECK_INTERVAL` | `60` | Seconds between preemption sweeps |
 | `CAPACITY_CHECK_INTERVAL` | `3600` | Seconds between app-side vs physical GPU capacity audits; each audit logs per-class differences as WARNING and pauses on-demand admission for classes the app over-counts (see **App-side vs physical capacity reconciliation**) |

@@ -72,7 +72,7 @@ def _patch_warnings(monkeypatch, m):
 
 
 def _patch_snapshots(monkeypatch, m, *, pods, capacity, read_pod_ok=True):
-    async def _snapshot_pods(_key, _group_label_key=None):
+    async def _snapshot_pods(_key, _group_label_key=None, _group_label_default=None):
         return pods
 
     async def _snapshot_capacity(_key):
@@ -120,7 +120,7 @@ class TestNoBoundariesInScope:
 
         called = []
 
-        async def _boom(_key, _group_label_key=None):
+        async def _boom(_key, _group_label_key=None, _group_label_default=None):
             called.append(_key)
             raise AssertionError("should not be called")
 
@@ -137,7 +137,7 @@ class TestSnapshotFailureFailsSafe:
         state = _state(_boundary_reservation())
         config = _config()
 
-        async def _boom(_key, _group_label_key=None):
+        async def _boom(_key, _group_label_key=None, _group_label_default=None):
             raise RuntimeError("apiserver down")
 
         deleted = []
@@ -154,7 +154,7 @@ class TestSnapshotFailureFailsSafe:
         state = _state(_boundary_reservation())
         config = _config()
 
-        async def _ok_pods(_key, _group_label_key=None):
+        async def _ok_pods(_key, _group_label_key=None, _group_label_default=None):
             return []
 
         async def _boom(_key):

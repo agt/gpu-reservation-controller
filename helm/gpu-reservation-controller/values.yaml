@@ -123,6 +123,19 @@ config:
   # alongside gpu-class.  Leave empty to disable (no group constraint).
   requiredGroupLabel: ""
 
+  # Minimum runtime (seconds) to assume for a pod carrying no usable
+  # galends/minimum-runtime-seconds annotation, so it can still be JIT-eligible.
+  # 0 disables the fallback: such a pod is left Pending, as before.
+  defaultMinimumRuntimeSeconds: 0
+
+  # Usage group to assume for a pod that names none.  With requiredGroupLabel
+  # set this stands in for the missing *label* — the pod matches that group's
+  # reservations exactly as if it carried it, and a JIT lease for the pod is
+  # created under that group.  With requiredGroupLabel empty it stands in for a
+  # missing galends/usage-group annotation (the JIT lease's group only).  Leave
+  # empty to disable the fallback.
+  defaultUsageGroup: ""
+
   # Minutes before an upcoming reservation slot boundary that the preemption
   # sweep's phase-A pass runs (proactively frees capacity from overstaying
   # pods so the incoming reservation has room when its window opens).
