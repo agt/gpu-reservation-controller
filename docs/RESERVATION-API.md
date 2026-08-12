@@ -357,9 +357,16 @@ Semantics:
   > unchanged in the default configuration**; the bound was raised only so a
   > deliberately-raised group ceiling is reachable here rather than 422'ing at
   > schema validation. Controllers need no change.
-- `username` / `group_name` are natural keys. The user must be an **active
-  member** of the named active group, and the GPU class must be attached to that
-  group (or `attach_all_groups`). Users supply the group via a pod annotation
+- `username` / `group_name` are natural keys. The named group must be active and
+  the GPU class must be attached to it (or `attach_all_groups`). By default the
+  user must already exist, be active, and be a **member** of that group. A group
+  whose `on_demand_auto_join` flag is set relaxes the membership requirement,
+  and only on **this** path: an unenrolled user is added as a `member`, and an
+  unknown `username` is provisioned a new ordinary account. An **inactive**
+  existing account is still refused — deactivation is never undone here — as is
+  a `username` that cannot form a valid address, that is shorter than an account
+  name may be, or whose identity is already claimed by another account; all of
+  those answer as an unknown user. Users supply the group via a pod annotation
   and are responsible for matching the usage-group name exactly.
 - **Feasibility is the same analysis as a web booking**: the three capacity
   tiers (physical / cohort / group, including borrowing when the group's
@@ -387,8 +394,8 @@ Semantics:
 | 201 | Lease created — full [ReservationResponse](#reservationresponse), `kind: "on_demand"` |
 | 200 | `idempotency_key` matched an existing reservation — that original reservation is returned unchanged (idempotent retry) |
 | 403 | Missing/`read_only` key, or a human session sent `on_demand: true` |
-| 404 | Unknown `username` / `group_name` / `gpu_class_id` (or inactive) |
-| 409 | Denied — insufficient capacity **or** a policy gate (membership, class access, SU budget, GPU cap, validity dates, `max_reservation_hours`). Human-readable JSON `detail` explains which |
+| 404 | Unknown `group_name` / `gpu_class_id` (or inactive), or an unknown/inactive `username`. On a group with `on_demand_auto_join` an unknown `username` is provisioned rather than refused — but the account is still reported as unknown when it exists and is **inactive**, when the username cannot form a valid mailbox address or is shorter than an account name may be, or when another account already claims that identity |
+| 409 | Denied — insufficient capacity **or** a policy gate (membership, class access, SU budget, GPU cap, validity dates, `max_reservation_hours`). Human-readable JSON `detail` explains which. Membership does not appear here on a group with `on_demand_auto_join` set |
 | 422 | Malformed body (e.g. `duration_seconds` out of bounds) |
 
 Send a fresh `idempotency_key` per lease attempt (e.g. derived from the pod
@@ -1000,7 +1007,9 @@ an admin session or a `read_write` service key (the controller path) may curate 
 group. In the human UI, a **group manager** may also curate a group whose
 `provisioning_source` is `"manager"` (full parity — add/remove members and
 appoint/demote co-managers); other callers get `403`. These endpoints only
-attach existing accounts — they never create users.
+attach existing accounts — they never create users. (A group's
+`on_demand_auto_join` flag does not change that: it acts on the on-demand
+creation path alone, and leaves these endpoints exactly as described here.)
 
 **Path parameter:** `group_id` — integer
 
@@ -1183,6 +1192,8 @@ entry is a full GpuClassResponse.
 | `allow_manager_impersonation` | boolean | Whether this group's **managers** may impersonate its members (`POST /api/users/{id}/impersonate`). Default `false`; administrators may impersonate regardless. Granting it on a group whose `provisioning_source` is `"manager"` also lets those managers impersonate anyone they choose to add. Settable only by an admin via `POST`/`PUT /api/groups` |
 | `researcher_mode` | boolean | Whether this group's **ordinary members** may read every reservation in it and book past the 48-hour duration cap. Default `false`. Read-only: cancel, waive, adopt and continue are unaffected, and no other admission gate is relaxed (SU budget and pool, `min/max_days_ahead`, the strict `valid_from`/`valid_until` boundary with no manager grace, capacity, `max_gpus_per_reservation` all still bind). Settable only by an admin via `POST`/`PUT /api/groups` |
 | `max_reservation_hours` | integer | Hard ceiling on the length of a **single** reservation, in hours. Default `168` (7 days); always present and always finite — there is no "unlimited". Applies on **every** creation path (booking, on-demand lease, continue) and to **every** caller, including group managers and admins; unlike the 48-hour cap it has no exemption. A non-exempt member is therefore bounded by `min(48, max_reservation_hours)`. Settable only by an admin via `POST`/`PUT /api/groups` |
+| `on_demand_only` | boolean | Whether this group may be used **only** for controller-created on-demand leases. Default `false`. When `true`, `POST /api/reservations` refuses every web booking under it with **400**, for every caller — there is no exemption for group managers or administrators, because the flag describes what the group's allocation is *for* rather than what a caller has earned. On-demand leases are unaffected, and so is `POST /api/reservations/{id}/continue` on an already-running job. Settable only by an admin via `POST`/`PUT /api/groups` |
+| `on_demand_auto_join` | boolean | Whether an on-demand lease naming this group may enrol — and if necessary create — the user it names. Default `false`. When `true` and the request's `username` is not a member, the app adds them as a `member`; when no such account exists at all, it provisions an ordinary `role="user"` account keyed to JupyterHub with an empty password. Affects **only** the on-demand creation path — web bookings, SSO login and the roster APIs in §5 are unchanged — never reactivates a deactivated account, and relaxes no gate other than membership. Settable only by an admin via `POST`/`PUT /api/groups` |
 | `is_active` | boolean | Inactive groups cannot accept new reservations |
 | `created_at` | datetime | UTC |
 | `members` | array of [GroupMemberBrief](#groupmemberbrief) | |
