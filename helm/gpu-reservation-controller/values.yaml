@@ -168,6 +168,27 @@ config:
   # local uniform-random selection.
   preemptionDelegateSelection: true
 
+  # Anticipatory headroom: percentage of each GPU class's physical capacity to
+  # hold free for on-demand jobs that have not arrived yet, reclaimed from pods
+  # running past their runtime guarantee.  Unlike boundary preemption this is a
+  # standing goal, not a response to a booking.  0 disables it entirely (the
+  # default); a pod inside its runtime guarantee is never a headroom victim.
+  headroomTargetPercent: 0
+
+  # Notice a headroom victim gets before it becomes killable.  A pod entering the
+  # at-risk pool is first stamped with a galends/termination-warning-at deadline
+  # and only becomes eligible once that deadline has elapsed, so a job can
+  # checkpoint or re-book.  0 means no notice — kill on sight.  Requires
+  # terminationWarningEnabled; with warnings off the gate is bypassed.
+  headroomNoticeMinutes: 15
+
+  # Seconds between headroom evaluations.  Headroom rides the preemption sweep
+  # but is throttled to this much slower cadence, so an otherwise-idle cluster is
+  # not LISTed on the sweep's own interval just to re-check headroom.  Note the
+  # kill latency this implies: a warned pod dies between headroomNoticeMinutes
+  # and headroomNoticeMinutes + this interval after being stamped.
+  headroomCheckInterval: 600
+
   # Report each ended overstay's duration to the app for offline analysis
   # (POST /api/reservations/{id}/overstay).  Best-effort and analysis-only —
   # it records nothing that affects admission, capacity, or the reservation

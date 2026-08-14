@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -352,6 +353,12 @@ class PodRuntimeView:
     terminating: bool              # metadata.deletionTimestamp is set
     group_label: Optional[str] = None  # value of REQUIRED_GROUP_LABEL pod label; None when disabled
     node_name: Optional[str] = None    # spec.nodeName; None until the pod is scheduled onto a node
+    # Parsed value of the pod's ``galends/termination-warning-at`` annotation, or
+    # None when it carries none.  The headroom planners read it as *state*: it is
+    # both the notice deadline they gate kills on and the value they keep stable
+    # across ticks, which is what makes the notice survive a controller restart
+    # (the pod's own annotation is the only record that it was warned).
+    termination_warning_at: Optional[datetime] = None
 
 
 @dataclass
@@ -763,6 +770,16 @@ class ControllerState:
         # which is safe because recomputation is idempotent (a killed pod
         # shows as Terminating or gone).  Pruned by ``prune_preemption_marks``.
         self.preemption_fired: dict[datetime, set[str]] = {}
+
+        # When the anticipatory-headroom *kill* evaluation last ran.  Headroom
+        # rides the preemption sweep rather than a loop of its own (one pair of
+        # cluster snapshots, and one writer for the termination-warning
+        # annotations), so this is what throttles it to
+        # HEADROOM_CHECK_INTERVAL instead of the sweep's own faster cadence.
+        # None = never evaluated, so the first sweep after startup runs it.
+        # Deliberately *not* used to throttle headroom *warnings*: those are
+        # recomputed on every sweep (see main._run_preemption_sweep).
+        self.headroom_last_eval: Optional[datetime] = None
 
         # Serialises reservation-state reconciliation between the fetch loop and
         # the inbound push endpoint.  Both mutate ``reservations`` and evict pods
@@ -1987,6 +2004,165 @@ class ControllerState:
         need = self.plan_boundary_candidates(boundary, capacity_by_class, pods, now)
         selected = select_victims_locally(need, rng)
         return build_preemption_plan(need, selected)
+
+    # ------------------------------------------------------------------
+    # Anticipatory headroom (capacity held free for arriving on-demand jobs)
+    # ------------------------------------------------------------------
+
+    def _headroom_pool(
+        self, gpu_class: str, pods: list[PodRuntimeView], now: datetime
+    ) -> list[PodRuntimeView]:
+        """Pods of *gpu_class* that headroom is allowed to consider at all.
+
+        Exactly ``plan_boundary_candidates``' eligibility predicate — live,
+        node-resident, admitted by this controller, and **past its runtime
+        guarantee**.  Kept as one helper because the two headroom entry points
+        below must agree on it: a pod warned by ``plan_headroom_warnings`` that
+        ``plan_headroom_candidates`` would never consider is a warning that can
+        never come true.
+        """
+        return [
+            p
+            for p in pods
+            if p.gpu_class == gpu_class
+            and p.reservation_id is not None
+            and p.node_resident
+            and not p.terminating
+            and p.gpu_count > 0
+            and self._past_guarantee(p, now)
+        ]
+
+    def headroom_shortfall_by_class(
+        self,
+        capacity_by_class: dict[str, int],
+        pods: list[PodRuntimeView],
+        target_percent: int,
+    ) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+        """Return ``(target, free, shortfall)`` GPUs per class for a headroom goal.
+
+        The target is ``ceil(capacity * target_percent / 100)`` — rounding *up*
+        so a small class still reserves a whole GPU rather than rounding its
+        headroom away entirely.  ``free`` reuses ``free_capacity_by_class``
+        verbatim (and may be negative for an over-committed class, which simply
+        makes the shortfall larger).  Only classes with a non-zero shortfall
+        appear in the third map.  Pure — no I/O, no state mutation.
+        """
+        target: dict[str, int] = {}
+        shortfall: dict[str, int] = {}
+        free = free_capacity_by_class(capacity_by_class, pods)
+        for gpu_class, capacity in capacity_by_class.items():
+            want = math.ceil(capacity * target_percent / 100)
+            target[gpu_class] = want
+            short = max(0, want - free.get(gpu_class, 0))
+            if short:
+                shortfall[gpu_class] = short
+        return target, free, shortfall
+
+    def plan_headroom_candidates(
+        self,
+        capacity_by_class: dict[str, int],
+        pods: list[PodRuntimeView],
+        now: datetime,
+        target_percent: int,
+        require_elapsed_notice: bool = True,
+    ) -> BoundaryPreemptionNeed:
+        """Compute the per-class shortfall and victim pool for a headroom goal.
+
+        The boundary-free sibling of ``plan_boundary_candidates``: instead of
+        clearing demand at a reservation ``slot_start``, it keeps
+        *target_percent* of every class's physical GPUs free so an arriving
+        on-demand job finds capacity already open rather than waiting for it to
+        be reclaimed reactively.
+
+        Candidates are ``_headroom_pool`` members — so a pod inside its runtime
+        guarantee is **never** a headroom victim, exactly as at a boundary — and,
+        when *require_elapsed_notice*, additionally ones whose stamped
+        ``termination_warning_at`` deadline has already passed.  That gate is the
+        whole notice mechanism: a pod's first appearance in a short class only
+        earns it a warning (see ``plan_headroom_warnings``); it becomes killable
+        on a later evaluation, once the deadline it was given has elapsed.
+
+        Returns a ``BoundaryPreemptionNeed`` so the entire selection pipeline
+        downstream — app delegation, ``select_victims_locally``,
+        ``build_preemption_plan`` — is reused unchanged.  ``boundary``/``phase``
+        are inert on this path (there is no boundary): they carry ``now`` and
+        ``"H"`` so the shape stays total, and the headroom log lines omit both.
+        Pure — no I/O, no state mutation, and no victim selection.
+        """
+        target, free, shortfall = self.headroom_shortfall_by_class(
+            capacity_by_class, pods, target_percent
+        )
+        candidates: dict[str, list[PodRuntimeView]] = {}
+        for gpu_class in shortfall:
+            pool = self._headroom_pool(gpu_class, pods, now)
+            if require_elapsed_notice:
+                pool = [
+                    p
+                    for p in pool
+                    if p.termination_warning_at is not None
+                    and p.termination_warning_at <= now
+                ]
+            candidates[gpu_class] = pool
+
+        return BoundaryPreemptionNeed(
+            boundary=now,
+            phase="H",
+            demand_by_class={c: target[c] for c in shortfall},
+            free_by_class=free,
+            kills_needed_by_class=dict(shortfall),
+            candidates_by_class=candidates,
+        )
+
+    def plan_headroom_warnings(
+        self,
+        capacity_by_class: dict[str, int],
+        pods: list[PodRuntimeView],
+        now: datetime,
+        target_percent: int,
+        notice: timedelta,
+    ) -> dict[str, "TerminationWarning"]:
+        """Notice warnings for pods a headroom shortfall puts at risk.
+
+        The headroom sibling of ``plan_termination_warnings``, returning the same
+        ``{uid: TerminationWarning}`` shape so one annotation and one reconcile
+        serve both sources.  The **full** eligible pool of a short class is
+        warned rather than a ``kills_needed``-sized subset, for the same reason
+        the boundary planner does it: the app's victim-selection policy is
+        opaque, so any pool member could be the one chosen.
+
+        ``terminate_at`` is **sticky** — a pod already carrying a warning keeps
+        the deadline it has, and only a pod with none is given ``now + notice``.
+        This is load-bearing twice over.  Recomputing ``now + notice`` every tick
+        would re-patch the pod every tick (``_apply_termination_warnings`` diffs
+        on the exact value) and, worse, the deadline would recede ahead of
+        ``now`` forever, so ``plan_headroom_candidates``' notice gate could never
+        open and no headroom kill would ever fire.
+
+        Reusing a deadline the *boundary* warner wrote is deliberate rather than
+        incidental: it is the earliest instant that pod has already been told it
+        could be killed, which keeps ``galends/termination-warning-at`` meaning
+        one thing — the earliest instant this pod could die, from any cause.
+
+        Pure — no I/O, no state mutation; the caller writes the annotations.
+        """
+        _, _, shortfall = self.headroom_shortfall_by_class(
+            capacity_by_class, pods, target_percent
+        )
+        warnings: dict[str, TerminationWarning] = {}
+        for gpu_class, short in shortfall.items():
+            pool = self._headroom_pool(gpu_class, pods, now)
+            pool_gpus = sum(p.gpu_count for p in pool)
+            if pool_gpus <= 0:
+                continue  # shortfall with nothing eligible — nothing to warn
+            risk = min(1.0, short / pool_gpus)
+            for p in pool:
+                deadline = p.termination_warning_at
+                if deadline is None:
+                    deadline = now + notice
+                warnings[p.uid] = TerminationWarning(
+                    view=p, terminate_at=deadline, risk=risk
+                )
+        return warnings
 
     def prune_preemption_marks(self, now: datetime, lead: timedelta) -> None:
         """Drop boundary bookkeeping once phase B's grace window has closed.

@@ -108,6 +108,9 @@ class Config:
     ondemand_horizon_minutes: int = 30    # JIT trigger: reserved-match horizon before requesting a lease
     ondemand_lease_buffer_minutes: int = 10  # added to a pod's minimum-runtime when sizing a JIT lease
     capacity_check_interval: int = 3600  # seconds between app-side vs physical capacity audits
+    headroom_target_percent: int = 0  # % of each class's physical GPUs to hold free; 0 = disabled
+    headroom_notice_minutes: int = 15  # notice a headroom victim gets before it becomes killable
+    headroom_check_interval: int = 600  # seconds between headroom evaluations (throttles the sweep)
     overstay_report_enabled: bool = False  # report overstay durations to the app for analysis (ships dark)
     singleton_lease_enabled: bool = True  # hold a coordination Lease so a duplicate instance refuses to run
     pod_name: Optional[str] = None  # this pod's name (downward API); lease holder identity
@@ -165,6 +168,16 @@ class Config:
                 "ONDEMAND_LEASE_BUFFER_MINUTES", 10, minimum=0
             ),
             capacity_check_interval=_env_int("CAPACITY_CHECK_INTERVAL", 3600),
+            # A percentage floors at 0 ("hold nothing", the disabled default) and
+            # caps at 100; a notice of 0 means "no notice gate, kill on sight";
+            # but an evaluation interval of 0 is a busy loop, so that floors at 1.
+            headroom_target_percent=_env_int(
+                "HEADROOM_TARGET_PERCENT", 0, minimum=0, maximum=100
+            ),
+            headroom_notice_minutes=_env_int(
+                "HEADROOM_NOTICE_MINUTES", 15, minimum=0
+            ),
+            headroom_check_interval=_env_int("HEADROOM_CHECK_INTERVAL", 600),
             overstay_report_enabled=_env_bool("OVERSTAY_REPORT_ENABLED", False),
             singleton_lease_enabled=_env_bool("SINGLETON_LEASE_ENABLED", True),
             # POD_NAME comes from the downward API in-cluster; HOSTNAME is the

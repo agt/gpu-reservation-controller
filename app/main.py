@@ -1400,10 +1400,14 @@ async def _teardown_ondemand_lease(
             state.reservations = [r for r in state.reservations if r.id != booking_id]
 
 
-def _parse_guaranteed_until(value: Optional[str]) -> Optional[datetime]:
-    """Parse a ``galends/guaranteed-until`` annotation (``…Z`` UTC ISO-8601).
+def _parse_utc_iso(value: Optional[str]) -> Optional[datetime]:
+    """Parse a ``galends/*`` timestamp annotation — the inverse of ``utc_iso``.
 
     Returns a tz-aware UTC ``datetime`` or ``None`` if absent/unparseable.
+    Used for ``galends/guaranteed-until`` (overstay reporting) and
+    ``galends/termination-warning-at`` (the headroom notice gate); an
+    unparseable value degrades to "absent" rather than raising, because these
+    annotations are read back off pods the controller does not fully control.
     """
     if not value:
         return None
@@ -1445,7 +1449,7 @@ async def _report_overstay_if_any(
     if start is None:
         # Reservation no longer active — fall back to the frozen annotation.
         _, until_str = get_pod_guarantee_status(pod)
-        start = _parse_guaranteed_until(until_str)
+        start = _parse_utc_iso(until_str)
     if start is None or now <= start:
         return  # unresolvable, or the pod stayed within its guarantee
     await client.report_overstay(
@@ -1985,25 +1989,54 @@ def _pod_view(p) -> PodRuntimeView:
         terminating=p.deletion_timestamp is not None,
         group_label=p.group_label,
         node_name=p.node_name,
+        termination_warning_at=_parse_utc_iso(p.termination_warning_at),
     )
+
+
+def _overstay_description(
+    state: ControllerState, view: PodRuntimeView, now: datetime
+) -> str:
+    """Describe *view*'s standing against its runtime guarantee, for an Event.
+
+    Shared by both preemption messages below: every victim — boundary-driven or
+    headroom-driven — is by definition past its guarantee, so the *why this pod*
+    half of the message is identical and only the *why now* half differs.
+    """
+    end = state.guarantee_end(view.reservation_id, now=now)
+    if end is None:
+        return "its runtime guarantee could no longer be resolved (reservation no longer active)"
+    overstay = max(0, int((now - end).total_seconds()))
+    minutes, secs = divmod(overstay, 60)
+    hours, minutes = divmod(minutes, 60)
+    human = f"{hours}h{minutes:02d}m{secs:02d}s" if hours else f"{minutes}m{secs:02d}s"
+    return f"overstayed its runtime guarantee by {human}"
 
 
 def _preemption_message(
     state: ControllerState, view: PodRuntimeView, boundary: datetime, now: datetime
 ) -> str:
     """Build the human-readable ``Preempted`` event message for *view*."""
-    end = state.guarantee_end(view.reservation_id, now=now)
-    if end is not None:
-        overstay = max(0, int((now - end).total_seconds()))
-        minutes, secs = divmod(overstay, 60)
-        hours, minutes = divmod(minutes, 60)
-        human = f"{hours}h{minutes:02d}m{secs:02d}s" if hours else f"{minutes}m{secs:02d}s"
-        guarantee_desc = f"overstayed its runtime guarantee by {human}"
-    else:
-        guarantee_desc = "its runtime guarantee could no longer be resolved (reservation no longer active)"
     return (
         f"Pod preempted to free capacity for reservation(s) starting "
-        f"{boundary.strftime('%Y-%m-%dT%H:%M:%SZ')}: {guarantee_desc}."
+        f"{boundary.strftime('%Y-%m-%dT%H:%M:%SZ')}: "
+        f"{_overstay_description(state, view, now)}."
+    )
+
+
+def _headroom_preemption_message(
+    state: ControllerState, view: PodRuntimeView, now: datetime, target_percent: int
+) -> str:
+    """Build the ``Preempted`` event message for a headroom victim.
+
+    Names the standing goal rather than a boundary — there is none.  The pod is
+    being reclaimed so an *arriving* on-demand job finds capacity already free,
+    which is a different (and less obvious) reason than "your GPUs are booked in
+    15 minutes", so the message says so explicitly.
+    """
+    return (
+        f"Pod preempted to maintain {target_percent}% free on-demand capacity "
+        f"headroom for gpu class {view.gpu_class}: "
+        f"{_overstay_description(state, view, now)}."
     )
 
 
@@ -2417,12 +2450,17 @@ def _map_selected_victims(
     return selected
 
 
-async def _select_boundary_victims(
+async def _select_victims(
     config: Config,
     client: Optional[ReservationClient],
     need: BoundaryPreemptionNeed,
 ) -> dict[str, list[PodRuntimeView]]:
-    """Choose victims for one boundary, delegating to the app when possible.
+    """Choose victims for one reclaim need, delegating to the app when possible.
+
+    Serves both reclaim passes — a boundary's demand and the anticipatory
+    headroom goal — because ``BoundaryPreemptionNeed`` is all either produces and
+    ``PreemptionSelectionRequest`` carries no boundary, so the app sees the same
+    "here is a pool and a number" question either way.
 
     When delegation is enabled and a client is available, the eligible pool is
     sent to the app (``POST /api/reservations/preemption-victims``) so it can
@@ -2446,7 +2484,14 @@ async def _run_preemption_sweep(
     client: Optional[ReservationClient] = None,
     now: Optional[datetime] = None,
 ) -> None:
-    """One preemption-sweep evaluation: clear demand at any in-scope boundary.
+    """One preemption-sweep evaluation: clear boundary demand, then hold headroom.
+
+    Two reclaim passes share this sweep's snapshots and lock.  The **boundary**
+    pass (below) frees capacity a booking needs at an imminent ``slot_start``.
+    The **headroom** pass then holds ``HEADROOM_TARGET_PERCENT`` of each class
+    free for on-demand jobs that have not arrived yet — anticipatory rather than
+    demand-driven, throttled to ``HEADROOM_CHECK_INTERVAL``, and gated on a
+    notice period so a doomed job is warned before it is killed.
 
     For each slot boundary within ``PREEMPTION_LEAD_MINUTES`` of *now* whose
     phase ("A" = lead-time, "B" = at-boundary) has not already been evaluated,
@@ -2475,7 +2520,18 @@ async def _run_preemption_sweep(
         warn_boundaries = sorted(
             set(boundaries) | set(state.forecast_boundaries(now, now + warning_lead))
         )
-    if not boundaries and not warn_boundaries:
+    # Anticipatory headroom rides this sweep rather than a loop of its own: one
+    # pair of cluster snapshots, and — decisively — one writer for the
+    # termination-warning annotations, which a second loop would race.  It is
+    # throttled to its own (much slower) interval so an otherwise-idle cluster is
+    # not LISTed on the sweep's 60 s cadence just to re-check headroom.
+    headroom_on = config.headroom_target_percent > 0
+    headroom_due = headroom_on and (
+        state.headroom_last_eval is None
+        or now - state.headroom_last_eval
+        >= timedelta(seconds=config.headroom_check_interval)
+    )
+    if not boundaries and not warn_boundaries and not headroom_due:
         return
 
     try:
@@ -2516,7 +2572,7 @@ async def _run_preemption_sweep(
             # the controller still owns which pods are eligible at all.  Skip the
             # round-trip entirely when nothing needs reclaiming here.
             if need.kills_needed_by_class:
-                selected = await _select_boundary_victims(config, client, need)
+                selected = await _select_victims(config, client, need)
             else:
                 selected = {}
             plan = build_preemption_plan(need, selected)
@@ -2542,6 +2598,44 @@ async def _run_preemption_sweep(
                 doomed.add(victim.uid)
                 to_kill.append((victim, _preemption_message(state, victim, boundary, now)))
 
+        # Anticipatory headroom: reclaim from overstayers to hold a fixed
+        # fraction of each class free for on-demand jobs that have not arrived
+        # yet.  Runs after the boundary loop and is handed the post-kill pod set,
+        # so GPUs already freed above count towards the headroom goal and one
+        # pod is never selected twice — the same running-``doomed`` discipline
+        # the boundary loop uses across boundaries.  No preemption_fired mark:
+        # headroom is a standing goal, not a one-shot per boundary/phase.
+        if headroom_due:
+            state.headroom_last_eval = now
+            available_pods = [p for p in pods if p.uid not in doomed]
+            need = state.plan_headroom_candidates(
+                capacity, available_pods, now, config.headroom_target_percent,
+                require_elapsed_notice=config.termination_warning_enabled,
+            )
+            if need.kills_needed_by_class:
+                selected = await _select_victims(config, client, need)
+            else:
+                selected = {}
+            plan = build_preemption_plan(need, selected)
+            kills_by_class: dict[str, int] = {}
+            for victim in plan.victims:
+                kills_by_class[victim.gpu_class] = kills_by_class.get(victim.gpu_class, 0) + 1
+            for gpu_class, target in sorted(plan.demand_by_class.items()):
+                log.info("%s", kv(
+                    event="preempt.headroom", clabel=gpu_class, demand=target,
+                    free=plan.free_by_class.get(gpu_class, 0),
+                    kills=kills_by_class.get(gpu_class, 0),
+                ))
+            for gpu_class, shortfall in sorted(plan.unmet_by_class.items()):
+                log.warning("%s", kv(
+                    event="preempt.headroom_unmet", clabel=gpu_class, short=shortfall,
+                ))
+            for victim in plan.victims:
+                doomed.add(victim.uid)
+                to_kill.append((victim, _headroom_preemption_message(
+                    state, victim, now, config.headroom_target_percent,
+                )))
+
         # After all kills are chosen, flag the post-kill survivors that are still
         # at risk of preemption at an in-scope boundary (see
         # plan_termination_warnings).  Computed under the lock because it reads
@@ -2552,6 +2646,22 @@ async def _run_preemption_sweep(
             warn_plan = state.plan_termination_warnings(
                 warn_boundaries, capacity, pods_after, now, lead
             )
+            # Headroom warnings are recomputed on *every* sweep, not only when
+            # the throttled kill evaluation above ran.  They are pure arithmetic
+            # over snapshots already in hand, so they are free — and omitting
+            # them on a boundary-only tick would leave a headroom-warned pod out
+            # of warn_plan, whereupon _apply_termination_warnings clears its
+            # annotation and the notice can never ripen into a kill.
+            if headroom_on:
+                for uid, warning in state.plan_headroom_warnings(
+                    capacity, pods_after, now, config.headroom_target_percent,
+                    timedelta(minutes=config.headroom_notice_minutes),
+                ).items():
+                    existing = warn_plan.get(uid)
+                    # Keep whichever deadline is sooner: the pod should be told
+                    # the earliest instant it could die, from any cause.
+                    if existing is None or warning.terminate_at < existing.terminate_at:
+                        warn_plan[uid] = warning
 
         for victim, message in to_kill:
             log.info("%s", kv(

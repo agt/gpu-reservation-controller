@@ -164,15 +164,32 @@ Past that instant the pod is not killed either — it keeps running until some
 still running, no longer protected.
 
 **`galends/termination-warning-at` — the projected kill instant.** Present only
-when the controller has identified this pod as an eligible victim at an upcoming
-reservation boundary where its GPU class is short on capacity. The value is the
-**earliest** instant the pod could actually be deleted (the start of the sweep's
-kill window, which opens `PREEMPTION_LEAD_MINUTES` — default 15 — *before* the
-boundary, but never before the pod's own guarantee ends). Not a scheduled
-execution time: the pod may well survive it (§8).
+while the controller has identified this pod as an eligible victim in a GPU class
+that is short on capacity. The value is the **earliest** instant the pod could
+actually be deleted, whatever the cause. Not a scheduled execution time: the pod
+may well survive it (§8).
+
+There are two causes, and a consumer does not need to tell them apart — the key
+means the same thing either way, and where both apply the **sooner** instant is
+the one written:
+
+- **An upcoming reservation boundary** needs the capacity. The instant is the
+  start of the sweep's kill window, which opens `PREEMPTION_LEAD_MINUTES`
+  (default 15) *before* the boundary, but never before the pod's own guarantee
+  ends.
+- **Anticipatory headroom** — the deployment holds a fixed percentage of each
+  GPU class free for on-demand jobs that have not arrived yet
+  (`HEADROOM_TARGET_PERCENT`, off by default). Here the instant is a **notice
+  deadline**: `HEADROOM_NOTICE_MINUTES` from when the pod entered the at-risk
+  pool. The pod is *not eligible to be killed at all* until it passes, so this is
+  a firmer floor than the boundary case — and it is **sticky**, so it does not
+  drift forward while the pod stays at risk.
+
+In both cases the pod must already be past its runtime guarantee to be at risk;
+a pod inside its guarantee is never a victim.
 
 **`galends/termination-warning-risk` — how likely.** The fraction of the
-eligible pool that has to be killed at that boundary, `min(1, shortfall / pool_gpus)`.
+eligible pool that has to be killed, `min(1, shortfall / pool_gpus)`.
 `1.00` means the whole pool is needed and the pod will almost certainly be
 picked; `0.20` means roughly a one-in-five chance. Pool *membership* is exact;
 the number models uniform-random victim selection, which is the controller's
@@ -557,10 +574,13 @@ Two consequences worth designing around:
    `booking-reference` on a pod the controller has not admitted yet, and the
    warning trio during the window between sweeps.
 2. **Warnings retract.** The three `termination-warning-*` keys are deleted when
-   the pod leaves the at-risk pool — the user re-booked, the incoming
+   the pod leaves the at-risk pool — the user re-booked or extended, the incoming
    reservation no-showed, demand evaporated, or the pod was re-linked to a new
    reservation. A UI that latches a red banner will show a false alarm
-   indefinitely; clear it when the key disappears.
+   indefinitely; clear it when the key disappears. **Extending or re-booking is
+   the reliable way to cancel a pending termination**, and it works right up to
+   the moment the pod is deleted: the controller re-checks each pod's live
+   guarantee on every sweep, so a reservation that lands first always wins.
 3. **`termination-warning-at` can pass without anything happening.** The
    shortfall it was computed from may be gone by the time it arrives. Never
    count down to zero and declare the job dead; fall back to "may be stopped at

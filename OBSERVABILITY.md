@@ -201,7 +201,9 @@ audit blocking admission" without matching on message text.
 |---|---|---|---|
 | INFO | `preempt.boundary` | `boundary sweep clabel demand free kills` | **One line per GPU class**, not one carrying two dicts. |
 | WARNING | `preempt.unmet` | `boundary sweep clabel short` | Demand uncovered after preempting every eligible overstayer. |
-| INFO | `pod.preempting` | `ns pod clabel gpus detail` | `detail` explains the overstay and the triggering boundary. |
+| INFO | `preempt.headroom` | `clabel demand free kills` | Anticipatory headroom pass. **One line per GPU class.** `demand` is the headroom *target* (`ceil(capacity × HEADROOM_TARGET_PERCENT / 100)`), not booking demand. No `boundary`/`sweep` — headroom is a standing goal, not a boundary phase. |
+| WARNING | `preempt.headroom_unmet` | `clabel short` | Headroom target uncovered after preempting every eligible, notice-elapsed overstayer. Expected while notices are still ripening. |
+| INFO | `pod.preempting` | `ns pod clabel gpus detail` | `detail` explains the overstay and either the triggering boundary or the headroom target. |
 | INFO | `pod.deleted` | `ns pod` | |
 | WARNING | `preempt.snapshot_failed` | `target err` | `target=pods` or `node_capacity`. **The whole sweep is skipped** — never kill on unknown physical state. |
 | WARNING | `preempt.selection_unavailable` | `fallback` | App delegation failed; local uniform-random used. |
