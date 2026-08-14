@@ -63,7 +63,7 @@ app/
 | `reservation_fetch_loop` | every `RESERVATION_FETCH_INTERVAL` s (default 300) | Re-fetches active reservations; refreshes `gpu_class_id ↔ label_value` maps; reconciles stale queue entries |
 | `pod_watch_loop` | continuous (WATCH resumed by `resourceVersion`; LIST at start and every ~10 min resync) | Routes a pod with the `gpu-class` label and no toleration to the reserved queue (a match is open or opens soon) or to a JIT on-demand lease request; dequeues deleted pods and, when a deleted/terminated pod was admitted under a JIT lease, cancels that lease; **fast-path**: applies toleration immediately when a new pod arrives inside an open window.  Each event is handled under its own try/except, so one bad event cannot kill the consumer |
 | `queue_processor_loop` | every `QUEUE_PROCESSOR_INTERVAL` s (default 300) | Handles pods queued before their window opened; retries pods that were over-budget; requests/retries JIT leases; cancels declared no-shows; schedules retries with 2–5 min jitter |
-| `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee, only when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**) |
+| `preemption_loop` | every `PREEMPTION_CHECK_INTERVAL` s (default 60) | Recovers capacity from pods running past their runtime guarantee: reactively, when an upcoming reservation boundary needs it (see **Runtime guarantees and demand-driven preemption**), and — throttled to `HEADROOM_CHECK_INTERVAL` — anticipatorily, to hold a fixed fraction of each class free for on-demand jobs that have not arrived yet (see **Anticipatory headroom preemption**) |
 | `capacity_audit_loop` | every `CAPACITY_CHECK_INTERVAL` s (default 3600) | Compares app-side per-class GPU capacity (`effective_gpus_today`) against physical cluster capacity; logs any difference as a WARNING and pauses on-demand admission for over-committed classes (see **App-side vs physical capacity reconciliation**) |
 | `lease_guard_loop` | every 20 s (only when `SINGLETON_LEASE_ENABLED`) | Renews the singleton `coordination.k8s.io` Lease; terminates the process if another live instance takes it (see **Singleton lease guard**) |
 
@@ -290,6 +290,86 @@ state.
 
 **RBAC**: the controller's ServiceAccount must have `create` on `events` and
 `get`/`list` on `nodes`, in addition to the existing pod permissions.
+
+### Anticipatory headroom preemption
+
+Boundary preemption is **reactive**: it frees GPUs only once a booking actually
+needs them at a `slot_start`.  A JIT on-demand job has no boundary of its own
+(see the caveat in **Just-in-time (JIT) on-demand leases**), so one landing on
+squatted GPUs simply waits.  **Headroom** (`HEADROOM_TARGET_PERCENT`, default
+`0` = off) closes that gap from the other side: it holds a fixed fraction of
+every GPU class free *before* the demand arrives.
+
+- **The goal** is per class, `ceil(capacity × HEADROOM_TARGET_PERCENT / 100)`
+  GPUs free — rounding **up**, so a small class still reserves a whole GPU
+  rather than rounding its headroom away.  Capacity is the physical node
+  snapshot (`snapshot_node_gpu_capacity`); free reuses `free_capacity_by_class`.
+  `ControllerState.headroom_shortfall_by_class` is the single arithmetic.
+- **Eligibility is unchanged from a boundary kill**
+  (`ControllerState._headroom_pool` applies exactly
+  `plan_boundary_candidates`' predicate): live, node-resident, admitted by this
+  controller, and **past its runtime guarantee**.  A pod inside its guarantee is
+  never a headroom victim, however large the shortfall.
+- **Notice period.**  Because no calendar event announces a headroom kill, a pod
+  is **warned before it is killable**.  `ControllerState.plan_headroom_warnings`
+  stamps the at-risk pool with the same `galends/termination-warning-*`
+  annotations the boundary warner uses, and
+  `plan_headroom_candidates` only considers pods whose stamped deadline has
+  already elapsed.  The deadline is **sticky** — a pod that already carries one
+  keeps it — which is load-bearing twice over: recomputing `now + notice` every
+  tick would re-patch every tick *and* the deadline would recede ahead of `now`
+  forever, so the gate could never open.  The pod's own annotation is the state,
+  so the notice survives a controller restart.  With
+  `TERMINATION_WARNING_ENABLED=false` nothing writes notices, so the gate is
+  **bypassed** (headroom kills immediately) rather than silently wedging.
+- **It rides the preemption sweep**, throttled by `HEADROOM_CHECK_INTERVAL`
+  (default 600 s) via `ControllerState.headroom_last_eval` — one pair of cluster
+  snapshots, and decisively **one writer** for the termination-warning
+  annotations, which a second loop would race.  The sweep still ticks on
+  `PREEMPTION_CHECK_INTERVAL`; headroom only *forces* it (and its two LISTs)
+  once per interval, so an idle cluster costs 2 LISTs / 10 min, not 2 / min.
+  A failed snapshot skips the sweep **without** consuming the interval.
+- **Ordering**: the headroom pass runs **after** the boundary loop and is handed
+  the post-kill pod set, so GPUs freed there count towards the goal and no pod is
+  selected twice — the same running-`doomed` discipline the boundary loop uses
+  across boundaries.  No `preemption_fired` mark: headroom is a standing goal,
+  not a one-shot per boundary/phase.
+- **Headroom *warnings* are recomputed on every sweep**, not only when the
+  throttled kill evaluation runs.  They are pure arithmetic over snapshots
+  already in hand, so they are free — and skipping them on a boundary-only tick
+  would leave a headroom-warned pod out of `warn_plan`, whereupon
+  `_apply_termination_warnings` clears its annotation as stale and the notice
+  could never ripen into a kill.  Where both sources warn the same pod, the
+  **sooner** deadline wins, so `galends/termination-warning-at` keeps one
+  meaning: the earliest instant this pod could die, from any cause.
+- **Victim selection reuses the boundary pipeline verbatim** — the planner
+  returns a `BoundaryPreemptionNeed` (with `boundary=now`, `phase="H"` inert on
+  this path), so app delegation, `select_victims_locally` and
+  `build_preemption_plan` all apply unchanged.  `PreemptionSelectionRequest`
+  carries no boundary, so **no app-side change was needed**.
+
+**Extending a reservation aborts a pending headroom kill**, through machinery
+that already existed — eligibility is recomputed from **live** reservation state
+every tick, not from the pod snapshot:
+
+| Extension shape | Mechanism |
+|---|---|
+| Abutting (`slot_start(new) == slot_end(old)`, same user/class/`gpu_count`) | `compute_guaranteed_until` chains it; `guarantee_end` grows, `_past_guarantee` goes false, the pod leaves the pool |
+| Non-abutting, or a different `gpu_count` | `plan_pod_adoptions` → `_adopt_pods` re-links the pod, deliberately **above** victim planning in the sweep |
+| App-side `POST /api/reservations/{id}/continue` | Pushed via the inbound API, which takes the same `reservation_lock` the sweep holds |
+
+Plan → select → delete is one uninterrupted `reservation_lock` acquisition, so an
+extension cannot land between selection and deletion — including across the
+delegation round-trip.  The stamped warning then self-clears (the pod drops out
+of `warn_plan`), and if the pod later lapses again a **fresh** full notice period
+is minted rather than the old deadline being resurrected.
+
+**Known gap**: `GET /api/forecast/preemption-risk` models booking boundaries
+only, so a pod at risk purely from headroom reports near-zero risk while
+carrying a real warning annotation.  Headroom is also **count-based per class**,
+inheriting the fragmentation blind spot documented under **Per-node capacity
+accounting**.  **RBAC**: none new — it reuses the sweep's existing node LIST and
+pod delete/patch permissions.
 
 ### Termination-warning annotations
 
@@ -1087,6 +1167,9 @@ the claimed set and the grace re-arm path above applies.
 | `PREEMPTION_LEAD_MINUTES` | `15` | Minutes before a reservation slot boundary that phase-A preemption runs |
 | `PREEMPTION_CHECK_INTERVAL` | `60` | Seconds between preemption sweeps |
 | `CAPACITY_CHECK_INTERVAL` | `3600` | Seconds between app-side vs physical GPU capacity audits; each audit logs per-class differences as WARNING and pauses on-demand admission for classes the app over-counts (see **App-side vs physical capacity reconciliation**) |
+| `HEADROOM_TARGET_PERCENT` | `0` | Percentage of each GPU class's physical capacity to hold free for on-demand jobs that have not arrived yet, reclaimed from pods past their runtime guarantee (see **Anticipatory headroom preemption**). `0` disables the feature; a pod inside its guarantee is never a headroom victim |
+| `HEADROOM_NOTICE_MINUTES` | `15` | Notice a headroom victim gets before it becomes killable — it is stamped with a `galends/termination-warning-at` deadline first and only becomes eligible once that deadline elapses. `0` = no notice. Requires `TERMINATION_WARNING_ENABLED`; with warnings off the gate is bypassed |
+| `HEADROOM_CHECK_INTERVAL` | `600` | Seconds between headroom evaluations. Headroom rides the preemption sweep but is throttled to this slower cadence so an idle cluster is not LISTed on `PREEMPTION_CHECK_INTERVAL`. Kill latency is therefore `HEADROOM_NOTICE_MINUTES` to `HEADROOM_NOTICE_MINUTES + this` after a pod is warned |
 | `PREEMPTION_DELEGATE_SELECTION` | `true` | Ask the app to choose preemption victims from the eligible pool (`POST /api/reservations/preemption-victims`); `false` (or any app-call failure) falls back to local uniform-random selection |
 | `POD_ADOPTION_ENABLED` | `true` | Re-link an overstay pod to a reservation its user has since booked (see **Adopting overstay pods into a re-booked reservation**); `false` disables |
 | `ONDEMAND_MERGE_ENABLED` | `true` | Merge a JIT on-demand lease's pod into the user's matching booking the moment that booking's window opens — re-link the pod and retire the lease penalty-exempt, without waiting for the lease guarantee to lapse (see **Merging a JIT lease into a matching booking**); `false` disables (the pod then converges lazily via adoption once past its lease guarantee) |

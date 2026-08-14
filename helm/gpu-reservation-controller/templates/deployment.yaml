@@ -106,6 +106,12 @@ spec:
               value: {{ .Values.config.terminationWarningLeadMinutes | quote }}
             - name: PREEMPTION_DELEGATE_SELECTION
               value: {{ .Values.config.preemptionDelegateSelection | quote }}
+            - name: HEADROOM_TARGET_PERCENT
+              value: {{ .Values.config.headroomTargetPercent | quote }}
+            - name: HEADROOM_NOTICE_MINUTES
+              value: {{ .Values.config.headroomNoticeMinutes | quote }}
+            - name: HEADROOM_CHECK_INTERVAL
+              value: {{ .Values.config.headroomCheckInterval | quote }}
             - name: OVERSTAY_REPORT_ENABLED
               value: {{ .Values.config.overstayReportEnabled | quote }}
             - name: SINGLETON_LEASE_ENABLED

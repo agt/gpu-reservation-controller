@@ -130,7 +130,7 @@ class TestEnvBool:
 
 
 # ---------------------------------------------------------------------------
-# Config.from_env — the twelve numeric settings
+# Config.from_env — the fifteen numeric settings
 # ---------------------------------------------------------------------------
 
 
@@ -148,12 +148,18 @@ NUMERIC_SETTINGS = [
     ("ONDEMAND_HORIZON_MINUTES", "ondemand_horizon_minutes", 30, True),
     ("ONDEMAND_LEASE_BUFFER_MINUTES", "ondemand_lease_buffer_minutes", 10, True),
     ("CAPACITY_CHECK_INTERVAL", "capacity_check_interval", 3600, False),
+    # 0 disables anticipatory headroom entirely, so it is a legitimate value;
+    # a 0-minute notice legitimately means "no notice gate"; but a 0-second
+    # evaluation interval is a busy loop, so that one floors at 1.
+    ("HEADROOM_TARGET_PERCENT", "headroom_target_percent", 0, True),
+    ("HEADROOM_NOTICE_MINUTES", "headroom_notice_minutes", 15, True),
+    ("HEADROOM_CHECK_INTERVAL", "headroom_check_interval", 600, False),
 ]
 
 
 class TestConfigNumericSettings:
     def test_every_numeric_setting_is_covered(self):
-        # Guards against a thirteenth setting being added with a bare int().
+        # Guards against a sixteenth setting being added with a bare int().
         import inspect
 
         source = inspect.getsource(Config.from_env)
