@@ -2882,7 +2882,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.reservation_client = client
 
     # Initialise Kubernetes client.
-    init_k8s(config.kubeconfig_path)
+    init_k8s(
+        config.kubeconfig_path, strict_tls_verify=config.k8s_tls_strict_verify
+    )
 
     # Claim the singleton lease before doing any work: two controllers would
     # issue duplicate toleration patches.  Raises (aborting startup, non-zero

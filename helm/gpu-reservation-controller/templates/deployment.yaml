@@ -116,6 +116,8 @@ spec:
               value: {{ .Values.config.overstayReportEnabled | quote }}
             - name: SINGLETON_LEASE_ENABLED
               value: {{ .Values.config.singletonLeaseEnabled | quote }}
+            - name: K8S_TLS_STRICT_VERIFY
+              value: {{ .Values.config.k8sTlsStrictVerify | quote }}
 
             # --- Downward API: identity for the singleton Lease ---
             - name: POD_NAME

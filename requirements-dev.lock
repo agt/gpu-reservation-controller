@@ -169,6 +169,7 @@ typing-inspection==0.4.2
 urllib3==2.7.0
     # via
     #   -c requirements.lock
+    #   -r requirements.txt
     #   kubernetes
     #   requests
 uvicorn==0.52.1

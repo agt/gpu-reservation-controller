@@ -113,6 +113,7 @@ class Config:
     headroom_check_interval: int = 600  # seconds between headroom evaluations (throttles the sweep)
     overstay_report_enabled: bool = False  # report overstay durations to the app for analysis (ships dark)
     singleton_lease_enabled: bool = True  # hold a coordination Lease so a duplicate instance refuses to run
+    k8s_tls_strict_verify: bool = True  # OpenSSL strict X.509 checks on the Kubernetes API connection
     pod_name: Optional[str] = None  # this pod's name (downward API); lease holder identity
     pod_namespace: Optional[str] = None  # this pod's namespace (downward API); where the Lease lives
     log_level: str = "INFO"        # root log level (LOG_LEVEL)
@@ -180,6 +181,7 @@ class Config:
             headroom_check_interval=_env_int("HEADROOM_CHECK_INTERVAL", 600),
             overstay_report_enabled=_env_bool("OVERSTAY_REPORT_ENABLED", False),
             singleton_lease_enabled=_env_bool("SINGLETON_LEASE_ENABLED", True),
+            k8s_tls_strict_verify=_env_bool("K8S_TLS_STRICT_VERIFY", True),
             # POD_NAME comes from the downward API in-cluster; HOSTNAME is the
             # pod name inside a container anyway, so it is a natural fallback.
             pod_name=os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or None,
