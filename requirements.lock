@@ -105,6 +105,7 @@ typing-inspection==0.4.2
     #   pydantic
 urllib3==2.7.0
     # via
+    #   -r requirements.txt
     #   kubernetes
     #   requests
 uvicorn==0.52.1

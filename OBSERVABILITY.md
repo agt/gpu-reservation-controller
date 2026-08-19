@@ -89,6 +89,7 @@ pod UID, so `event=reservation.lease_created … poduid=X` in the app and
 | CRITICAL | `task.crashed` | `task err` | A supervised background loop died with an unhandled exception; `GET /health` turns 503 so the liveness probe restarts the pod. No in-process restart. |
 | INFO | `shutdown.start` / `shutdown.complete` | — | |
 | INFO | `k8s.auth` | `mode` (+ `path`) | `mode=kubeconfig` or `in_cluster`. |
+| WARNING | `k8s.tls_relaxed` | `name detail` | `K8S_TLS_STRICT_VERIFY=false` — OpenSSL's strict X.509 checks are off for the Kubernetes API connection, so a cluster certificate missing an Authority Key Identifier is accepted. Chain, validity and hostname are still verified; this is not `verify_ssl: false`. Emitted once at startup, and only when the relaxation is in force. |
 
 ### Singleton lease — duplicate-instance guard (`SINGLETON_LEASE_ENABLED`)
 
