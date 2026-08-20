@@ -32,15 +32,19 @@ OTHER = "controller-xyz"
 DURATION = 60
 
 
-def _lease(holder, *, age_s=0, duration=DURATION, transitions=3):
+RV = "48213"
+
+
+def _lease(holder, *, age_s=0, duration=DURATION, transitions=3, rv=RV):
     renew = datetime.now(timezone.utc) - timedelta(seconds=age_s)
     return SimpleNamespace(
+        metadata=SimpleNamespace(name=LEASE_NAME, resource_version=rv),
         spec=SimpleNamespace(
             holder_identity=holder,
             lease_duration_seconds=duration,
             renew_time=renew,
             lease_transitions=transitions,
-        )
+        ),
     )
 
 
@@ -61,6 +65,11 @@ class _FakeCoordination:
         return body
 
     def replace_namespaced_lease(self, name, namespace, body):
+        # The apiserver rejects an update whose metadata.resourceVersion is
+        # unset ("must be specified for an update"), which is exactly what a
+        # body built from scratch rather than from the read object carries.
+        if not getattr(body.metadata, "resource_version", None):
+            raise ApiException(status=422, reason="Unprocessable Entity")
         self.replaced.append(body)
         return body
 
@@ -102,6 +111,7 @@ def test_acquire_takes_over_expired_lease(monkeypatch):
     # lease_transitions is bumped on a genuine handover.
     assert fake.replaced[0].spec.lease_transitions == 4
     assert fake.replaced[0].spec.holder_identity == ME
+    assert fake.replaced[0].metadata.resource_version == RV
 
 
 def test_acquire_reacquires_own_lease_immediately(monkeypatch):
@@ -127,6 +137,17 @@ def test_renew_refreshes_our_lease(monkeypatch):
     assert out.status == "acquired" and out.mode == "renewed"
     # A renewal must not restamp acquire_time.
     assert getattr(fake.replaced[0].spec, "acquire_time", None) is None
+    # ...and must carry the read object's resourceVersion, or the apiserver
+    # 422s every renewal and the lease silently goes stale.
+    assert fake.replaced[0].metadata.resource_version == RV
+
+
+def test_renew_fails_open_when_the_server_rejects_the_update(monkeypatch):
+    """The 422 this regression produced is returned, never raised."""
+    _install(monkeypatch, _FakeCoordination(read=_lease(ME, age_s=20, rv=None)))
+    out = asyncio.run(renew_singleton_lease(NS, ME, DURATION))
+
+    assert out.status == "error" and "422" in out.err
 
 
 def test_renew_detects_live_takeover(monkeypatch):
