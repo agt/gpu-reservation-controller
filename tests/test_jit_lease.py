@@ -275,6 +275,24 @@ def _non_gpu_condition():
     )
 
 
+def _taint_gated_condition():
+    """The verdict a real taint-gated cluster produces for a JIT candidate.
+
+    Every node of the pod's class carries the controller's NoSchedule taint,
+    which the candidate does not tolerate yet — and TaintToleration runs ahead
+    of NodeResourcesFit, so those nodes are filtered out before any GPU verdict
+    exists.  Current kube-scheduler does not name the taint either.
+    """
+    return SimpleNamespace(
+        type="PodScheduled", status="False", reason="Unschedulable",
+        message=(
+            "0/41 nodes are available: 12 node(s) didn't match Pod's node "
+            "affinity/selector, 25 node(s) had untolerated taint(s), 4 node(s) "
+            "were unschedulable."
+        ),
+    )
+
+
 def _candidate(uid="uid-1", *, gpu_requested=1, min_runtime_seconds=600,
                group_label=None, usage_group=GROUP_NAME):
     return OnDemandCandidate(
@@ -612,6 +630,132 @@ class TestTryRequestLease:
         # Indeterminate guard-1 parks the candidate on the scheduler's verdict;
         # the flag lets a subsequent MODIFIED re-attempt it immediately.
         assert candidate.awaiting_schedule_signal is True
+
+    def test_guard1_taint_gated_verdict_grants(self, monkeypatch):
+        """The regression this guard was rewritten for.
+
+        A candidate whose only reported blocker is an anonymous untolerated
+        taint used to classify indeterminate forever — the scheduler can never
+        say "Insufficient nvidia.com/gpu" about nodes it rejected on our taint
+        — so no lease was ever requested on a correctly taint-gated cluster.
+        """
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=_lease(604))
+        state = _state_ready()
+        candidate = _candidate("uid-1")
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_taint_gated_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        _patch_admission(monkeypatch, m)
+
+        config = SimpleNamespace(
+            ondemand_horizon_minutes=30, ondemand_lease_buffer_minutes=10,
+            scheduling_gate_name=None,
+        )
+        result = asyncio.run(m._try_request_lease(state, client, config, "uid-1", candidate))
+
+        assert result is True
+        assert len(client.create_requests) == 1
+        # A rendered verdict is not "awaiting the scheduler".
+        assert candidate.awaiting_schedule_signal is False
+
+    def test_guard1_no_taint_bucket_drops_candidate(self, monkeypatch):
+        """Nothing was rejected on a taint, so a toleration changes nothing."""
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=_lease(605))
+        state = _state_ready()
+        candidate = _candidate("uid-1")
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[SimpleNamespace(
+                type="PodScheduled", status="False", reason="Unschedulable",
+                message=(
+                    "0/5 nodes are available: 5 node(s) didn't match Pod's "
+                    "node affinity/selector."
+                ),
+            )])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+
+        config = SimpleNamespace(
+            ondemand_horizon_minutes=30, ondemand_lease_buffer_minutes=10,
+            scheduling_gate_name=None,
+        )
+        result = asyncio.run(m._try_request_lease(state, client, config, "uid-1", candidate))
+
+        assert result is True  # dropped
+        assert client.create_requests == []
+
+    def test_guard1b_drained_class_short_retries(self, monkeypatch):
+        """A class with no schedulable nodes gets no lease — but is not dropped."""
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=_lease(606))
+        state = _state_ready()
+        state.class_node_counts = {GPU_CLASS_LABEL: 0}
+        candidate = _candidate("uid-1")
+        before = candidate.next_attempt_at
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_taint_gated_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+
+        config = SimpleNamespace(
+            ondemand_horizon_minutes=30, ondemand_lease_buffer_minutes=10,
+            scheduling_gate_name=None,
+        )
+        result = asyncio.run(m._try_request_lease(state, client, config, "uid-1", candidate))
+
+        assert result is False  # held, retried later — nodes come back
+        assert candidate.next_attempt_at > before
+        assert client.create_requests == []
+
+    def test_guard1b_unknown_class_fails_open(self, monkeypatch):
+        """No node data yet must never wedge admission (matches guard 5)."""
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=_lease(607))
+        state = _state_ready()
+        state.class_node_counts = {}  # startup, or a failed snapshot
+        candidate = _candidate("uid-1")
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_taint_gated_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        _patch_admission(monkeypatch, m)
+
+        config = SimpleNamespace(
+            ondemand_horizon_minutes=30, ondemand_lease_buffer_minutes=10,
+            scheduling_gate_name=None,
+        )
+        result = asyncio.run(m._try_request_lease(state, client, config, "uid-1", candidate))
+
+        assert result is True
+        assert len(client.create_requests) == 1
+
+    def test_guard1b_populated_class_grants(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        client = _FakeClient(lease=_lease(608))
+        state = _state_ready()
+        state.class_node_counts = {GPU_CLASS_LABEL: 1}
+        candidate = _candidate("uid-1")
+
+        async def fake_read_pod(name, namespace):
+            return _pod(conditions=[_taint_gated_condition()])
+
+        monkeypatch.setattr(m, "read_pod", fake_read_pod)
+        _patch_admission(monkeypatch, m)
+
+        config = SimpleNamespace(
+            ondemand_horizon_minutes=30, ondemand_lease_buffer_minutes=10,
+            scheduling_gate_name=None,
+        )
+        result = asyncio.run(m._try_request_lease(state, client, config, "uid-1", candidate))
+
+        assert result is True
+        assert len(client.create_requests) == 1
 
     def test_guard3_stuck_holder_interlock_short_retries(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -1021,7 +1165,7 @@ def _watch_config():
 
 def _pending_jit_pod(*, uid="uid-1", conditions=None):
     """A Pending, JIT-eligible pod: gpu-class label + min-runtime / usage-group
-    annotations, no toleration.  *conditions* drives is_gpu_only_pending."""
+    annotations, no toleration.  *conditions* drives is_gpu_gated_pending."""
     return SimpleNamespace(
         metadata=SimpleNamespace(
             uid=uid, name="pod-1", namespace=USERNAME,
@@ -1093,7 +1237,7 @@ class TestScheduleSignalFastPath:
         state.ondemand_candidates["uid-1"] = candidate
 
         # A reconcile MODIFIED with no PodScheduled verdict yet (conditions=None
-        # → is_gpu_only_pending returns None): keep waiting, do not kick a batch.
+        # → is_gpu_gated_pending returns None): keep waiting, do not kick a batch.
         events = [("MODIFIED", _pending_jit_pod(conditions=None))]
         calls = self._run_with(monkeypatch, m, state, events)
 

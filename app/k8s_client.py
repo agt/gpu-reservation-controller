@@ -11,7 +11,7 @@ get_pod_booking_reference(pod)               — read galends/booking-reference 
 get_pod_usage_group(pod)                     — read galends/usage-group annotation (JIT lease group)
 parse_booking_reference(ref)                 — reservation id from a booking-reference
 pod_has_toleration(pod, ...)                 — check for a specific toleration
-is_gpu_only_pending(pod)                      — guard 1: GPU-only scheduling failure check
+is_gpu_gated_pending(pod, taint_key)         — guard 1: is Pending fixable by a lease?
 read_pod(name, namespace)                    — fetch current pod object
 snapshot_tolerated_pods(tol_key)             — one LIST → occupancy + claims + guard 3
 snapshot_node_gpu_inventory(taint_key)       — one LIST → allocatable GPUs per class, per node
@@ -379,23 +379,60 @@ def _pod_has_any_reservation_toleration(pod, toleration_key: str) -> bool:
     return any(t.key == toleration_key for t in (pod.spec.tolerations or []))
 
 
-def is_gpu_only_pending(pod) -> Optional[bool]:
-    """Guard 1: determine whether *pod* is Pending solely due to GPU shortage.
+# Scheduler-message parsing for guard 1 (see is_gpu_gated_pending).
+#
+# The message is an aggregate of per-node filter verdicts.  kube-scheduler runs
+# Filter plugins in a fixed order and records only the *first* one that rejects
+# a given node, so a node knocked out by TaintToleration never reaches
+# NodeResourcesFit — the constraint that shapes everything below.
+_INSUFFICIENT_RE = re.compile(r"Insufficient (\S+)")
+_TAINT_BUCKET_RE = re.compile(r"untolerated taint")
+# Older kube-scheduler named the offending taint inline —
+# "had untolerated taint {key=value: NoSchedule}" — while current versions emit
+# an anonymous count ("25 node(s) had untolerated taint(s)").  Both are handled.
+_NAMED_TAINT_RE = re.compile(r"untolerated taint \{([^}=:]+)")
 
-    Inspects ``pod.status.conditions[type=PodScheduled]`` to classify the
-    scheduling failure.
+
+def is_gpu_gated_pending(pod, taint_key: str) -> Optional[bool]:
+    """Guard 1: is *pod* Pending for something a lease + toleration could fix?
+
+    Inspects ``pod.status.conditions[type=PodScheduled]`` and classifies the
+    scheduling failure.  The question is deliberately *not* "is the pod short of
+    GPUs" — for an unadmitted candidate the scheduler cannot answer that.  The
+    controller's GPU nodes are tainted ``<taint_key>=<class>:NoSchedule``, a
+    candidate by definition does not tolerate that yet, and ``TaintToleration``
+    runs ahead of ``NodeResourcesFit`` in the default filter order — so every
+    node of the pod's own class is rejected on the taint and never produces an
+    ``Insufficient nvidia.com/gpu`` verdict at all.  Requiring that string as
+    the positive signal held every candidate at "indeterminate" forever on any
+    correctly taint-gated cluster.
+
+    So the message is read for what it *can* still say reliably: which blockers
+    rule the pod out for reasons a lease cannot fix.
 
     Returns:
-        ``True``  — confirmed GPU-only: message contains ``Insufficient
-                    nvidia.com/gpu`` and no other ``Insufficient <resource>``.
-                    The controller's own reservation taint appearing in the
-                    message is accepted (the pod lacks the toleration yet).
-        ``False`` — confirmed non-GPU constraint: message contains
-                    ``Insufficient <anything-else>``.  Drop the candidate;
-                    our toleration cannot fix its scheduling problem.
-        ``None``  — indeterminate: no ``PodScheduled`` condition yet, pod is
-                    not Pending, or message carries no ``Insufficient`` signal.
-                    Keep the candidate and retry on the next processor tick.
+        ``True``  — the scheduler has ruled and named no blocker the controller
+                    cannot fix.  Either GPU shortage is named outright (a class
+                    whose nodes are untainted), or nodes were rejected on an
+                    untolerated taint that may well be ours.  Proceed.
+        ``False`` — confirmed blocker we cannot fix: an ``Insufficient
+                    <non-GPU-resource>``; or no node was rejected on *any*
+                    taint (so our toleration changes nothing) with no GPU
+                    shortage named either; or every taint the message names is
+                    somebody else's.  Drop the candidate.
+        ``None``  — no scheduling verdict yet: the pod is not Pending, carries
+                    no ``PodScheduled`` condition, is not ``Unschedulable``, or
+                    the message is empty.  Keep the candidate and retry; this
+                    is the transient case the MODIFIED fast path in
+                    ``pod_watch_loop`` exists to shorten.
+
+    **Known limitation**, inherent to the filter ordering above: a candidate
+    blocked by a *second* constraint on its own class's nodes — insufficient
+    cpu/memory there, an unrelated taint, an unsatisfiable volume — is
+    invisible here, because those nodes never get past the taint filter to
+    report it.  Such a pod classifies ``True``, is granted a lease, and stays
+    Pending under it.  The backstops are guard 3 (a stuck holder freezes the
+    class), the lease's own short expiry, and ``_teardown_ondemand_lease``.
     """
     if get_pod_phase(pod) != "Pending":
         return None
@@ -408,20 +445,35 @@ def is_gpu_only_pending(pod) -> Optional[bool]:
         return None
 
     message = scheduled.message or ""
+    if not message:
+        return None
 
-    # Check for any non-GPU resource shortages first.  If any exist, we
-    # return False immediately even if GPU is also short — the pod cannot
-    # be helped by our toleration alone.  Strip trailing punctuation from
-    # the match group because the scheduler appends commas and periods
+    # (1) Any non-GPU resource shortage rules the pod out, even when GPU is
+    # also short — our toleration alone cannot help it.  Strip trailing
+    # punctuation from the match: the scheduler appends commas and periods
     # (e.g. "Insufficient nvidia.com/gpu, 3 Insufficient memory.").
-    for m in re.finditer(r"Insufficient (\S+)", message):
-        resource = m.group(1).rstrip(".,;)")
-        if resource != "nvidia.com/gpu":
+    for m in _INSUFFICIENT_RE.finditer(message):
+        if m.group(1).rstrip(".,;)") != "nvidia.com/gpu":
             return False
 
-    # GPU shortage must be explicitly mentioned.
-    if "Insufficient nvidia.com/gpu" not in message:
-        return None
+    # (2) GPU shortage named outright — the unambiguous case, and the only one
+    # the pre-taint-aware version of this guard could recognise.  It still
+    # occurs for a class whose nodes carry no reservation taint.
+    if "Insufficient nvidia.com/gpu" in message:
+        return True
+
+    # (3) No node was rejected on a taint at all, and no GPU shortage was
+    # named: whatever is blocking this pod, adding a toleration will not move
+    # it (a cluster-wide affinity/selector mismatch, an unbindable volume).
+    if not _TAINT_BUCKET_RE.search(message):
+        return False
+
+    # (4) Taints did reject nodes.  When the scheduler names them, ours has to
+    # be among them for a lease to help; when it only counts them
+    # (current kube-scheduler), assume it may be and proceed.
+    named = {m.group(1).strip() for m in _NAMED_TAINT_RE.finditer(message)}
+    if named and taint_key not in named:
+        return False
 
     return True
 

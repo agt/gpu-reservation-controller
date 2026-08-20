@@ -727,7 +727,7 @@ without the toleration,
    `MODIFIED` that carries the scheduler's verdict: when a fresh pod's
    `PodScheduled` condition is not yet set at ADDED time, guard 1 is
    indeterminate and the candidate is parked with `awaiting_schedule_signal`;
-   the `MODIFIED` that finally sets the condition (`is_gpu_only_pending` now
+   the `MODIFIED` that finally sets the condition (`is_gpu_gated_pending` now
    returns non-`None`) clears the flag, resets the candidate's cooldown, and
    re-attempts immediately — resolving in ~1 s + a lease round-trip instead of
    waiting up to a full periodic scan (~270–300 s).  The flag is set **only** by
@@ -750,7 +750,8 @@ two-step **preflight → delegate → grant** pipeline.
 - **Preflight** (`_preflight_ondemand_candidate`): re-reads the pod (drops it
   if gone/terminal/Unknown), re-runs step 1 above (a matching reservation may
   have appeared since the candidate was queued), applies guard 1
-  (`is_gpu_only_pending`), guard 3 (`stuck_holder_gpu_classes`), guard 4
+  (`is_gpu_gated_pending` + `class_node_counts` — see **Guard 1: what the
+  scheduler can and cannot tell us** below), guard 3 (`stuck_holder_gpu_classes`), guard 4
   (`overcommitted_gpu_classes`), and guard 5 (per-node feasibility — see
   **Per-node capacity accounting** below), and resolves the pod's `gpu-class`
   label to a numeric id via `ControllerState.gpu_class_ids`.  Survivors become an
@@ -835,6 +836,57 @@ independently.
 **RBAC / config**: no new Kubernetes permissions (admission reuses the
 existing pod-patch path); `ONDEMAND_HORIZON_MINUTES` and
 `ONDEMAND_LEASE_BUFFER_MINUTES` tune the routing horizon and lease sizing.
+
+### Guard 1: what the scheduler can and cannot tell us
+
+Guard 1 vets a JIT candidate's `PodScheduled` condition before a lease is
+minted.  Its original form asked "is this pod Pending *solely* for want of
+GPUs?" and answered by looking for `Insufficient nvidia.com/gpu` in the
+scheduler's message.  **That string can never appear for a candidate on a
+correctly taint-gated cluster**, and the guard therefore never granted anything:
+GPU nodes carry `gpu-class-reservation=<class>:NoSchedule`, an unadmitted
+candidate by definition does not tolerate it, and kube-scheduler evaluates
+`TaintToleration` *before* `NodeResourcesFit` — recording only the first filter
+that rejects each node.  So the pod's own class's nodes are attributed to the
+taint bucket and never report a resource verdict at all.  Every candidate parked
+at `guard=1 reason=schedule_verdict_pending`, at DEBUG, indefinitely.
+
+The rewrite splits the question along the line of what evidence actually exists.
+
+**1a — `k8s_client.is_gpu_gated_pending(pod, taint_key)`** (pure) reads the
+message only for blockers it can still name reliably, and keeps the same
+tri-state the call site already branched on:
+
+| | Condition | Outcome |
+|---|---|---|
+| `False` | `Insufficient <non-GPU-resource>`; **or** no node was rejected on *any* taint (a toleration changes nothing) and no GPU shortage named; **or** every taint the message *names* is somebody else's | **drop** — `ondemand.candidate_dropped reason=blocked_not_by_gpu_gating` |
+| `None` | no verdict at all: not Pending, no `PodScheduled`, not `Unschedulable`, or an empty message | hold, `awaiting_schedule_signal` |
+| `True` | otherwise — `Insufficient nvidia.com/gpu` outright, or nodes rejected on a taint that may be ours | proceed |
+
+Both scheduler message formats are handled: older versions name the offending
+taint inline (`untolerated taint {key=value: NoSchedule}`), current ones emit an
+anonymous count (`25 node(s) had untolerated taint(s)`).  Named taints are
+checked against `TOLERATION_KEY`; an anonymous bucket gets the benefit of the
+doubt.
+
+**1b — the physical half**, since 1a establishes only that *something* we might
+tolerate is in the way.  `ControllerState.class_node_counts` (class → schedulable
+nodes carrying its reservation taint, from `controller.node_counts_by_class` over
+the same inventory snapshot guard 5 reads, refreshed each queue-processor tick)
+must not be a **known zero**.  A fully drained class is **held**, not dropped —
+nodes come back — and a class with no data yet never blocks (fail-open, matching
+guard 5), so a snapshot gap cannot wedge admission.  Free GPUs cannot answer this:
+`node_free_by_class` reports `0` both for a full class and for a class with no
+nodes, and those want opposite treatment.
+
+**Known limitation**, inherent to the same filter ordering: a candidate blocked
+by a *second* constraint on its own class's nodes — cpu/memory there, an
+unrelated taint, an unbindable volume — is invisible, because those nodes never
+get past the taint filter to report it.  Such a pod classifies `True`, is granted
+a lease, and stays Pending under it.  Backstops: guard 3 (a stuck holder freezes
+the class), the lease's short natural expiry, and `_teardown_ondemand_lease` when
+the pod goes away.  **RBAC / config**: none new — 1b reuses the node LIST the
+queue tick already issues for guard 5.
 
 ### Defaults for pods that declare neither
 
@@ -955,7 +1007,9 @@ data already fetched (no new API calls, no new RBAC):
   accurate.
 - `ControllerState.node_free_by_class` (largest single-node free GPUs per class) is
   refreshed every `queue_processor_loop` tick from a node-inventory + tolerated-pod
-  snapshot.  **Fail-safe**: if either snapshot fails, the prior map is left unchanged
+  snapshot, alongside `ControllerState.class_node_counts` (nodes per class, which
+  guard 1b reads — see **Guard 1: what the scheduler can and cannot tell us**).
+  **Fail-safe**: if either snapshot fails, both prior maps are left unchanged
   (never open admission on unknown physical state).
 
 **Guard 5** (`_preflight_ondemand_candidate`): a JIT candidate requesting **≥2

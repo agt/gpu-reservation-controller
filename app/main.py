@@ -62,6 +62,7 @@ from .controller import (
     canceller_description,
     free_gpus_by_node_class,
     largest_node_free_by_class,
+    node_counts_by_class,
     reconcile_capacity,
     select_victims_locally,
     slot_end,
@@ -93,7 +94,7 @@ from .k8s_client import (
     get_pod_usage_group,
     get_unschedulable_message,
     init_k8s,
-    is_gpu_only_pending,
+    is_gpu_gated_pending,
     is_terminal_phase,
     make_booking_reference,
     parse_booking_reference,
@@ -925,7 +926,7 @@ async def _preflight_ondemand_candidate(
     2. Re-run the reserved-path routing check: a matching reservation may have
        appeared since the candidate was queued (a new booking, or simply time
        passing into the horizon) — route there instead of requesting a lease.
-    3. Guard 1 (GPU-only-pending).
+    3. Guard 1 (Pending for a reason a lease can fix, and the class has nodes).
     4. Guard 3 (stuck reservation-holder safety interlock).
     5. Guard 4 (over-committed gpu-class admission pause).
     6. Guard 5 (per-node feasibility: no single node can host a multi-GPU ask).
@@ -933,10 +934,10 @@ async def _preflight_ondemand_candidate(
 
     Returns one of:
     - ``(_PREFLIGHT_REMOVE, None)`` — drop the candidate (gone/terminal, routed
-      to the reserved queue, or not GPU-only-pending).
+      to the reserved queue, or blocked by something no lease can fix).
     - ``(_PREFLIGHT_RETRY, None)`` — keep it; ``candidate.next_attempt_at`` has
-      been pushed forward (transient read error, conditions not yet set, guard-3
-      interlock, or unknown gpu-class id).
+      been pushed forward (transient read error, conditions not yet set, a
+      drained gpu-class, guard-3 interlock, or unknown gpu-class id).
     - ``(_PREFLIGHT_READY, ask)`` — the candidate is a valid on-demand ask.
     """
     now = datetime.now(timezone.utc)
@@ -993,24 +994,44 @@ async def _preflight_ondemand_candidate(
                     state.dequeue_pod(uid)
         return _PREFLIGHT_REMOVE, None
 
-    # Guard 1: GPU-only-pending check.
-    gpu_only = is_gpu_only_pending(fresh_pod)
+    # Guard 1a: is the pod Pending for something a lease could fix?  The
+    # scheduler's verdict is read for the blockers it can still name — it
+    # cannot name a GPU shortage on this pod's own class, whose nodes it
+    # rejected on our untolerated taint before ever weighing resources.
+    gpu_gated = is_gpu_gated_pending(fresh_pod, TOLERATION_KEY)
     # Record *why* the candidate is (or isn't) waiting: True only when the
-    # scheduler has not yet recorded a verdict (gpu_only is None), so the
+    # scheduler has not yet recorded a verdict (gpu_gated is None), so the
     # MODIFIED-driven fast re-attempt in pod_watch_loop fires solely for this
     # case and never short-circuits a denial or guard-3/4 backoff.
-    candidate.awaiting_schedule_signal = gpu_only is None
-    if gpu_only is False:
+    candidate.awaiting_schedule_signal = gpu_gated is None
+    if gpu_gated is False:
         log.info("%s", kv(
             event="ondemand.candidate_dropped", ns=candidate.pod_namespace,
-            pod=candidate.pod_name, reason="not_gpu_only_pending",
+            pod=candidate.pod_name, reason="blocked_not_by_gpu_gating",
             detail=get_unschedulable_message(fresh_pod),
         ))
         return _PREFLIGHT_REMOVE, None
-    if gpu_only is None:
+    if gpu_gated is None:
         log.debug("%s", kv(
             event="ondemand.candidate_held", ns=candidate.pod_namespace,
             pod=candidate.pod_name, guard=1, reason="schedule_verdict_pending",
+        ))
+        candidate.next_attempt_at = _short_retry_at(now)
+        return _PREFLIGHT_RETRY, None
+
+    # Guard 1b: the physical half of the same question.  1a concluded only that
+    # *something* we might tolerate is in the way; confirm the class actually
+    # has a node to land on before minting an SU-charged lease.  The inventory
+    # already excludes cordoned and terminating nodes, so a known count of zero
+    # means a fully drained class — hold, since nodes come back.  A class with
+    # no data is unknown and never blocks (fail-open, matching guard 5), so a
+    # snapshot gap cannot wedge admission.
+    class_nodes = state.class_node_counts.get(candidate.gpu_class_label)
+    if class_nodes == 0:
+        log.info("%s", kv(
+            event="ondemand.candidate_held", guard=1, reason="no_class_nodes",
+            ns=candidate.pod_namespace, pod=candidate.pod_name,
+            clabel=candidate.gpu_class_label, nodes=0,
         ))
         candidate.next_attempt_at = _short_retry_at(now)
         return _PREFLIGHT_RETRY, None
@@ -1696,7 +1717,7 @@ async def pod_watch_loop(
                             # it became admissible within ~1 s of ADDED.
                             #
                             # Tightly scoped so the anti-hammer property holds:
-                            # is_gpu_only_pending() is a pure in-memory check on the
+                            # is_gpu_gated_pending() is a pure in-memory check on the
                             # watch object (no API call), and only a tracked candidate
                             # still flagged awaiting_schedule_signal can trigger — so an
                             # ordinary reconcile MODIFIED costs one boolean and returns.
@@ -1708,7 +1729,7 @@ async def pod_watch_loop(
                             if (
                                 candidate is not None
                                 and candidate.awaiting_schedule_signal
-                                and is_gpu_only_pending(pod) is not None
+                                and is_gpu_gated_pending(pod, TOLERATION_KEY) is not None
                             ):
                                 candidate.awaiting_schedule_signal = False
                                 candidate.next_attempt_at = datetime.now(timezone.utc)
@@ -1917,17 +1938,17 @@ async def _run_queue_tick(
         for gpu_class in old_classes - new_classes:
             log.info("%s", kv(event="interlock.cleared", clabel=gpu_class, guard=3))
 
-    # Guard 5: refresh per-node feasibility (largest single-node free GPUs per
-    # class) from a node-inventory snapshot joined with this tick's tolerated
-    # `snapshot`.  `snapshot` is deliberately reused rather than re-fetched
-    # alongside `inventory` (avoids a second wide pod LIST this tick); the two
-    # calls are not atomic, so a pod that finishes scheduling in the gap is
-    # briefly invisible here, making the per-node free count optimistic for
-    # the node it actually landed on.  Accepted: guard 3 and the compensating
-    # cancel in _grant_and_admit backstop any grant this skew lets through.
-    # Fail-safe: if either snapshot is missing, leave the prior map intact —
-    # never open multi-GPU admission for a class based on unknown physical
-    # state.  Consulted synchronously by _preflight_ondemand_candidate.
+    # Guards 1b and 5: refresh per-node feasibility (largest single-node free
+    # GPUs per class, and the node count behind each class) from a node-inventory
+    # snapshot joined with this tick's tolerated `snapshot`, deliberately reused
+    # rather than re-fetched alongside `inventory` (avoids a second wide pod LIST
+    # this tick); the two calls are not atomic, so a pod that finishes scheduling
+    # in the gap is briefly invisible here, making the per-node free count
+    # optimistic for the node it actually landed on.  Accepted: guard 3 and the
+    # compensating cancel in _grant_and_admit backstop any grant this skew lets
+    # through.  Fail-safe: if either snapshot is missing, leave both prior maps
+    # intact — never open admission for a class based on unknown physical state.
+    # Consulted synchronously by _preflight_ondemand_candidate.
     if config.ondemand_lease_enabled and snapshot is not None:
         try:
             inventory = await snapshot_node_gpu_inventory(TOLERATION_KEY)
@@ -1941,9 +1962,15 @@ async def _run_queue_tick(
                     inventory, [_pod_view(p) for p in snapshot]
                 )
             )
+            # Guard 1b reads the node *count* from the same inventory: free
+            # GPUs cannot distinguish "class is full" from "class has no nodes
+            # left", and those want opposite treatment (grant and wait, versus
+            # do not mint a lease at all).
+            state.class_node_counts = node_counts_by_class(inventory)
             for _cls, _free in sorted(state.node_free_by_class.items()):
                 log.debug("%s", kv(
                     event="queue.node_feasibility", clabel=_cls, node_free=_free,
+                    nodes=state.class_node_counts.get(_cls, 0),
                 ))
 
     to_remove: list[str] = []
