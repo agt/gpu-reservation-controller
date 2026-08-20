@@ -1332,9 +1332,25 @@ def _lease_age_seconds(lease, now: datetime) -> Optional[int]:
     return int((now - renewed).total_seconds())
 
 
+def _lease_resource_version(lease) -> Optional[str]:
+    """The resourceVersion of a Lease we just read, or None if absent."""
+    meta = getattr(lease, "metadata", None)
+    rv = getattr(meta, "resource_version", None) if meta is not None else None
+    return str(rv) if rv else None
+
+
 def _lease_body(holder: str, duration_s: int, now: datetime, *, acquire: bool,
-                transitions: int = 0):
-    """Build a Lease object claiming (or renewing) the singleton lock."""
+                transitions: int = 0, resource_version: Optional[str] = None):
+    """Build a Lease object claiming (or renewing) the singleton lock.
+
+    *resource_version* must be carried over from the Lease we just read
+    whenever this body is going to be PUT: the apiserver rejects an update
+    whose ``metadata.resourceVersion`` is unset with a 422 ("must be specified
+    for an update"), so a body built without it can be created but never
+    replaced.  It doubles as the optimistic-concurrency token — a write that
+    raced another instance's fails 409 rather than silently clobbering it,
+    and the next tick re-reads and re-decides.
+    """
     spec = k8s_client.V1LeaseSpec(
         holder_identity=holder,
         lease_duration_seconds=duration_s,
@@ -1344,7 +1360,10 @@ def _lease_body(holder: str, duration_s: int, now: datetime, *, acquire: bool,
     if acquire:
         spec.acquire_time = now
     return k8s_client.V1Lease(
-        metadata=k8s_client.V1ObjectMeta(name=LEASE_NAME), spec=spec
+        metadata=k8s_client.V1ObjectMeta(
+            name=LEASE_NAME, resource_version=resource_version
+        ),
+        spec=spec,
     )
 
 
@@ -1393,7 +1412,10 @@ async def acquire_singleton_lease(
             _coordination_v1.replace_namespaced_lease,
             LEASE_NAME,
             namespace,
-            _lease_body(holder, duration_s, now, acquire=True, transitions=transitions),
+            _lease_body(
+                holder, duration_s, now, acquire=True, transitions=transitions,
+                resource_version=_lease_resource_version(lease),
+            ),
         )
         log.debug("%s", kv(event="k8s.lease_write", name=LEASE_NAME, mode=mode))
         return LeaseOutcome(
@@ -1430,7 +1452,10 @@ async def renew_singleton_lease(
             _coordination_v1.replace_namespaced_lease,
             LEASE_NAME,
             namespace,
-            _lease_body(holder, duration_s, now, acquire=False, transitions=transitions),
+            _lease_body(
+                holder, duration_s, now, acquire=False, transitions=transitions,
+                resource_version=_lease_resource_version(lease),
+            ),
         )
         log.debug("%s", kv(event="k8s.lease_write", name=LEASE_NAME, mode="renewed"))
         return LeaseOutcome(status="acquired", holder=holder, mode="renewed")
