@@ -331,6 +331,29 @@ def get_pod_guarantee_status(pod) -> tuple[Optional[str], Optional[str]]:
     )
 
 
+def get_pod_reservation_facts(pod) -> tuple:
+    """Return the pod's five ``galends`` reservation-fact annotations, raw.
+
+    Order matches ``ReservationFacts``: ``(kind, start, end, gpu_count,
+    gpu_class_name)``; any element is ``None`` when its annotation is absent.
+    Values are the stored strings, **not** parsed — the reconcile in ``main``
+    compares them against freshly rendered strings (``utc_iso`` / ``str``), so
+    round-tripping through a parse would only introduce a way for the two sides
+    to disagree about formatting and re-patch every tick.
+
+    ``galends/admitted-at`` is deliberately absent: it is stamped once at first
+    admission and must never be refreshed, so nothing should be diffing it.
+    """
+    annotations: dict = getattr(pod.metadata, "annotations", None) or {}
+    return (
+        annotations.get(RESERVATION_KIND),
+        annotations.get(RESERVATION_START),
+        annotations.get(RESERVATION_END),
+        annotations.get(RESERVATION_GPU_COUNT),
+        annotations.get(GPU_CLASS_NAME),
+    )
+
+
 # Prefix recorded in a galends/booking-reference value.  Every admitted pod is a
 # real reservation now (the lease model requests one just-in-time rather than
 # placing onto an ad-hoc block), so there is only one kind.  Construction
@@ -546,6 +569,17 @@ class ToleratedPodInfo:
     # wants against what the pod already has and skip a no-op re-patch.
     guarantee_status: Optional[str] = None
     guaranteed_until: Optional[str] = None
+    # Current values of the reservation-fact annotations (raw strings), or None
+    # when absent — see get_pod_reservation_facts.  Carried for the same
+    # diff-and-skip reason: the facts describe a reservation that can change
+    # *underneath* a pod without the pod being re-linked (a window extended in
+    # place), and the per-tick reconcile must be able to tell a real change from
+    # the overwhelmingly common no-change.
+    reservation_kind: Optional[str] = None
+    reservation_start: Optional[str] = None
+    reservation_end: Optional[str] = None
+    reservation_gpu_count: Optional[str] = None
+    gpu_class_name: Optional[str] = None
 
 
 async def snapshot_tolerated_pods(
@@ -582,6 +616,7 @@ async def snapshot_tolerated_pods(
         booking = get_pod_booking_reference(pod)
         warning_at, warning_risk = get_pod_termination_warning(pod)
         guarantee_status, guaranteed_until = get_pod_guarantee_status(pod)
+        res_kind, res_start, res_end, res_gpus, res_class = get_pod_reservation_facts(pod)
         labels = pod.metadata.labels or {}
         out.append(
             ToleratedPodInfo(
@@ -605,6 +640,11 @@ async def snapshot_tolerated_pods(
                 termination_warning_risk=warning_risk,
                 guarantee_status=guarantee_status,
                 guaranteed_until=guaranteed_until,
+                reservation_kind=res_kind,
+                reservation_start=res_start,
+                reservation_end=res_end,
+                reservation_gpu_count=res_gpus,
+                gpu_class_name=res_class,
             )
         )
     log.debug("%s", kv(event="k8s.list_pods_done", purpose="tolerated_snapshot", count=len(out)))
@@ -782,6 +822,12 @@ async def annotate_runtime_guarantee(
     ``admitted_at`` is passed only on a pod's **first** admission, and is
     omitted (left at whatever the pod already carries) on those re-links.
 
+    Re-linking is not the only way the facts can go stale: the *same*
+    reservation can be mutated underneath the pod (a lease window extended in
+    place), which reaches none of those callers.  ``annotate_reservation_facts``
+    plus the per-tick ``main._apply_reservation_facts`` reconcile cover that
+    case; this function stays the admission/re-link writer.
+
     Informational only: this never patches ``spec.activeDeadlineSeconds`` —
     demand-driven preemption enforces nothing through a Kubernetes-side
     deadline, and never reads these annotations back to make a decision; it
@@ -810,6 +856,54 @@ async def annotate_runtime_guarantee(
     log.info("%s", kv(
         event="pod.guarantee_recorded", ns=namespace, pod=pod_name,
         guarantee_s=seconds, until=until_str,
+    ))
+
+
+async def annotate_reservation_facts(
+    pod_name: str,
+    namespace: str,
+    facts: ReservationFacts,
+) -> None:
+    """Re-stamp *pod_name*'s reservation-fact annotations from *facts*.
+
+    ``annotate_runtime_guarantee`` writes these at admission and on every
+    **re-link** (adoption, lease-to-booking merge), which covers every way the
+    pod's reservation could change *identity*.  This covers the remaining way it
+    can change *content*: the same reservation being mutated underneath the pod
+    — an on-demand lease whose window is extended in place, which re-links
+    nothing and so reaches none of those callers.  Without it the pod would keep
+    advertising its pre-extension ``galends/reservation-end`` while
+    ``galends/guaranteed-until`` moved forward, and a consumer reading both
+    would see them contradict each other.
+
+    Writes only the five fact keys.  It deliberately does **not** touch
+    ``galends/guarantee-status`` / ``-guaranteed-until`` (owned by
+    ``annotate_guarantee_status``, which reconciles them from live chain-aware
+    state) or ``galends/admitted-at`` (stamped once, at first admission — a
+    session-elapsed clock that must never restart mid-job).
+
+    Informational only, like every other ``galends`` stamp: never enforced
+    Kubernetes-side and never read back to make a decision.
+    """
+    end_str = utc_iso(facts.end_utc)
+    log.debug("%s", kv(
+        event="k8s.patch_pod", ns=namespace, pod=pod_name,
+        patch="reservation_facts", end=end_str,
+    ))
+    patch = {
+        "metadata": {
+            "annotations": {
+                RESERVATION_KIND: facts.kind,
+                RESERVATION_START: utc_iso(facts.start_utc),
+                RESERVATION_END: end_str,
+                RESERVATION_GPU_COUNT: str(facts.gpu_count),
+                GPU_CLASS_NAME: facts.gpu_class_name,
+            }
+        },
+    }
+    await _run(_core_v1.patch_namespaced_pod, pod_name, namespace, patch)
+    log.info("%s", kv(
+        event="pod.facts_refreshed", ns=namespace, pod=pod_name, end=end_str,
     ))
 
 
