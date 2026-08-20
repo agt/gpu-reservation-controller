@@ -497,7 +497,9 @@ class ToleratedPodInfo:
 
 
 async def snapshot_tolerated_pods(
-    toleration_key: str, group_label_key: Optional[str] = None
+    toleration_key: str,
+    group_label_key: Optional[str] = None,
+    group_label_default: Optional[str] = None,
 ) -> list[ToleratedPodInfo]:
     """Return one ``ToleratedPodInfo`` per pod carrying a *toleration_key* toleration.
 
@@ -510,6 +512,10 @@ async def snapshot_tolerated_pods(
     *group_label_key* (the configured REQUIRED_GROUP_LABEL, when enabled) names
     an additional pod label whose value is captured into
     ``ToleratedPodInfo.group_label``; unset ⇒ the field stays None.
+    *group_label_default* (the configured DEFAULT_USAGE_GROUP) stands in when the
+    pod carries no value for that label — it must be passed wherever routing
+    applies the same default, or a pod admitted under the default group would
+    read back as group-less and `_group_ok` would reject every reservation for it.
     """
     log.debug("%s", kv(event="k8s.list_pods", selector="gpu-class", purpose="tolerated_snapshot"))
     pod_list = await _run(
@@ -538,7 +544,9 @@ async def snapshot_tolerated_pods(
                 scheduled_false=(scheduled is not None and scheduled.status == "False"),
                 deletion_timestamp=pod.metadata.deletion_timestamp,
                 group_label=(
-                    labels.get(group_label_key) if group_label_key else None
+                    (labels.get(group_label_key) or group_label_default)
+                    if group_label_key
+                    else None
                 ),
                 node_name=getattr(pod.spec, "node_name", None) if pod.spec else None,
                 termination_warning_at=warning_at,

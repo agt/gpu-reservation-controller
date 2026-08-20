@@ -534,10 +534,13 @@ async def _snapshot_pods_for_eviction(config: Config) -> list:
     required_group_label must be passed: without it every ToleratedPodInfo
     carries group_label=None, `_group_ok` then rejects every reservation while
     the feature is enabled, and the adoption re-link can never find a booking to
-    carry the pod onto.
+    carry the pod onto.  default_usage_group rides along for the same reason: a
+    pod admitted under the default group must read back carrying it.
     """
     try:
-        return await snapshot_tolerated_pods(TOLERATION_KEY, config.required_group_label)
+        return await snapshot_tolerated_pods(
+            TOLERATION_KEY, config.required_group_label, config.default_usage_group
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning(
             "%s", kv(event="evict.snapshot_failed", target="pods", err=exc),
@@ -1478,11 +1481,12 @@ async def pod_watch_loop(
     JIT on-demand path (when ``config.ondemand_lease_enabled``): a pod with
     no reservation admittable now or within ``ONDEMAND_HORIZON_MINUTES`` is
     routed here instead of waiting — see ``_try_request_lease``.
-    - ADDED, Pending, has ``galends/minimum-runtime-seconds`` annotation, and
-      names its usage group (the group label when REQUIRED_GROUP_LABEL is set,
-      else the ``galends/usage-group`` annotation — the lease ask's required
-      ``group_name``) → add as a candidate and attempt a lease request
-      immediately
+    - ADDED, Pending, has ``galends/minimum-runtime-seconds`` annotation (or
+      ``DEFAULT_MINIMUM_RUNTIME_SECONDS`` standing in for it), and names its usage
+      group (the group label when REQUIRED_GROUP_LABEL is set, else the
+      ``galends/usage-group`` annotation, with ``DEFAULT_USAGE_GROUP`` standing in
+      for either — the lease ask's required ``group_name``) → add as a candidate
+      and attempt a lease request immediately
     - MODIFIED carrying the scheduler's verdict (``PodScheduled`` now set) for a
       tracked candidate that was parked on an indeterminate guard-1 result →
       re-attempt immediately, so a fresh pod does not wait a full periodic scan.
@@ -1519,9 +1523,12 @@ async def pod_watch_loop(
                 # Optional usage-group constraint (REQUIRED_GROUP_LABEL).  None both when
                 # the feature is disabled and when the pod lacks a (non-empty) value; a
                 # labelless pod (feature on) matches no booking and is never JIT-eligible
-                # either — it is left Pending for future "born overstay" handling.
+                # either — it is left Pending for future "born overstay" handling, unless
+                # DEFAULT_USAGE_GROUP names a group to fall back to.  The default stands
+                # in for the label wholesale: the pod matches that group's reservations
+                # on the reserved path exactly as if it had carried the label itself.
                 group_label: str | None = (
-                    labels.get(config.required_group_label) or None
+                    labels.get(config.required_group_label) or config.default_usage_group
                     if config.required_group_label
                     else None
                 )
@@ -1634,14 +1641,24 @@ async def pod_watch_loop(
                                         state.dequeue_pod(uid)
                         continue
 
-                    min_rt = get_pod_min_runtime_seconds(pod)
+                    # DEFAULT_MINIMUM_RUNTIME_SECONDS stands in for a pod that never
+                    # declared one (or declared junk).  0 means "no default", which
+                    # leaves the historical behaviour: no annotation, no JIT.
+                    min_rt = get_pod_min_runtime_seconds(pod) or (
+                        config.default_min_runtime_seconds or None
+                    )
                     # Usage group a JIT lease ask would carry: group_name is a
                     # *required* natural key on the app's lease-create endpoint, so a
                     # pod must name its group to be JIT-eligible — via the group label
                     # when REQUIRED_GROUP_LABEL is on (the label doubles as the group
-                    # source), else via the galends/usage-group annotation.
+                    # source), else via the galends/usage-group annotation.  The group
+                    # label already carries DEFAULT_USAGE_GROUP when it applies; the
+                    # annotation branch falls back to the same default, so one setting
+                    # covers a pod that named no group by either route.
                     usage_group: str | None = (
-                        group_label if config.required_group_label else get_pod_usage_group(pod)
+                        group_label
+                        if config.required_group_label
+                        else (get_pod_usage_group(pod) or config.default_usage_group)
                     )
                     jit_eligible = (
                         config.ondemand_lease_enabled
@@ -1817,7 +1834,7 @@ async def _run_queue_tick(
     snapshot = None
     try:
         snapshot = await snapshot_tolerated_pods(
-            TOLERATION_KEY, config.required_group_label
+            TOLERATION_KEY, config.required_group_label, config.default_usage_group
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(event="queue.snapshot_failed", target="pods", err=exc), exc_info=True)
@@ -2536,7 +2553,7 @@ async def _run_preemption_sweep(
 
     try:
         snapshot = await snapshot_tolerated_pods(
-            TOLERATION_KEY, config.required_group_label
+            TOLERATION_KEY, config.required_group_label, config.default_usage_group
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(event="preempt.snapshot_failed", target="pods", err=exc), exc_info=True)
@@ -3256,7 +3273,7 @@ async def preemption_risk_forecast(
     # Snapshots are awaited OUTSIDE the lock, mirroring the preemption sweep.
     try:
         snapshot = await snapshot_tolerated_pods(
-            TOLERATION_KEY, config.required_group_label
+            TOLERATION_KEY, config.required_group_label, config.default_usage_group
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(event="forecast.snapshot_failed", target="pods", err=exc), exc_info=True)

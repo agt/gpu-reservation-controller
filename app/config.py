@@ -105,6 +105,11 @@ class Config:
     preemption_delegate_selection: bool = True  # ask the app to choose victims; local random fallback
     ondemand_delegate_admission: bool = False  # ask the app which pending pods to admit; grant-all fallback
     required_group_label: Optional[str] = None  # pod label naming the usage group to match; None = disabled
+    # Fallbacks for the two things a pod must name itself before the controller
+    # can mint a JIT lease on its behalf.  Both ship disabled, so an unconfigured
+    # deployment keeps the "a pod that doesn't say is left Pending" behaviour.
+    default_min_runtime_seconds: int = 0  # stand-in for a missing galends/minimum-runtime-seconds; 0 = disabled
+    default_usage_group: Optional[str] = None  # stand-in for a missing group label/annotation; None = disabled
     ondemand_horizon_minutes: int = 30    # JIT trigger: reserved-match horizon before requesting a lease
     ondemand_lease_buffer_minutes: int = 10  # added to a pod's minimum-runtime when sizing a JIT lease
     capacity_check_interval: int = 3600  # seconds between app-side vs physical capacity audits
@@ -147,6 +152,13 @@ class Config:
             queue_processor_interval=_env_int("QUEUE_PROCESSOR_INTERVAL", 300),
             scheduling_gate_name=os.environ.get("POD_SCHEDULING_GATE_NAME") or None,
             required_group_label=os.environ.get("REQUIRED_GROUP_LABEL") or None,
+            # 0 is the meaningful "off" here — get_pod_min_runtime_seconds
+            # already rejects a non-positive annotation, so a zero default is
+            # indistinguishable from having no default at all.
+            default_min_runtime_seconds=_env_int(
+                "DEFAULT_MINIMUM_RUNTIME_SECONDS", 0, minimum=0
+            ),
+            default_usage_group=os.environ.get("DEFAULT_USAGE_GROUP") or None,
             inbound_api_token=os.environ.get("INBOUND_API_TOKEN") or None,
             preemption_lead_minutes=_env_int("PREEMPTION_LEAD_MINUTES", 15, minimum=0),
             preemption_check_interval=_env_int("PREEMPTION_CHECK_INTERVAL", 60),

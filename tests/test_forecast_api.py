@@ -52,7 +52,7 @@ def _patched_main(monkeypatch, token):
 def _patch_snapshots(monkeypatch, main, *, pods, capacity):
     """Stub both cluster snapshots; pass an Exception to make one fail."""
 
-    async def _snapshot_pods(_key, _group_label_key=None):
+    async def _snapshot_pods(_key, _group_label_key=None, _group_label_default=None):
         if isinstance(pods, Exception):
             raise pods
         return pods

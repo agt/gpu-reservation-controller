@@ -130,7 +130,7 @@ class TestEnvBool:
 
 
 # ---------------------------------------------------------------------------
-# Config.from_env — the fifteen numeric settings
+# Config.from_env — the numeric settings
 # ---------------------------------------------------------------------------
 
 
@@ -154,12 +154,14 @@ NUMERIC_SETTINGS = [
     ("HEADROOM_TARGET_PERCENT", "headroom_target_percent", 0, True),
     ("HEADROOM_NOTICE_MINUTES", "headroom_notice_minutes", 15, True),
     ("HEADROOM_CHECK_INTERVAL", "headroom_check_interval", 600, False),
+    # 0 is this one's "off": no stand-in for a missing minimum-runtime annotation.
+    ("DEFAULT_MINIMUM_RUNTIME_SECONDS", "default_min_runtime_seconds", 0, True),
 ]
 
 
 class TestConfigNumericSettings:
     def test_every_numeric_setting_is_covered(self):
-        # Guards against a sixteenth setting being added with a bare int().
+        # Guards against the next setting being added with a bare int().
         import inspect
 
         source = inspect.getsource(Config.from_env)

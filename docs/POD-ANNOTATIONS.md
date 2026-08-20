@@ -210,6 +210,13 @@ them. Worth surfacing read-only in a UI, since they explain admission behaviour:
 The pod's `gpu-class` **label** (not an annotation, so it is not in this file
 unless you also project `metadata.labels`) names the GPU class.
 
+A deployment may configure cluster-wide stand-ins for both of the above
+(`DEFAULT_MINIMUM_RUNTIME_SECONDS` / `DEFAULT_USAGE_GROUP`), in which case a pod
+carrying neither annotation is still JIT-eligible. Neither default is written
+back to the pod, so a UI cannot tell from the annotations alone whether a value
+came from the pod or from the deployment — read the absence of an annotation as
+"whatever the cluster defaults to", not as "unset".
+
 ---
 
 ## 4. Deriving a display state
