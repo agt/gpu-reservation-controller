@@ -165,8 +165,8 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 |---|---|---|---|
 | INFO | `ondemand.candidate_added` | `ns pod poduid clabel gpus min_runtime_s group` | |
 | DEBUG | `ondemand.candidate_removed` | `ns pod poduid` | |
-| INFO | `ondemand.candidate_dropped` | `ns pod reason` (+ `phase` \| `detail`) | Terminal phase, or Pending for a non-GPU reason. |
-| DEBUG/INFO/WARNING | `ondemand.candidate_held` | `guard reason ns pod` (+ `clabel gpus node_free`) | **The guard number is the field** — see below. |
+| INFO | `ondemand.candidate_dropped` | `ns pod reason` (+ `phase` \| `detail`) | Terminal phase, or Pending for something no lease can fix (`detail` carries the scheduler's verdict). |
+| DEBUG/INFO/WARNING | `ondemand.candidate_held` | `guard reason ns pod` (+ `clabel gpus node_free nodes`) | **The guard number is the field** — see below. |
 | DEBUG | `ondemand.schedule_verdict` | `ns pod` | Scheduler verdict arrived; re-attempting immediately. |
 | INFO | `lease.denied` | `ns pod clabel gpus status` | App refused the ask as infeasible (409), or a transient network/5xx failure; cooldown 2–5 min. |
 | WARNING | `lease.error` | `ns pod clabel gpus status fails retry_s` | **A fault waiting cannot fix** — a 4xx that is not 409 (read-only service key, schema mismatch, unknown group). Exponential backoff to 30 min; `grep 'event=lease.error'` is how a misconfigured deployment announces itself. |
@@ -185,11 +185,23 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 
 | `guard=` | `reason=` | Meaning |
 |---|---|---|
-| 1 | `schedule_verdict_pending` | `PodScheduled` not yet set; GPU-only-pending is indeterminate. |
+| 1 | `schedule_verdict_pending` | No `PodScheduled` verdict yet, so there is nothing to classify. Transient — the MODIFIED fast path shortens it to ~1 s. |
+| 1 | `no_class_nodes` | The class is *known* to have no schedulable node carrying its reservation taint (fully drained/cordoned). Fail-open when unknown. |
 | 3 | `stuck_holder_interlock` | A reservation holder is stuck Pending on this class. |
 | 4 | `class_overcommitted` | App-side capacity exceeds physical (see §8). |
 | 5 | `no_single_node_fit` | No single node has enough free GPUs for a ≥2-GPU ask. Fail-open when unknown. |
 | — | `class_id_unknown` | The `gpu-class` label has no numeric id yet. |
+
+Guard 1 is the only one that also **drops** rather than holds: a candidate the
+scheduler rules out for something a lease cannot fix leaves as
+`ondemand.candidate_dropped reason=blocked_not_by_gpu_gating`, with the verdict
+in `detail`.  Note what it deliberately does *not* key on — the string
+`Insufficient nvidia.com/gpu`.  On a taint-gated cluster the scheduler rejects
+the pod's own GPU nodes on our untolerated taint before it ever weighs their
+resources, so that string never appears and every candidate used to sit at
+`guard=1 reason=schedule_verdict_pending` forever, at DEBUG, granting nothing.
+`grep 'event=ondemand.candidate_held guard=1'` should be a *transient*
+population; a candidate that stays there across ticks is worth a look.
 
 `grep 'event=ondemand.candidate_held guard=4'` answers "how often is the capacity
 audit blocking admission" without matching on message text.
@@ -253,7 +265,7 @@ were deliberately given different keys.
 | WARNING | `queue.snapshot_failed` | `target err` | `target=pods` or `node_inventory`; prior state kept. |
 | WARNING | `interlock.activated` | `clabel guard count pods` | Guard-3 interlock on; JIT held for that class. |
 | INFO | `interlock.cleared` | `clabel guard` | |
-| DEBUG | `queue.node_feasibility` | `clabel node_free` | One line per class. |
+| DEBUG | `queue.node_feasibility` | `clabel node_free nodes` | One line per class: largest single-node opening (guard 5) and how many nodes back the class (guard 1). |
 
 ---
 

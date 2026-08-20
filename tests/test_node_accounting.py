@@ -6,6 +6,8 @@ Pure functions — no Kubernetes or HTTP.  Cover:
   the GPUs of *bound, live, non-terminating* pods on that node.
 - ``largest_node_free_by_class`` — the largest single-node opening per class, the
   number a multi-GPU admission feasibility check (guard 5) compares against.
+- ``node_counts_by_class`` — how many schedulable nodes back each class, which
+  guard 1 reads to tell "class is full" apart from "class has no nodes left".
 
 The final class contrasts per-node reality with the class-global total, which is
 the whole reason this accounting exists: a class can show free GPUs in aggregate
@@ -19,6 +21,7 @@ from app.controller import (
     free_capacity_by_class,
     free_gpus_by_node_class,
     largest_node_free_by_class,
+    node_counts_by_class,
 )
 
 
@@ -110,6 +113,23 @@ class TestLargestNodeFreeByClass:
     def test_negative_nodes_report_max(self):
         # Over-committed everywhere: the "largest" is the least-negative node.
         assert largest_node_free_by_class({"h100": {"n1": -2, "n2": -1}}) == {"h100": -1}
+
+
+class TestNodeCountsByClass:
+    def test_counts_nodes_not_gpus(self):
+        assert node_counts_by_class({"h100": {"n1": 8, "n2": 8}}) == {"h100": 2}
+
+    def test_zero_gpu_node_still_counts(self):
+        # A node carrying the class taint but reporting no allocatable GPUs is
+        # still a node: the class is not drained, it is empty of capacity, and
+        # those want different treatment from guard 1 vs guard 5.
+        assert node_counts_by_class({"h100": {"n1": 0}}) == {"h100": 1}
+
+    def test_drained_class_is_zero(self):
+        assert node_counts_by_class({"h100": {}}) == {"h100": 0}
+
+    def test_empty_inventory(self):
+        assert node_counts_by_class({}) == {}
 
 
 class TestFragmentationVsClassTotal:

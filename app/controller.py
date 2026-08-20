@@ -165,6 +165,21 @@ def largest_node_free_by_class(
     }
 
 
+def node_counts_by_class(
+    capacity_by_node_class: dict[str, dict[str, int]],
+) -> dict[str, int]:
+    """Collapse a per-node inventory to the number of nodes backing each class.
+
+    ``{gpu_class: node count}``.  ``snapshot_node_gpu_inventory`` already
+    excludes cordoned and terminating nodes, so a count of ``0`` — or a class
+    absent from the map entirely — means no schedulable node currently carries
+    that class's reservation taint.  Guard 1 reads this: a lease minted for a
+    class with nowhere to run is an SU charge against a pod that cannot start.
+    Pure.
+    """
+    return {gpu_class: len(nodes) for gpu_class, nodes in capacity_by_node_class.items()}
+
+
 class LockContractError(RuntimeError):
     """A ``reservation_lock`` contract violation — re-entry, or a missing hold.
 
@@ -727,6 +742,15 @@ class ControllerState:
         # never blocks (fail-open); a failed snapshot leaves the prior map intact
         # (fail-safe).  Empty = no data yet.
         self.node_free_by_class: dict[str, int] = {}
+
+        # Node existence (guard 1): number of schedulable nodes carrying each
+        # GPU class's reservation taint, from the same inventory snapshot that
+        # feeds node_free_by_class.  A candidate whose class is *known* to have
+        # no nodes is held rather than granted a lease it could never run
+        # under; a class absent from the map is "unknown" and never blocks
+        # (fail-open), and a failed snapshot leaves the prior map intact
+        # (fail-safe).  Empty = no data yet.
+        self.class_node_counts: dict[str, int] = {}
 
         # No-show tracking:
         # Maps reservation_id → deadline by which a matching pod must appear.

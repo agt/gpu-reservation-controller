@@ -81,8 +81,9 @@ system is designed to accommodate greater values in the future.)
 │      d. Safety interlock (guard 3): if a reservation │
 │         holder is stuck Pending for a GPU class,     │
 │         hold lease requests for that class            │
-│      e. Vet every due candidate: guard 1 (GPU-only-  │
-│         pending), resolve gpu-class → gpu_class_id.   │
+│      e. Vet every due candidate: guard 1 (Pending    │
+│         for a reason a lease can fix, and the class  │
+│         has nodes), resolve gpu-class → gpu_class_id. │
 │         If ONDEMAND_DELEGATE_ADMISSION, offer the     │
 │         whole batch to the app (LAS prioritization):  │
 │           POST /api/reservations/ondemand-admission   │
@@ -189,6 +190,32 @@ reservation rather than creating a duplicate.
   (`POST /api/reservations/{id}/cancel`, `reason=controller-revoked`) so the
   grant is never left dangling.
 
+**Scheduling verdict (guard 1)** — before requesting a lease the controller
+reads the pod's `PodScheduled` condition and drops any candidate the scheduler
+rules out for a reason a lease cannot fix: an `Insufficient <non-GPU-resource>`,
+a failure where *no* node was rejected on a taint at all (so adding a toleration
+changes nothing), or one where every taint the message names belongs to somebody
+else.  A pod with no verdict yet is held briefly and re-attempted the moment the
+scheduler records one.
+
+What it deliberately does **not** require is the string `Insufficient
+nvidia.com/gpu`.  GPU nodes carry `gpu-class-reservation=<class>:NoSchedule`, a
+candidate does not tolerate that yet, and kube-scheduler's `TaintToleration`
+filter runs ahead of `NodeResourcesFit` — so the pod's own class's nodes are
+rejected on the taint and never report a GPU verdict at all.  Requiring it held
+every candidate at "indeterminate" indefinitely on exactly the clusters this
+controller is built for.  The corresponding *physical* check is that the class
+has at least one schedulable node carrying its taint (same per-node inventory
+guard 5 uses); a fully drained class is held, not dropped, since nodes come
+back, and a class with no data yet does not block (fail-open).
+
+The residual gap is inherent to the same filter ordering: a candidate blocked by
+a *second* constraint on its own class's nodes — cpu/memory there, an unrelated
+taint, an unbindable volume — cannot be seen, because those nodes never get past
+the taint filter to report it.  Such a pod is granted a lease and stays Pending
+under it; guard 3, the lease's short expiry and the pod-teardown cancel are the
+backstops.
+
 **Safety interlock (guard 3)** — if any reservation-holder pod for a given
 GPU class is stuck in Pending (admitted but the scheduler cannot place it),
 lease requests are suspended for that class until the stuck pod is resolved.
@@ -198,8 +225,8 @@ Other GPU classes are unaffected.
 `nvidia.com/gpu` only schedules if a *single* node has N free (Kubernetes never
 splits a job across nodes).  Before requesting a lease for a **multi-GPU (≥2)**
 pod, the controller checks the largest single-node free block for its class
-(computed each queue-processor tick from a per-node inventory + pod snapshot —
-`nodes: list`, no new RBAC).  If no single node can host it, the request is held
+(computed each queue-processor tick from the same per-node inventory + pod
+snapshot guard 1 reads — `nodes: list`, no new RBAC).  If no single node can host it, the request is held
 and retried, rather than minting an SU-charged lease that could never schedule
 onto fragmented capacity.  A class with no per-node data yet does not block
 (fail-open); 1-GPU pods are unaffected.  (Node-aware *preemption* — freeing a
