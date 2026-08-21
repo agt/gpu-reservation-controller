@@ -119,7 +119,7 @@ def parse_downward_annotations(path="/etc/podinfo/annotations") -> dict[str, str
 | `galends/admitted-at` | at first admission only | absolute UTC instant, same format | Written once and never rewritten — a re-link is not a new admission. Never removed while the pod lives. |
 | `galends/termination-warning-at` | while at risk | absolute UTC instant, same format | **Appears and disappears.** Present only while the pod is in the at-risk pool; all three warning keys are removed together when the risk clears. |
 | `galends/termination-warning-risk` | while at risk | decimal string in `(0, 1]`, 2 dp, e.g. `0.33` | Same lifecycle. |
-| `galends/termination-warning-message` | while at risk | human-readable English sentence | Same lifecycle. Rendered deterministically from the other two; safe to display verbatim. |
+| `galends/termination-warning-message` | while at risk | human-readable English sentence | Same lifecycle. Rendered deterministically from the other two; safe to display verbatim. **The one value here that is not UTC**: its instant reads in the deployment's local zone (e.g. `2026-08-21 10:30:16 PDT`), because it is prose for a person rather than a value to parse. Parse `-at` instead. |
 
 ### What each one means
 
@@ -258,8 +258,14 @@ Suggested presentation:
 
 Countdowns should target `guaranteed-until` (state `guaranteed`) or
 `termination-warning-at` (state `at-risk`), computed client-side against the
-current time. All timestamps are UTC with an explicit `Z`; parse as
+current time. Every timestamp you parse is UTC with an explicit `Z`; parse as
 timezone-aware and render in the user's local zone.
+
+The single exception is `galends/termination-warning-message`, whose instant is
+*already* local — it is a finished sentence for a person, not a field, which is
+why the advice for it is "display verbatim" and never "parse". Its local zone is
+the controller deployment's, so if your users are somewhere else, build your own
+copy from `-at` and `-risk` rather than showing the message.
 
 The state above is orthogonal to `reservation-kind`, which sets the *noun* in
 that copy: a `guaranteed` pod on a `booking` has "your reservation until 20:00",
@@ -289,7 +295,9 @@ a new reservation, `Preempted` immediately before deletion, and
 `OnDemandLeaseDenied` when a lease request is refused — §5.1). These are richer
 than the annotations but need Kubernetes API access to read, so they are for
 whoever runs `kubectl` — the pod's owner, an operator, a dashboard — rather than
-for in-pod consumers.
+for in-pod consumers. Being addressed to a person, their messages state times in
+the deployment's local zone (`2026-08-21 10:30:16 PDT`) rather than the UTC the
+annotations carry.
 
 ### 5.1 Why a pod is still Pending: `OnDemandLeaseDenied`
 

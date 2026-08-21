@@ -685,8 +685,42 @@ All reservation window arithmetic uses **UTC-aware `datetime` objects** (`timezo
 response; no local-time conversion is performed in the controller.  Every
 `datetime.now()` call in the codebase uses `datetime.now(timezone.utc)`.
 
-The `TZ` environment variable affects log timestamp display only; window
-arithmetic is UTC-based and does not depend on it.
+**Human-readable prose is the one exception, and only ever at the last step.**
+A Kubernetes Event message and the `galends/termination-warning-message`
+annotation are read by a person — a user running `kubectl describe pod` — so
+they render their instants in a **local** zone (`2026-08-21 10:30:16 PDT`)
+rather than UTC.  Nothing else moves: every stored `datetime`, every
+`galends/*` timestamp annotation, and every log field stays UTC.  That split is
+load-bearing in both directions.  `docs/POD-ANNOTATIONS.md` promises consumers
+the `YYYY-MM-DDTHH:MM:SSZ` wire format, `main`'s diff-and-skip reconciles
+*rebuild* those strings to decide whether to re-patch (so a localised `utc_iso`
+would re-patch every pod on every tick), and the `until=` / `at=` / `boundary=`
+log fields join a controller line to an app line — which only works while both
+sides are UTC.
+
+`k8s_client.format_local` is the renderer and is deliberately a **sibling** of
+`utc_iso`, never a replacement: the two formats differ visibly (`2026-08-21
+10:30:16 PDT` vs `2026-08-21T17:30:16Z`) so neither is mistaken for the other in
+a bug report.  The zone is always named, because a bare local timestamp is
+ambiguous and one labelled `Z` would be wrong.  Four messages carry an absolute
+instant and all four are localised: the `RuntimeGuaranteed` and
+`OverstayRelinked` Events, the boundary `Preempted` Event, and
+`galends/termination-warning-message`.  The `OnDemandLeaseDenied` Event is
+**not** — it carries the app's 409 `detail` verbatim (which may embed a
+timestamp of the app's own), and rewriting a timestamp out of someone else's
+prose is how "carried, not re-derived" gets broken.
+
+The zone comes from `EVENT_DISPLAY_TIMEZONE` (an IANA name) when set, and
+otherwise from the process's local zone — i.e. `TZ`, which the chart already
+wires.  So `TZ` alone localises both the logs and the prose; the explicit
+variable exists for keeping logs on UTC while events read local.  It is
+resolved to a `ZoneInfo`, **not** to a fixed offset captured at startup: this
+daemon runs across DST transitions, and a frozen offset would render every
+later instant at the offset it booted with.  An unknown zone is not fatal — the
+same tolerant posture as every other setting: `config.invalid` at WARNING with
+`reason=unknown_timezone`, then fall back.  `config.timezone` at INFO on startup
+records what actually took effect, because the default is *derived* from the
+environment rather than read off a variable.
 
 ### Fast path for mid-window pods
 
@@ -1352,7 +1386,8 @@ the claimed set and the grace re-arm path above applies.
 | `KUBECONFIG` | *(absent = in-cluster)* | Path to kubeconfig file for out-of-cluster use |
 | `HTTP_PORT` | `8000` | Bind port for the **whole** HTTP listener — `GET /health` plus `POST /api/reservations/push` and `GET /api/forecast/preemption-risk` |
 | `INBOUND_API_TOKEN` | *(absent = inbound API disabled)* | Bearer token guarding the inbound APIs (`POST /api/reservations/push` and `GET /api/forecast/preemption-risk`); mount from a Kubernetes Secret. Unset ⇒ both endpoints return 503 |
-| `TZ` | system default | Affects log timestamp display only; window arithmetic is UTC-based and does not depend on it |
+| `TZ` | system default | Log timestamp display **and** the default zone for human-readable Event/annotation prose (see **Timezone**); window arithmetic is UTC-based and does not depend on it |
+| `EVENT_DISPLAY_TIMEZONE` | *(absent = the process zone, i.e. `TZ`)* | IANA zone the human-readable Event messages and `galends/termination-warning-message` render in, overriding `TZ` — for keeping logs on UTC while events read local. An unknown zone logs `config.invalid` and falls back rather than failing startup. Display only: stored instants, `galends/*` timestamp annotations and log fields stay UTC |
 | `ONDEMAND_LEASE_ENABLED` | `true` | Set to `false` to disable the JIT on-demand lease path entirely (a non-JIT-eligible pod still waits for a matching reservation; an ineligible one is left Pending) |
 | `ONDEMAND_HORIZON_MINUTES` | `30` | JIT routing horizon: a pod is queued for a reservation that opens within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | `10` | Minutes added to a pod's `galends/minimum-runtime-seconds` when sizing a requested JIT lease's duration |

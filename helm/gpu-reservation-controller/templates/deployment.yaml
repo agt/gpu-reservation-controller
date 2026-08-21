@@ -151,6 +151,12 @@ spec:
             - name: TZ
               value: {{ .Values.config.timezone | quote }}
             {{- end }}
+            {{- if .Values.config.eventDisplayTimezone }}
+            # Localises the human-readable Event/annotation prose only; log
+            # fields and every galends/* timestamp annotation stay UTC.
+            - name: EVENT_DISPLAY_TIMEZONE
+              value: {{ .Values.config.eventDisplayTimezone | quote }}
+            {{- end }}
 
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}

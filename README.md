@@ -287,7 +287,7 @@ effect:   NoSchedule
 | `galends/admitted-at` | first admission only | When the controller admitted this pod, absolute UTC ISO-8601. Deliberately **not** rewritten on a re-link — a re-link is not a new admission |
 | `galends/termination-warning-at` | at risk of preemption | Projected kill instant `max(boundary − lead, guarantee_end)` (the start of the sweep's kill window at the soonest boundary the pod is an eligible victim at, absolute UTC ISO-8601); cleared when the pod is no longer at risk. See *Termination-warning annotations* |
 | `galends/termination-warning-risk` | at risk of preemption | Preemption risk in (0, 1] at that boundary (`min(1, shortfall/pool_gpus)`, 2 decimals) |
-| `galends/termination-warning-message` | at risk of preemption | Human-readable warning text |
+| `galends/termination-warning-message` | at risk of preemption | Human-readable warning text. Renders its instant in **local** time (see `EVENT_DISPLAY_TIMEZONE`) — it is prose for a person, unlike the UTC `-at` above that a widget parses |
 
 (`galends/minimum-runtime-seconds` and `galends/usage-group` — the usage-group
 name a JIT lease is created under when `REQUIRED_GROUP_LABEL` is not in use —
@@ -336,7 +336,9 @@ abutting follow-on booking), something a Kubernetes deadline cannot do.
 **Recording the guarantee** — after applying the toleration, the controller
 annotates the pod (see table above) and creates a Kubernetes **Event** with
 reason `RuntimeGuaranteed` explaining when the guarantee ends and that the
-pod may later be preempted.  Recording is best-effort: if the PATCH or Event
+pod may later be preempted.  Event messages state their times in local time
+(`EVENT_DISPLAY_TIMEZONE`, defaulting to `TZ`), since a user reads them
+through `kubectl describe pod`; the annotations alongside stay UTC.  Recording is best-effort: if the PATCH or Event
 creation fails, a warning is logged but the toleration that was already
 applied is not revoked.
 
@@ -445,7 +447,8 @@ All settings are supplied via environment variables.
 | `RESERVATION_LOOKAHEAD_DAYS` | no | `7` | How many calendar days ahead to fetch reservations |
 | `KUBECONFIG` | no | *(absent)* | Path to a kubeconfig file; if unset, in-cluster service-account credentials are used |
 | `HTTP_PORT` | no | `8000` | Bind port for the whole HTTP listener — `GET /health` liveness plus the inbound push (`POST /api/reservations/push`) and preemption-risk forecast (`GET /api/forecast/preemption-risk`) APIs |
-| `TZ` | no | system default | **Log timestamp display only** — not read by application code; reservation window arithmetic is UTC-based and does not depend on it |
+| `TZ` | no | system default | Log timestamp display **and** the default zone for the human-readable Event/annotation prose (see `EVENT_DISPLAY_TIMEZONE`); reservation window arithmetic is UTC-based and does not depend on it |
+| `EVENT_DISPLAY_TIMEZONE` | no | *(absent = the process zone, i.e. `TZ`)* | IANA zone (e.g. `America/Los_Angeles`) the human-readable Kubernetes Event messages and `galends/termination-warning-message` render in. Set it to keep logs on UTC while events read local; an unknown zone logs a warning and falls back rather than failing startup. **Display only** — stored instants, every `galends/*` timestamp annotation and every log field stay UTC |
 | `ONDEMAND_LEASE_ENABLED` | no | `true` | Set to `false` to disable the JIT on-demand lease path entirely |
 | `ONDEMAND_HORIZON_MINUTES` | no | `30` | JIT routing horizon: a pod is queued for a reservation opening within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | no | `10` | Minutes added to a pod's `galends/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
