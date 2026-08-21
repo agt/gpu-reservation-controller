@@ -314,3 +314,129 @@ def test_push_owner_change_evicts_prior_owner_pod(monkeypatch):
         assert state.occupancy.get(1, {}) == {}         # budget freed for new owner
         by_id = {r.id: r for r in state.reservations}
         assert by_id[1].user.username == "bob"          # ownership transferred
+
+
+def _lease(res_id, *, user_id, username, end_utc, status="active"):
+    """An on-demand lease starting an hour ago and ending at *end_utc*."""
+    from tests.conftest import reservation
+
+    now = datetime.now(timezone.utc)
+    return reservation(
+        res_id,
+        start_utc=now - timedelta(hours=1),
+        end_utc=end_utc,
+        kind="on_demand",
+        user_id=user_id,
+        username=username,
+        status=status,
+        with_user=True,
+        gpu_class_label=GPU_CLASS_LABEL,
+    )
+
+
+def test_push_in_place_lease_extension_grows_the_guarantee_without_relinking(monkeypatch):
+    """The app's Extend on a lease: one row, same id, a later end.
+
+    This is the whole point of extending in place rather than superseding. The
+    push is an upsert by id, so the lease is *replaced* and:
+
+    * the pod is neither evicted nor re-linked -- its
+      ``galends/booking-reference`` still names the same reservation;
+    * ``guarantee_end`` grows, because it is recomputed live from ``slot_end``
+      rather than frozen at admission;
+    * the row stays ``kind="on_demand"``, so the pod remains merge-eligible and
+      the lease is still torn down when that pod exits.
+
+    Under the old supersede shape every one of those was false: the pod was
+    re-linked onto a booking (or *evicted*, with adoption disabled), and the
+    controller would never tear that booking down.
+    """
+    main = _patched_main(monkeypatch, token="secret")
+
+    pod = ToleratedPodInfo(
+        namespace=USERNAME, name="pod-1", uid="uid-1", gpu_class=GPU_CLASS_LABEL,
+        booking_reference="res-1", reservation_id=1, gpu_count=1,
+        phase="Running", scheduled_false=False,
+    )
+    deleted: list[tuple[str, str]] = []
+    relinked: list[tuple[str, str]] = []
+
+    async def _snapshot(_key, _group_label_key=None, _group_label_default=None):
+        return [pod]
+
+    async def _delete(name, ns):
+        deleted.append((name, ns))
+
+    async def _apply_toleration(name, ns, pod_obj, key, value, booking_reference):
+        relinked.append((name, booking_reference))
+
+    monkeypatch.setattr(main, "snapshot_tolerated_pods", _snapshot)
+    monkeypatch.setattr(main, "delete_pod", _delete)
+    monkeypatch.setattr(main, "apply_toleration", _apply_toleration)
+
+    now = datetime.now(timezone.utc)
+    original_end = now + timedelta(hours=1)
+    extended_end = now + timedelta(hours=6)
+
+    with TestClient(main.app) as client:
+        state = main.app.state.controller_state
+        state.reservations = [_lease(1, user_id=1, username=USERNAME, end_utc=original_end)]
+        state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
+        state.record_placement(1, "uid-1", 1)
+
+        before = state.guarantee_end(1, now=now)
+        assert before == original_end
+
+        resp = client.post(
+            "/api/reservations/push",
+            json=_json(_lease(1, user_id=1, username=USERNAME, end_utc=extended_end)),
+            headers={"Authorization": "Bearer secret"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["cancelled"] == 0
+        assert resp.json()["adopted"] == 0
+
+        assert deleted == [], "an extended lease's pod must never be evicted"
+        assert relinked == [], "extending in place re-links nothing"
+
+        # One row, not two: the upsert replaced it rather than adding beside it.
+        assert [r.id for r in state.reservations] == [1]
+        assert state.reservations[0].kind == "on_demand"
+        # Occupancy is untouched -- the pod is still on the same reservation.
+        assert state.occupancy.get(1, {}) == {"uid-1": 1}
+        # And the guarantee grew, live, with no annotation having been re-read.
+        assert state.guarantee_end(1, now=now) == extended_end
+
+
+def test_push_extended_lease_stays_merge_eligible(monkeypatch):
+    """The merge planner gates on ``kind == "on_demand"``, which an extension keeps.
+
+    Superseding the lease for a booking removed its pod from this planner's reach
+    permanently, even if the user booked the window properly an hour later.
+    """
+    main = _patched_main(monkeypatch, token="secret")
+
+    pod = ToleratedPodInfo(
+        namespace=USERNAME, name="pod-1", uid="uid-1", gpu_class=GPU_CLASS_LABEL,
+        booking_reference="res-1", reservation_id=1, gpu_count=1,
+        phase="Running", scheduled_false=False,
+    )
+
+    async def _snapshot(_key, _group_label_key=None, _group_label_default=None):
+        return [pod]
+
+    monkeypatch.setattr(main, "snapshot_tolerated_pods", _snapshot)
+
+    now = datetime.now(timezone.utc)
+    with TestClient(main.app) as client:
+        state = main.app.state.controller_state
+        state.reservations = [
+            _lease(1, user_id=1, username=USERNAME, end_utc=now + timedelta(hours=6)),
+            _booking(2, user_id=1, username=USERNAME),
+        ]
+        state.gpu_class_labels = {GPU_CLASS_ID: GPU_CLASS_LABEL}
+        state.record_placement(1, "uid-1", 1)
+
+        merges = state.plan_ondemand_merges([main._pod_view(pod)], now)
+
+    assert [(v.uid, r.id) for v, r in merges] == [("uid-1", 2)]

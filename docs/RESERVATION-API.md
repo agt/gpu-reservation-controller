@@ -315,7 +315,7 @@ Every reservation has a `kind` field:
 | `kind` | Created by | Time grid | Attribution |
 |--------|-----------|-----------|-------------|
 | `"booking"` | A user through the web UI (or an admin/manager on a user's behalf) | Whole hours — **except** a booking minted by `POST /api/reservations/{id}/continue`, which is anchored at "now" with an arbitrary second-granularity window (`continued_from_id` set) | `user_id` + `group_id` always set |
-| `"on_demand"` | The Kubernetes controller via §"Creating on-demand reservations" | Arbitrary timestamps, anchored at creation time | `user_id` + `group_id` always set |
+| `"on_demand"` | The Kubernetes controller via §"Creating on-demand reservations" | Arbitrary timestamps, anchored at creation time. **`end_dt` is mutable**: `POST /api/reservations/{id}/continue` moves it out in place, keeping the row's `id`, `kind` and `start_dt`. This is the only reservation whose window changes after creation, so a consumer caching one by id must expect its end to move | `user_id` + `group_id` always set |
 
 Both kinds are returned by `GET /api/reservations` under every `status` filter —
 there is no kind-based filtering. (Historical note: a third kind, `"reclaim"`,
@@ -451,13 +451,21 @@ appears in all reservation responses.
 
 ### `POST /api/reservations/{id}/continue`
 
-Continue a **still-running job** under a fresh guaranteed reservation. Mints a
-new `kind="booking"` reservation for the source's user/group/GPU class, anchored
-at the app's own "now" with an arbitrary second-granularity `duration_seconds`
-(so it can cover a job that never aligned to the whole-hour grid), then returns
-it. The sibling controller re-links (adopts) the running pod onto the new
-reservation, so the job keeps running with no relaunch. Callable by the source's
-**owner** (their session), an admin, or a manager of its group — **not** service keys.
+Extend a **still-running job**'s guarantee. Timing is anchored at the app's own
+"now" with an arbitrary second-granularity `duration_seconds`, so it can cover a
+job that never aligned to the whole-hour grid. Callable by the source's **owner**
+(their session), an admin, or a manager of its group — **not** service keys.
+
+**Two shapes, chosen by the source**, and the status code is the only way to tell
+them apart, since both return the reservation the job is now running under:
+
+| Source | What happens | Code |
+|---|---|---|
+| `kind="on_demand"`, `gpu_count` unchanged | The lease's own `end_dt` moves out. **Same row, same id, still `kind="on_demand"`.** Nothing is superseded and nothing is re-linked. | **200** |
+| `kind="booking"` in progress, **or** any source whose `gpu_count` is being changed | A fresh `kind="booking"` is minted and the sibling controller re-links (adopts) the running pod onto it. | **201** |
+
+A client that reads only the response body needs no change. One that compares the
+returned `id` against the id it posted will find them **equal** on a 200.
 
 ```json
 { "duration_seconds": 7200, "gpu_count": 2, "notes": "extending training run" }
@@ -465,9 +473,9 @@ reservation, so the job keeps running with no relaunch. Callable by the source's
 
 | Field | Meaning |
 |-------|---------|
-| `duration_seconds` | Length of the new guaranteed window from now (60 … 31 622 400; previously capped at 604 800 — see the contract note under on-demand creation). Required. Also bounded by the group's `max_reservation_hours`, which is enforced in the handler and returned as **400**. |
-| `gpu_count` | GPUs for the new reservation; defaults to the source's count. Optional. |
-| `notes` | Stored on the new reservation; defaults to the source's notes. Optional. |
+| `duration_seconds` | How long the job should be guaranteed **from now** (60 … 31 622 400; previously capped at 604 800 — see the contract note under on-demand creation). Required. Note this is a target instant, not an amount to add: extending in place resolves to `max(end_dt, now + duration_seconds)`, so a duration shorter than the time the lease already holds is an idempotent **200** no-op rather than a truncation. Also bounded by the group's `max_reservation_hours` (**400**), which in place measures the **accumulated** span from the row's original `start_dt`. |
+| `gpu_count` | GPUs for the reservation; defaults to the source's count. Passing a *different* count forces the supersede-and-recreate shape, because the existing span was capacity-checked and SU-charged at the old count. Optional. |
+| `notes` | Stored on the reservation; defaults to the source's notes. Optional. |
 
 Eligible sources (must be `status="active"`):
 
@@ -477,31 +485,50 @@ Eligible sources (must be `status="active"`):
   path than re-running the booking wizard. A not-yet-started or already-ended
   booking is rejected.
 
-Semantics:
+Semantics common to both shapes:
 
-- **Off-grid, anchored at "now"** — like an on-demand lease, `start_dt` is the
-  app's `local_now()` and `end_dt = start + duration_seconds`; whole-hour
-  alignment and the 15-minute lead do **not** apply. The resulting
-  `kind="booking"` row may therefore be off the hourly grid.
-- **Supersede** — when the source still holds future time (`end_dt > now`) it is
-  cancelled with the standard unwaived cancellation penalty (charging only the
-  time already consumed and freeing its remaining capacity), then set
-  `cancel_reason="superseded"`, so the new reservation is admitted against freed
-  resources and the two never double-count. An already-ended on-demand overstay
-  is left untouched.
+- **Off-grid** — whole-hour alignment and the 15-minute lead do **not** apply, so
+  the resulting window may be off the hourly grid to the second.
 - **Same admission analysis as a booking** — the three capacity tiers (+
   borrowing), the per-member/team SU budget and group SU pool, and
   `max_gpus_per_reservation`, with privilege judged **as-if-self-booked** (the
   owner being an admin/manager of the group skips budgets and earns the ±90-day
   validity grace).
-- The new row records `continued_from_id` (the source reservation's id). No
-  confirmation email is sent. Both the new booking and any superseded source are
-  pushed to the controller (best-effort) so the pod is carried forward promptly.
+- No confirmation email is sent. The result is pushed to the controller
+  (best-effort) so the pod is carried forward promptly.
+
+**In place** (200):
+
+- **Only the added tail** `[max(end_dt, now), target)` is capacity-checked and
+  SU-charged; the SU gates take that delta, since the committed and pool sums
+  already include this lease at its current cost. `su_cost_original` is never
+  touched.
+- For a **lapsed** lease (an overstaying pod), the gap `[end_dt, now)` is
+  deliberately **not** charged.
+- `borrowed_gpus` / `borrowed_gpu_hours` / `borrow_tier` / `borrow_mode`
+  **accumulate** across the row's admissions rather than being written once —
+  max, sum, union and latest respectively. A row carrying no attribution
+  (`borrowed_gpus: null`, i.e. admitted before tracking existed) is left as-is
+  rather than being merged into, since `null` means *no data*.
+- `date` stays the row's original **start** date and does not advance with the
+  window; consumers selecting a date range must use overlap, not start date.
+- `continued_from_id` stays `null` — nothing was continued *from*.
+
+**Supersede and recreate** (201):
+
+- When the source still holds future time (`end_dt > now`) it is cancelled
+  **penalty-exempt** — charging only the time already consumed and freeing its
+  remaining capacity — then set `cancel_reason="superseded"`, so the new
+  reservation is admitted against freed resources and the two never double-count.
+  An already-ended on-demand overstay is left untouched.
+- The new row records `continued_from_id` (the source reservation's id). Both it
+  and any superseded source are pushed to the controller in one call.
 
 **Responses**
 
 | Code | Condition |
 |------|-----------|
+| 200 | Extended in place — the source [ReservationResponse](#reservationresponse) with its new `end_dt`, same `id`, `kind="on_demand"`. Also returned unchanged when the lease already covered the requested end |
 | 201 | Created — the new [ReservationResponse](#reservationresponse), `kind="booking"`, `continued_from_id` set |
 | 400 | Source not active / not an eligible kind or phase, or the window can't be admitted on budget |
 | 403 | Caller is not the owner, an admin, or a manager of the group |
@@ -1290,7 +1317,7 @@ Returned by `GET /api/groups/{group_id}/members`.
 | `cancelled_at_local` | datetime \| null (local, no suffix) | `cancelled_at` in site-local wall clock, in `start_dt`'s shape — for UIs that print it beside `start_dt`/`end_dt`. `null` when never cancelled. Not an absolute instant: use `cancelled_at` for time comparisons |
 | `cancelled_by_id` | integer \| null | User ID of whoever cancelled; `null` for a controller (service-key) cancellation |
 | `cancel_reason` | `"no-show"` \| `"controller-revoked"` \| `"pod-terminated"` \| `"superseded"` \| null | Machine-readable reason recorded by `POST /api/reservations/{id}/cancel` (or `"superseded"` when a source was continued via `POST /api/reservations/{id}/continue`); `null` for human cancellations |
-| `continued_from_id` | integer \| null | Set on a booking minted via `POST /api/reservations/{id}/continue`: the id of the superseded source reservation whose pod it carries forward; `null` otherwise |
+| `continued_from_id` | integer \| null | Set on a booking minted via `POST /api/reservations/{id}/continue`: the id of the superseded source reservation whose pod it carries forward; `null` otherwise — including on a lease that endpoint extended **in place**, which continues nothing and keeps its own id |
 
 ---
 
