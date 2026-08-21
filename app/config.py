@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from datetime import tzinfo
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .log_fields import kv
 
@@ -82,6 +84,47 @@ def _env_int(
     return value
 
 
+def timezone_label(tz: Optional[tzinfo]) -> str:
+    """Name *tz* for a log line, where ``None`` means the process's local zone.
+
+    A ``ZoneInfo`` carries the IANA key it was built from; the process-local
+    fallback has no such name, so it is reported as whatever ``TZ`` says (the
+    variable that actually decides it) or ``system`` when even that is unset.
+    """
+    key = getattr(tz, "key", None)
+    if key:
+        return str(key)
+    return os.environ.get("TZ") or "system"
+
+
+def _env_tz(name: str, default: Optional[tzinfo] = None) -> Optional[tzinfo]:
+    """Read an IANA timezone name, falling back to *default* on an unknown zone.
+
+    The same tolerant posture as ``_env_bool`` / ``_env_int``: a typo'd or
+    unshipped zone must not kill startup over a *display* setting, so it logs
+    ``config.invalid`` and falls back.
+
+    ``None`` — the default default — means "the process's local zone", which is
+    what ``TZ`` sets.  It is deliberately not resolved to a fixed ``tzinfo``
+    here: a zone captured at startup would freeze the UTC offset in force at
+    that moment, and this daemon runs across DST transitions.  Deferring to
+    ``datetime.astimezone(None)`` at render time re-derives the offset per
+    instant instead.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return ZoneInfo(raw)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        log.warning("%s", kv(
+            event="config.invalid", name=name, value=raw,
+            reason="unknown_timezone",
+            detail=f"using {timezone_label(default)}",
+        ))
+        return default
+
+
 @dataclass(frozen=True)
 class Config:
     reservation_api_url: str
@@ -128,6 +171,10 @@ class Config:
     k8s_tls_strict_verify: bool = True  # OpenSSL strict X.509 checks on the Kubernetes API connection
     pod_name: Optional[str] = None  # this pod's name (downward API); lease holder identity
     pod_namespace: Optional[str] = None  # this pod's namespace (downward API); where the Lease lives
+    # Timezone the human-readable Event/annotation prose renders in.  None =
+    # the process's local zone (TZ).  Display only: every stored instant,
+    # every galends/* timestamp annotation and every log field stays UTC.
+    display_timezone: Optional[tzinfo] = None
     log_level: str = "INFO"        # root log level (LOG_LEVEL)
 
     @classmethod
@@ -211,5 +258,10 @@ class Config:
             # pod name inside a container anyway, so it is a natural fallback.
             pod_name=os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or None,
             pod_namespace=os.environ.get("POD_NAMESPACE") or None,
+            # Unset falls through to the process local zone, so setting TZ
+            # alone (which the chart already wires) is enough to localise the
+            # prose; the explicit variable is for keeping logs on UTC while
+            # events read local.
+            display_timezone=_env_tz("EVENT_DISPLAY_TIMEZONE"),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
         )

@@ -31,7 +31,7 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from typing import AsyncIterator, Callable, Optional, TypeVar
 
 from kubernetes import client as k8s_client, config as k8s_config, watch
@@ -236,6 +236,58 @@ def utc_iso(dt: datetime) -> str:
     if dt.tzinfo is not None:
         dt = dt.astimezone(timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Timezone the human-readable prose renders in — Kubernetes Event messages and
+# the ``galends/termination-warning-message`` annotation.  ``None`` means the
+# process's local zone (what ``TZ`` sets), which is also the default — so a
+# deployment that sets neither variable still renders UTC.  A module global set
+# once at startup rather than a threaded parameter: the emitters are reached
+# from call sites (``_record_guarantee`` and friends) that carry no ``Config``,
+# and this module already holds startup-initialised globals for the API
+# clients.
+_display_tz: Optional[tzinfo] = None
+
+
+def set_display_timezone(tz: Optional[tzinfo]) -> None:
+    """Set the zone ``local_display`` renders in (``Config.display_timezone``)."""
+    global _display_tz
+    _display_tz = tz
+
+
+def format_local(dt: datetime, tz: Optional[tzinfo]) -> str:
+    """Render *dt* in *tz* for a human to read, e.g. ``2026-08-21 10:30:16 PDT``.
+
+    The counterpart to ``utc_iso``, and deliberately *not* a replacement for it:
+    a stored instant, a ``galends/*`` timestamp annotation and every log field
+    stay UTC (``docs/POD-ANNOTATIONS.md`` promises consumers that wire format,
+    and ``main``'s diff-and-skip reconciles rebuild those strings to decide
+    whether to re-patch).  Only prose a person reads is localised.
+
+    *tz* of ``None`` means the process's local zone, resolved per instant by
+    ``astimezone`` — so a daemon that started in PST renders a PDT instant
+    correctly rather than freezing the offset it booted with.
+
+    The zone is always named, because a bare local timestamp is ambiguous and
+    one labelled ``Z`` would be wrong.  ``%Z`` gives the abbreviation for a
+    named zone and can come back empty for a bare fixed offset, so that case
+    falls back to the numeric offset.
+
+    A naive instant is assumed to be UTC, matching ``utc_iso`` — ``astimezone``
+    would otherwise read it as *local* time, so the two helpers would disagree
+    about the same input.  As there, that is a defensive fallback rather than a
+    supported input: every datetime in this codebase is built ``timezone.utc``.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    local = dt.astimezone(tz)
+    label = local.strftime("%Z") or local.strftime("%z")
+    return f"{local.strftime('%Y-%m-%d %H:%M:%S')} {label}".strip()
+
+
+def local_display(dt: datetime) -> str:
+    """``format_local`` against the startup-configured display zone."""
+    return format_local(dt, _display_tz)
 
 
 # Annotation keys describing the reservation an admitted pod is running under,
@@ -1063,6 +1115,9 @@ async def emit_runtime_guaranteed_event(
         if hours
         else f"{minutes}m{secs:02d}s"
     )
+    # The Event message reads in local time (a person reads it); the log field
+    # stays UTC, because it joins to the app's own log lines and to the
+    # galends/guaranteed-until annotation this same admission writes.
     until_str = utc_iso(guaranteed_until)
     await _emit_pod_event(
         pod.metadata.uid,
@@ -1072,7 +1127,8 @@ async def emit_runtime_guaranteed_event(
         reason="RuntimeGuaranteed",
         action="GuaranteeRuntime",
         message=(
-            f"GPU access guaranteed for {human}, until {until_str}. The pod may "
+            f"GPU access guaranteed for {human}, until "
+            f"{local_display(guaranteed_until)}. The pod may "
             f"keep running after that, but can be preempted if reserved capacity "
             f"is needed."
         ),
@@ -1241,7 +1297,8 @@ async def emit_overstay_relinked_event(
         action="RelinkPod",
         message=(
             f"Pod re-linked to GPU reservation #{reservation_id}; no longer "
-            f"overstay. GPU access guaranteed until {until_str}."
+            f"overstay. GPU access guaranteed until "
+            f"{local_display(guaranteed_until)}."
         ),
     )
     log.info("%s", kv(

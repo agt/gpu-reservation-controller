@@ -45,7 +45,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from . import trace
-from .config import Config
+from .config import Config, timezone_label
 from .log_fields import kv
 from .controller import (
     TOLERATION_KEY,
@@ -98,12 +98,14 @@ from .k8s_client import (
     init_k8s,
     is_gpu_gated_pending,
     is_terminal_phase,
+    local_display,
     make_booking_reference,
     parse_booking_reference,
     pod_has_toleration,
     read_pod,
     remove_scheduling_gate,
     renew_singleton_lease,
+    set_display_timezone,
     snapshot_node_gpu_capacity,
     snapshot_node_gpu_inventory,
     snapshot_tolerated_pods,
@@ -2135,7 +2137,7 @@ def _preemption_message(
     """Build the human-readable ``Preempted`` event message for *view*."""
     return (
         f"Pod preempted to free capacity for reservation(s) starting "
-        f"{boundary.strftime('%Y-%m-%dT%H:%M:%SZ')}: "
+        f"{local_display(boundary)}: "
         f"{_overstay_description(state, view, now)}."
     )
 
@@ -2201,15 +2203,22 @@ async def _preempt_pod(
         log.warning("%s", kv(event="pod.delete_failed", ns=namespace, pod=name, err=exc))
 
 
-def _termination_warning_message(at_str: str, risk_str: str) -> str:
+def _termination_warning_message(terminate_at: datetime, risk_str: str) -> str:
     """Build the human-readable ``galends/termination-warning-message`` value.
 
     Rendered deterministically from the projected instant and risk so it only
     changes when they do (keeping the no-op-skip comparison stable).
+
+    The instant reads in local time here, while the sibling
+    ``galends/termination-warning-at`` annotation keeps the UTC wire format —
+    this is prose for a person, that is a value a widget parses.  Taking the
+    ``datetime`` rather than the caller's already-rendered UTC string is what
+    keeps the two from being confused for one another.
     """
     return (
         f"At risk of preemption: this pod is at or nearing the end of its GPU "
-        f"runtime guarantee and may be terminated as early as {at_str} to free "
+        f"runtime guarantee and may be terminated as early as "
+        f"{local_display(terminate_at)} to free "
         f"capacity for a reservation starting then (risk {risk_str}). Extend or "
         f"re-book the reservation to retain capacity."
     )
@@ -2255,7 +2264,7 @@ async def _apply_termination_warnings(
                     p.namespace,
                     desired.terminate_at,
                     risk_str,
-                    _termination_warning_message(at_str, risk_str),
+                    _termination_warning_message(desired.terminate_at, risk_str),
                 )
             elif (
                 p.termination_warning_at is not None
@@ -3056,6 +3065,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # arguments.  Only ``config`` is available on ``app.state`` before this.
     app.state.controller_state = state
     app.state.reservation_client = client
+
+    # Localise the human-readable Event/annotation prose (display only: stored
+    # instants, galends/* timestamp annotations and log fields all stay UTC).
+    set_display_timezone(config.display_timezone)
+    log.info("%s", kv(
+        event="config.timezone",
+        name="EVENT_DISPLAY_TIMEZONE" if config.display_timezone is not None else "TZ",
+        value=timezone_label(config.display_timezone),
+    ))
 
     # Initialise Kubernetes client.
     init_k8s(

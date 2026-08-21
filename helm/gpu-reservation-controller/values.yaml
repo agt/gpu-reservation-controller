@@ -103,11 +103,21 @@ config:
   # declared for windows already in progress.
   noshowGraceMinutes: 30
 
-  # IANA timezone; affects log timestamp display only (reservation window
-  # arithmetic is UTC-based and does not depend on it).
-  # Leave empty to use the container's system default.
+  # IANA timezone for log timestamps, and — unless eventDisplayTimezone
+  # overrides it — for the human-readable text of the Kubernetes Events the
+  # controller writes on pods.  Reservation window arithmetic is UTC-based and
+  # does not depend on either.
+  # Leave empty to use the container's system default (UTC).
   # Example: America/Los_Angeles
   timezone: ""
+
+  # IANA timezone for the human-readable Event messages and the
+  # galends/termination-warning-message annotation only — set this to localise
+  # what users read via `kubectl describe pod` while leaving the logs (and
+  # everything a machine parses) on UTC.
+  # Leave empty to follow `timezone` above.
+  # Example: America/Los_Angeles
+  eventDisplayTimezone: ""
 
   # Log level: DEBUG, INFO, WARNING, ERROR
   logLevel: "INFO"
