@@ -99,7 +99,10 @@ The penalty is computed by `_compute_cancellation_penalty` in
 `app/routers/reservations.py`. Let:
 
 - `used` = consumed hours (0 unless the reservation is in progress),
-- `pen`  = unused reserved hours inside the next 24 h (`[max(start, now), min(end, now+24h)]`),
+- `grace` = 2 h for a `kind='on_demand'` lease, 0 for a web booking (see
+  "On-demand grace" below),
+- `pen`  = unused reserved hours inside the next 24 h
+  (`[max(start + grace, now), min(end, now+24h)]`),
 - `committed = used + pen`.
 
 The **exemption** (in hours) is `min(committed / 2, 8)`. Then:
@@ -118,18 +121,44 @@ SU == hours):
 | 24 h booking, just started | **16.0** (used 0 + 24 × (24−8)/24) |
 | 12 h booking, cancelled 6 h in | **6.0** (used 6 + 0 penalty; `pen=6 ≤ exemption=6`) |
 | 24 h booking, cancelled 20 h in | **20.0** (used 20 + 0 penalty) |
+| 2 h **lease**, exited 10 min in | **0.17** (used 10 min + 0 penalty; the whole request is inside the grace) |
+| 12 h **lease**, revoked at start | **5.0** (used 0 + 10 × (10−5)/10; `pen` starts 2 h in) |
 
 A cancelled reservation with a non-zero penalty continues to count against the
 member's `su_cost_user` balance until its `end_dt` passes — the same
 renewable-ceiling model as active reservations. This prevents gaming the budget
 by booking then cancelling at the last minute.
 
+#### On-demand grace — `_CANCEL_ON_DEMAND_GRACE_H` (2 h)
+
+A web booking is a claim its owner chose the length of; a `kind='on_demand'`
+lease is not. The controller sizes a lease to the runtime a pod *requests*, and
+a request is a ceiling, not a prediction — a job that asks for two hours and
+converges in ten minutes is the normal case, not an abuse of the reservation.
+Penalising the difference would charge the user for the accuracy of an estimate
+the scheduler required them to make up front, and would push them to request
+less time than their job might need, which is the opposite of what the lease
+model wants.
+
+So for `kind='on_demand'` only, the penalisable window opens `grace` hours after
+the lease starts: unused time in `[start, start + 2 h]` contributes nothing to
+`pen`. **Consumed time is untouched** — it is charged in full whether it falls
+inside the grace or after it — so the ten-minute job pays for ten minutes and a
+lease that runs its full two hours pays for two.
+
+Only the *unused* remainder is forgiven, and only the leading hours: a lease long
+enough to reach past the grace is penalised on the ordinary curve from there on
+(the 12 h lease in the table). Web bookings are unaffected at any length: the
+same 2 h window booked through the wizard and abandoned 10 minutes in still
+retains 1.0 SU. `_CANCEL_ON_DEMAND_GRACE_H` in `app/routers/reservations.py` is
+the lever; setting it to `0` restores the pre-grace behaviour exactly.
+
 #### Design rationale and the three knobs
 
 This policy replaced a simpler "100 % of consumed + 50 % of the next-24 h
 remainder" rule. Three properties drove the redesign, and three constants
-(declared at the top of the cancel helpers in `app/routers/reservations.py`)
-remain the levers to retune:
+(declared at the top of the cancel helpers in `app/routers/reservations.py`,
+alongside the on-demand grace above) remain the levers to retune:
 
 1. **Penalty window — `_CANCEL_PENALTY_WINDOW_H` (24 h).** Only imminent
    capacity is scarce, so only reserved hours within this horizon are
@@ -396,8 +425,13 @@ Consequences for the scheduling model:
   (`POST /api/reservations/{id}/cancel`, reason `controller-revoked`) or reports
   a holder who never ran pods (`no-show` — also usable against an
   already-started booking). The standard unwaived cancellation penalty applies,
-  so an early no-show retains a real charge while a lease revoked near its end
-  retains only the consumed time.
+  so a lease revoked near its end retains only the consumed time. This is the
+  one place the lease and booking curves differ: a lease's first
+  `_CANCEL_ON_DEMAND_GRACE_H` (2 h) carry **no** penalty on unused time (§3,
+  "On-demand grace"), so a pod that exits well short of the runtime it requested
+  is charged for what it ran and nothing more, and a revoke or no-show inside
+  that grace costs the consumed time alone. Past the grace an early cancel
+  retains a real charge as before.
 
 ## 8. What is NOT modeled (gaps for OR guidance)
 

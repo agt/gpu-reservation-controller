@@ -434,7 +434,15 @@ Scope:
 The retained SU charge is the standard, unwaived late-cancellation charge —
 identical to the member cancelling at that instant (time already consumed in
 full, plus the fraction-of-cost penalty on the unused remainder inside the next
-24 h; short remainders are forgiven by the exemption). The **one exception** is
+24 h; short remainders are forgiven by the exemption). A `kind: "on_demand"`
+lease carries an additional **2-hour grace**: unused time in its first two hours
+is never penalised, because a lease's length is the runtime the pod *requested*
+rather than one its holder chose. A lease cancelled inside that grace therefore
+retains only the time it actually ran — a pod that asked for two hours and
+exited after ten minutes is charged for the ten minutes. Time consumed is
+charged in full inside the grace as anywhere else, a lease reaching past it is
+penalised normally on the remainder, and a `kind: "booking"` row cancelled here
+gets no grace at any length. The **one exception** is
 `reason: "superseded"`, which is penalty-exempt: only already-consumed time is
 retained (the merged-into booking re-covers the remaining time, so charging a
 penalty would double-charge it). The reason is stored in `cancel_reason` and
