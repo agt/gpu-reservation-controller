@@ -181,7 +181,18 @@ dark.  For each granted pod it then calls `POST /api/reservations` with
 pod's Kubernetes UID**: a retry after a prior grant returns the same
 reservation rather than creating a duplicate.
 
-- **Denied** (409/error): the candidate cools down 2–5 min and retries.
+- **Denied** (409/error): the candidate cools down 2–5 min and retries.  On a
+  **409** — the app's documented "infeasible right now", which carries a reason
+  such as `Only 1 GPU(s) available for this group at 2026-08-21 14:00 (group
+  ceiling: 4)` — that reason is also mirrored onto the pod as a `Warning`
+  Kubernetes Event (`reason=OnDemandLeaseDenied`), so the pod's **owner** can see
+  why their job is still Pending with `kubectl describe pod` rather than needing
+  the controller's logs.  An unchanged reason is restated at most once per
+  `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` (a changed one is reported at once), and
+  only the app's own denial is surfaced this way — a network failure or a
+  controller misconfiguration is an operator's problem and stays in the log.
+  `ONDEMAND_DENIAL_EVENT_ENABLED=false` disables it.  See
+  [`docs/POD-ANNOTATIONS.md` §5.1](docs/POD-ANNOTATIONS.md).
 - **Granted**: the pod is admitted under the new reservation immediately,
   through the same admission path as any reserved-path pod (stamps
   `res-<id>`, records the guarantee, emits `RuntimeGuaranteed`).  If
@@ -438,6 +449,8 @@ All settings are supplied via environment variables.
 | `ONDEMAND_LEASE_ENABLED` | no | `true` | Set to `false` to disable the JIT on-demand lease path entirely |
 | `ONDEMAND_HORIZON_MINUTES` | no | `30` | JIT routing horizon: a pod is queued for a reservation opening within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | no | `10` | Minutes added to a pod's `galends/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
+| `ONDEMAND_DENIAL_EVENT_ENABLED` | no | `true` | Mirror the reservation app's **409** denial reason for a JIT lease onto the waiting pod as a `Warning` Kubernetes Event (`reason=OnDemandLeaseDenied`), so its owner can see why it is still Pending without access to the controller's logs. Informational only — the controller retries either way. Only the app's own denial is surfaced; a network failure or a non-409 fault stays in the log. Set to `false` to disable |
+| `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | no | `30` | How long an **unchanged** denial reason is suppressed before being restated on the pod. The retry cadence is 2–5 min, so without this a blocked pod would accumulate a new Event every few minutes; the repeat still fires because Events expire, and a pod that is still stuck should still say so. A reason that **changes** is emitted immediately regardless. `0` emits on every denial |
 | `ONDEMAND_DELEGATE_ADMISSION` | no | `false` | Delegate on-demand admission selection to the app for LAS prioritization (`POST /api/reservations/ondemand-admission`); `false` (or any app-call failure) grants every eligible candidate. The app endpoint is shipped but selects grant-all today, so enabling this changes no behaviour until the app carries real admission policy |
 | `NOSHOW_TIMEOUT_MINUTES` | no | `15` | Minutes after a reservation window opens before declaring a no-show and cancelling it app-side |
 | `NOSHOW_GRACE_MINUTES` | no | `30` | Grace period (minutes) after controller startup before no-shows are declared for windows already in progress |

@@ -285,9 +285,48 @@ pod spec sets, typically 30 s. §6 covers how to do that for a PyTorch job.
 
 The controller also emits Kubernetes **Events** against the pod
 (`RuntimeGuaranteed` at admission, `OverstayRelinked` when a pod is re-linked to
-a new reservation, `Preempted` immediately before deletion). These are richer
+a new reservation, `Preempted` immediately before deletion, and
+`OnDemandLeaseDenied` when a lease request is refused — §5.1). These are richer
 than the annotations but need Kubernetes API access to read, so they are for
-operators and dashboards rather than in-pod consumers.
+whoever runs `kubectl` — the pod's owner, an operator, a dashboard — rather than
+for in-pod consumers.
+
+### 5.1 Why a pod is still Pending: `OnDemandLeaseDenied`
+
+The Events above all concern a pod that was *admitted*. A pod that never gets
+that far has the opposite problem, and it used to be invisible: a pod with no
+reservation open gets an on-demand lease requested on its behalf, and when the
+reservation app refuses that ask as infeasible it answers with a reason — not
+enough GPUs left under the group's ceiling, an exhausted SU budget, a group the
+user is not a member of. That reason reached the controller's log and stopped
+there, so the owner saw a pod sitting Pending with nothing saying why.
+
+The controller now mirrors it back onto the pod as a `Warning` Event, so it
+shows up in the place a user already looks:
+
+```console
+$ kubectl describe pod my-training-job
+...
+Events:
+  Type     Reason                Age    From                          Message
+  ----     ------                ----   ----                          -------
+  Warning  FailedScheduling      5m12s  default-scheduler             0/41 nodes are available: ...
+  Warning  OnDemandLeaseDenied   4m58s  gpu-reservation-controller    On-demand GPU lease for 2 x a100 was denied by the reservation service: Only 1 GPU(s) available for this group at 2026-08-21 14:00 (group ceiling: 4). The pod stays Pending; the controller will keep retrying.
+```
+
+Three things worth knowing about it:
+
+- **It is not a terminal state.** The controller keeps retrying on its own
+  cadence (2–5 minutes); the Event is a report, not a rejection. A pod denied
+  for capacity usually gets in once someone else's job ends.
+- **It repeats, but not every retry.** An unchanged reason is restated at most
+  once per `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` (default 30) — often enough
+  that the Event does not silently age out of `kubectl describe` on a pod that
+  is still stuck, rarely enough that it does not bury the pod's other Events. A
+  reason that *changes* is reported immediately, because it is new information.
+- **Only the app's own denial is reported.** A network failure or a controller
+  misconfiguration (a read-only service key, say) is not the pod owner's problem
+  and produces no Event; those go to the controller's log for an operator.
 
 ---
 

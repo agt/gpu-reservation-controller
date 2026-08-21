@@ -58,6 +58,12 @@ class LeaseAttempt:
 
     reservation: Optional[ReservationResponse] = None
     status: Optional[int] = None  # None when the app never answered (network/parse)
+    # Excerpt of the app's ``HTTPException.detail`` on a non-2xx, or None when
+    # the app never answered.  Carried rather than only logged because the 409
+    # text is the only statement of *why* the ask was infeasible ("Only 2 GPU(s)
+    # available for this group at ...", "SU budget exceeded"), and the caller
+    # surfaces it to the pod's owner as a Kubernetes Event.
+    detail: Optional[str] = None
 
     @property
     def granted(self) -> bool:
@@ -78,6 +84,13 @@ class LeaseAttempt:
 
 _DETAIL_MAX_CHARS = 200
 
+# Rendered into a log line when an error response carries nothing to quote.  A
+# log field cannot be empty and still read as deliberate, but this is our own
+# placeholder rather than something the app said, so it must not travel any
+# further -- ``LeaseAttempt.detail`` reports it as None ("the app gave no
+# reason") so it can never surface as a reason to a user.
+_NO_RESPONSE_BODY = "no body"
+
 
 def _response_detail(response: httpx.Response) -> str:
     """A short, log-safe excerpt of an error response body.
@@ -95,7 +108,7 @@ def _response_detail(response: httpx.Response) -> str:
     text = str(detail) if detail is not None else (response.text or "").strip()
     if len(text) > _DETAIL_MAX_CHARS:
         text = text[:_DETAIL_MAX_CHARS] + "…"
-    return text or "no body"
+    return text or _NO_RESPONSE_BODY
 
 
 async def _attach_trace(request: httpx.Request) -> None:
@@ -262,17 +275,21 @@ class ReservationClient:
             )
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
+            detail = _response_detail(exc.response)
             if status == LEASE_DENIED_STATUS:
                 log.info("%s", kv(
                     event="api.lease_denied", poduid=req.idempotency_key,
-                    status=status,
+                    status=status, detail=detail,
                 ))
             else:
                 log.warning("%s", kv(
                     event="api.lease_error", poduid=req.idempotency_key,
-                    status=status, detail=_response_detail(exc.response),
+                    status=status, detail=detail,
                 ))
-            return LeaseAttempt(status=status)
+            return LeaseAttempt(
+                status=status,
+                detail=None if detail == _NO_RESPONSE_BODY else detail,
+            )
         except httpx.RequestError as exc:
             log.warning("%s", kv(
                 event="api.lease_failed", poduid=req.idempotency_key, err=exc,

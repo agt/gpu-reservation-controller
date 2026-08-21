@@ -81,6 +81,7 @@ from .k8s_client import (
     apply_toleration,
     clear_termination_warning,
     delete_pod,
+    emit_lease_denied_event,
     emit_overstay_relinked_event,
     emit_preempted_event,
     emit_reservation_cancelled_event,
@@ -108,7 +109,7 @@ from .k8s_client import (
     snapshot_tolerated_pods,
     utc_iso,
 )
-from .reservation_client import ReservationClient
+from .reservation_client import LEASE_DENIED_STATUS, ReservationClient
 from .schemas import (
     ForecastBucket,
     ForecastClassSummary,
@@ -1104,6 +1105,63 @@ async def _preflight_ondemand_candidate(
     return _PREFLIGHT_READY, ask
 
 
+async def _emit_lease_denial_event(
+    config: Config,
+    uid: str,
+    candidate: OnDemandCandidate,
+    detail: Optional[str],
+    now: datetime,
+) -> None:
+    """Tell the pod's owner why its JIT lease was refused, via a Kubernetes Event.
+
+    Only the app's documented 409 is surfaced.  A network failure or a 5xx says
+    nothing about the ask, and the non-retryable 4xx (a read-only service key, a
+    schema mismatch, an unknown group) is an operator fault the pod's owner can
+    neither read usefully nor act on -- it already gets a WARNING log line.
+
+    **Throttled by content, not only by clock.**  A denial reason that has
+    *changed* is new information and is emitted immediately; an unchanged one
+    waits out ``ondemand_denial_event_repeat_minutes``, because the retry cadence
+    is 2-5 minutes and a pod blocked for an afternoon would otherwise accumulate
+    a hundred identical Events.  The repeat is what keeps the signal alive rather
+    than reporting once and going quiet: Events expire (an hour, by default), so
+    a pod still waiting must restate its reason or ``kubectl describe`` goes
+    blank on a pod that is still blocked.  ``0`` disables the throttle entirely.
+
+    Best-effort throughout, like every other emitter here: a failure to emit is
+    logged and never disturbs the retry cadence, which is the thing that
+    actually gets the pod running.
+    """
+    if not config.ondemand_denial_event_enabled or not detail:
+        return
+    repeat = timedelta(minutes=config.ondemand_denial_event_repeat_minutes)
+    if (
+        detail == candidate.denial_event_detail
+        and candidate.denial_event_at is not None
+        and now - candidate.denial_event_at < repeat
+    ):
+        return
+    try:
+        await emit_lease_denied_event(
+            uid,
+            candidate.pod_name,
+            candidate.pod_namespace,
+            detail,
+            gpu_class=candidate.gpu_class_label,
+            gpu_count=candidate.gpu_requested,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("%s", kv(
+            event="k8s.event_failed", ns=candidate.pod_namespace,
+            pod=candidate.pod_name, reason="OnDemandLeaseDenied", err=exc,
+        ))
+        return
+    # Stamped only on a successful emit, so a failed one is retried next denial
+    # rather than being suppressed for the whole repeat interval.
+    candidate.denial_event_detail = detail
+    candidate.denial_event_at = now
+
+
 async def _grant_and_admit(
     state: ControllerState,
     client: ReservationClient,
@@ -1143,9 +1201,14 @@ async def _grant_and_admit(
             log.info("%s", kv(
                 event="lease.denied", ns=candidate.pod_namespace, pod=candidate.pod_name,
                 clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
-                status=attempt.status,
+                status=attempt.status, detail=attempt.detail,
             ))
             candidate.next_attempt_at = _jittered_retry_at(now)
+            if attempt.status == LEASE_DENIED_STATUS:
+                # Surface the app's reason on the pod itself: the retry cadence
+                # below is invisible to its owner, who otherwise sees only a pod
+                # that stays Pending with nothing saying why.
+                await _emit_lease_denial_event(config, uid, candidate, attempt.detail, now)
         else:
             # A fault waiting will not fix — a read-only service key, a schema
             # mismatch after an app upgrade, an unknown group name.  WARNING so
