@@ -371,9 +371,10 @@ every tick, not from the pod snapshot:
 
 | Extension shape | Mechanism |
 |---|---|
+| **In-place** — the pod's own `kind="on_demand"` lease has its `end_dt` moved out app-side | The push upserts by id, so the row is *replaced*; `compute_guaranteed_until` reads `slot_end` live, `guarantee_end` grows, `_past_guarantee` goes false.  **Nothing is re-linked and no I/O is needed** — the simplest of the four |
 | Abutting (`slot_start(new) == slot_end(old)`, same user/class/`gpu_count`) | `compute_guaranteed_until` chains it; `guarantee_end` grows, `_past_guarantee` goes false, the pod leaves the pool |
 | Non-abutting, or a different `gpu_count` | `plan_pod_adoptions` → `_adopt_pods` re-links the pod, deliberately **above** victim planning in the sweep |
-| App-side `POST /api/reservations/{id}/continue` | Pushed via the inbound API, which takes the same `reservation_lock` the sweep holds |
+| App-side `POST /api/reservations/{id}/continue` | Pushed via the inbound API, which takes the same `reservation_lock` the sweep holds.  Which of the rows above arrives depends on the source: a lease is extended in place, an in-progress booking (or a `gpu_count` change) supersedes and recreates |
 
 Plan → select → delete is one uninterrupted `reservation_lock` acquisition, so an
 extension cannot land between selection and deletion — including across the
@@ -533,6 +534,15 @@ reservation stays in the fetched set (status is only `active`/`cancelled`, and
 recomputes live and grows to the new window's end, and `boundary_demand`
 credits the pod via `reservations_claimed_by` — no re-link needed.
 
+**The app's Extend no longer arrives here for an on-demand lease.**  It used to:
+Extend superseded the lease and pushed a replacement booking, and this section's
+cancellation-eviction path was what rescued the pod — which made a user-facing
+action depend on `POD_ADOPTION_ENABLED`, so with adoption off an Extend *evicted
+the job it was extending*.  Extending a lease now moves its own `end_dt` and
+keeps its id, so nothing is superseded and nothing needs adopting.  Adoption
+still covers what it always did: a user genuinely re-booking a **fresh**
+reservation beside their overstaying pod.
+
 **Adoption** (`POD_ADOPTION_ENABLED`, default on) covers what chaining cannot,
 via `ControllerState.plan_pod_adoptions` (pure), which pairs a pod already
 **past its runtime guarantee** (`_past_guarantee`, shared with the preemption
@@ -584,6 +594,13 @@ occupancy-budget tally, but drops the `_past_guarantee` gate.  A pod whose
 current reservation is already a booking, or that has no open booking, is left
 untouched (a pod still in its **pre-booking** window stays on its lease —
 correctly — until the booking opens).
+
+**An extended lease is still a lease, so it is still merge-eligible.**  That is
+one of the reasons the app extends a lease in place rather than superseding it
+for a booking: the old shape converted the pod's reservation to `kind="booking"`
+and so removed it from this planner's reach permanently, even though the user
+might book the window properly an hour later.  The gate here is exactly
+`current.kind == "on_demand"`, and an extension does not change it.
 
 `_merge_ondemand_into_bookings` in `main.py` executes it, modelled on
 `_adopt_pods`: re-annotate the pod's `galends/booking-reference` to the booking
@@ -721,6 +738,17 @@ squatted GPUs waits (guard 3) rather than displacing them.  Extending the
 sweep to on-demand boundaries is possible future work; until then the
 preemption-risk forecast reports pending JIT pressure as informational only
 for the same reason (see **Preemption-risk forecast API**).
+
+That asymmetry now also costs an **extended** lease something it used to get by
+accident.  When the app's Extend superseded a lease for a `kind="booking"`
+anchored at "now", that booking *was* a boundary within the sweep's window
+(`upcoming_boundaries` admits `now - lead < slot_start <= now + lead`), so the
+extended job could displace overstayers squatting on its class.  Extending in
+place keeps the row `kind="on_demand"`, so it no longer can.  This is a real loss
+and the accepted trade: the job is already running and holding its GPUs, so what
+it loses is the ability to *grow* onto squatted ones, not to keep what it has —
+against which the extension buys back a lease that is still torn down when its
+pod exits, still merge-eligible, and no longer dependent on adoption to survive.
 
 **Routing** (`pod_watch_loop`, re-evaluated on every attempt): for a pod
 without the toleration,
