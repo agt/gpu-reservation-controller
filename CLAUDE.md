@@ -179,6 +179,23 @@ exception: `_record_guarantee(..., first_admission=True)`, passed only from
 `_try_apply_toleration`, so a re-link cannot restart a session-elapsed clock
 mid-job.
 
+Re-linking covers every way the pod's reservation can change **identity**, but
+not the way it can change **content**: the same reservation mutated underneath
+the pod — a lease whose window is extended in place — keeps its id, so no
+re-link happens and none of those callers run.  The pod would keep advertising
+its pre-extension `galends/reservation-end` while `galends/guaranteed-until`,
+recomputed live every tick, moved forward; a consumer reading both would see
+them contradict.  `ControllerState.plan_reservation_facts` (pure, keyed by
+reservation id) plus `main._apply_reservation_facts` close that, once per
+**queue-processor tick**, reusing that tick's `snapshot_tolerated_pods` and the
+same `reservation_lock` acquisition as `plan_guarantee_status` — one lock, one
+view list, so the two annotation families can never describe different
+reservations for the same pod.  The write (`annotate_reservation_facts`) touches
+only the five fact keys, never `guaranteed-until`/`guarantee-status` (owned by
+the status reconcile) or `admitted-at` (write-once).  Like the status reconcile
+there is **no clear path** and it is diff-and-skip, so an unchanged pod costs no
+API call.
+
 `k8s_client.utc_iso` is the single definition of the `YYYY-MM-DDTHH:MM:SSZ` wire
 format `docs/POD-ANNOTATIONS.md` promises consumers.  It matters that writers and
 the diff-and-skip comparisons in `main` share it: those rebuild the string to

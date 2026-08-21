@@ -237,6 +237,8 @@ were deliberately given different keys.
 |---|---|---|---|
 | INFO | `pod.guarantee_status` | `ns pod gstatus` | `gstatus=guaranteed|overstay`; patched only on a real transition. |
 | WARNING | `pod.guarantee_status_failed` | `ns pod err` | Retried next tick. |
+| INFO | `pod.facts_refreshed` | `ns pod end` | The pod's reservation changed *underneath* it without a re-link (a lease window extended in place), so the `galends/reservation-*` stamps were re-written. Patched only on a real change — a re-link stamps these through `pod.guarantee_recorded` instead. |
+| WARNING | `pod.facts_refresh_failed` | `ns pod rid err` | Retried next tick. |
 | INFO | `pod.termination_warned` | `ns pod at risk` | `at` is the projected kill instant. |
 | INFO | `pod.termination_warning_cleared` | `ns pod` | Pod left the at-risk pool. |
 | WARNING | `pod.termination_warning_failed` | `ns pod err` | |

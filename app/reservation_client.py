@@ -145,8 +145,15 @@ class ReservationClient:
         """
         # UTC everywhere: date.today() would use the process TZ and drop
         # currently-open reservations east of UTC (see CODE-REVIEW-2026-07 B2).
-        # The API filter is date-based while windows are UTC-instant-based, so
-        # widen date_start by one day to avoid clipping a window open right now.
+        #
+        # The API selects by window **overlap**, so a reservation that started
+        # before ``date_start`` and is still running inside the range comes back
+        # on its own -- the one-day widening below is no longer what keeps a
+        # currently-open window in view, and must not be read as though it were.
+        # It is kept only as slack for the app's local clock differing from UTC
+        # by up to a day at the range edges; the range is a *day* filter on the
+        # app's own calendar, and neither side is worth a timezone round-trip to
+        # tighten.
         today = datetime.now(timezone.utc).date()
         start = today - timedelta(days=1)
         end = today + timedelta(days=self._lookahead_days)

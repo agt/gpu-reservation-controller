@@ -229,8 +229,8 @@ and `continue` are unchanged, so an observer may cancel only their own booking.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `status` | `active` \| `cancelled` \| `all` \| `recent` | `active` | Filter by reservation status. `recent` is not a stored status but the *Recent & Upcoming* view: every non-cancelled reservation that has not yet ended, **plus** every reservation of any status whose window overlapped the last 24 hours (so a just-finished job, or one cancelled while it was running, stays listed for a day). |
-| `date_start` | date | — | Include reservations on or after this date |
-| `date_end` | date | — | Include reservations on or before this date |
+| `date_start` | date | — | Include reservations whose window **overlaps** this day or later — i.e. `end_dt` is after this date's start. A reservation that began earlier and is still running on this date is included. |
+| `date_end` | date | — | Include reservations whose window **overlaps** this day or earlier — i.e. `start_dt` is before the end of this date. |
 | `gpu_class_id` | integer | — | Filter by GPU class ID |
 | `gpu_class_name` | string | — | Filter by GPU class name (exact match) |
 | `user_id` | integer | — | Filter by user ID |
@@ -243,9 +243,13 @@ and `continue` are unchanged, so an observer may cancel only their own booking.
 | `limit` | integer | 200 | Max records (1–1000) |
 | `offset` | integer | 0 | Records to skip |
 
-**Response** `200` — array of [ReservationResponse](#reservationresponse), ordered by `(date, id)`
+**Response** `200` — array of [ReservationResponse](#reservationresponse), ordered by `(start_dt, id)`
 
-**Example — fetch all active reservations starting today:**
+> `date_start`/`date_end` select by window **overlap**, not by start date. A
+> reservation is returned for every day it covers, not only the day it began, so
+> a long-running one stays visible to a poll whose range starts after it did.
+
+**Example — fetch all active reservations running on or after a date:**
 
 ```
 GET /api/reservations?status=active&date_start=2026-09-01

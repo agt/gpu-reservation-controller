@@ -2509,6 +2509,41 @@ class ControllerState:
                     )
         return warnings
 
+    def plan_reservation_facts(
+        self,
+        pods: list[PodRuntimeView],
+    ) -> dict[int, ReservationResponse]:
+        """Return the reservation each admitted pod is linked to, keyed by **reservation id**.
+
+        Pure.  The reconcile in ``main`` digests each row into the annotation
+        values the pod should carry and patches only where they differ from what
+        it already has.
+
+        Keyed by reservation id rather than pod uid because that is what the
+        result *is* — several pods on one reservation share one answer, and
+        keying by uid would fan the same row out per pod and invite a caller to
+        believe the value was pod-specific.
+
+        A pod whose ``reservation_id`` is ``None`` (not admitted by this
+        controller, or an unparseable booking-reference) is skipped, as is one
+        whose reservation is no longer in ``self.reservations`` — the set holds
+        only ``status="active"`` rows, so an absent row means cancelled or
+        expired.  Skipping leaves that pod's existing stamps frozen at their
+        last-known values, the same discipline ``plan_guarantee_status`` applies
+        to a lapsed pod's ``guaranteed-until``: these annotations describe what
+        the pod was admitted under, and a reservation ending is not new
+        information about that.
+        """
+        by_id = {r.id: r for r in self.reservations}
+        out: dict[int, ReservationResponse] = {}
+        for p in pods:
+            if p.reservation_id is None or p.reservation_id in out:
+                continue
+            res = by_id.get(p.reservation_id)
+            if res is not None:
+                out[p.reservation_id] = res
+        return out
+
     def plan_guarantee_status(
         self,
         pods: list[PodRuntimeView],

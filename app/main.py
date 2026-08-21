@@ -75,6 +75,7 @@ from .k8s_client import (
     ReservationFacts,
     acquire_singleton_lease,
     annotate_guarantee_status,
+    annotate_reservation_facts,
     annotate_runtime_guarantee,
     annotate_termination_warning,
     apply_toleration,
@@ -1902,10 +1903,19 @@ async def _run_queue_tick(
     # so it is computed under the lock; the best-effort I/O runs outside.
     if snapshot is not None:
         async with state.reservation_lock:
-            status_plan = state.plan_guarantee_status(
-                [_pod_view(p) for p in snapshot], now
-            )
+            views = [_pod_view(p) for p in snapshot]
+            status_plan = state.plan_guarantee_status(views, now)
+            # Same lock acquisition and the same view list: both planners read
+            # the reservation set, and taking it twice would let a fetch replace
+            # that set between them, so the two annotation families could
+            # describe different reservations for the same pod.
+            facts_plan = state.plan_reservation_facts(views)
         await _apply_guarantee_status(snapshot, status_plan)
+        # After the status reconcile, so that on the tick an in-place extension
+        # lands the pod's guaranteed-until moves forward first and the fact it
+        # is derived from follows.  Both are best-effort and independent; the
+        # order only decides which is briefly the staler of the two.
+        await _apply_reservation_facts(snapshot, facts_plan)
 
     if snapshot is not None and (
         config.ondemand_merge_enabled or config.pod_adoption_enabled
@@ -2242,6 +2252,65 @@ async def _apply_guarantee_status(
         except Exception as exc:  # noqa: BLE001
             log.warning("%s", kv(
                 event="pod.guarantee_status_failed", ns=p.namespace, pod=p.name, err=exc,
+            ))
+
+
+async def _apply_reservation_facts(
+    snapshot: "list",
+    facts_plan: dict[int, ReservationResponse],
+) -> None:
+    """Re-stamp reservation-fact annotations on pods whose reservation has changed.
+
+    *snapshot* is a ``snapshot_tolerated_pods`` list (each entry carries the
+    fact annotations the pod already has); *facts_plan* is
+    ``ControllerState.plan_reservation_facts`` output keyed by reservation id.
+
+    ``_record_guarantee`` already stamps these at admission and on every
+    **re-link** — adoption and lease-to-booking merge both move a pod to a
+    different reservation and re-stamp as part of that.  What neither covers is
+    the same reservation being mutated underneath a pod: an on-demand lease
+    whose window is extended in place keeps its id, so nothing re-links and
+    nothing re-stamps, and the pod would go on advertising a
+    ``galends/reservation-end`` that has since moved.
+
+    Diff-and-skip, and it has to be exact: the desired values are rendered with
+    the same ``utc_iso`` / ``str`` the writers use, so an unchanged pod compares
+    equal and costs no API call.  A format that drifted between writer and
+    comparison here would re-patch every admitted pod on every tick, which is
+    the failure mode this shape exists to avoid.
+
+    Best-effort per pod, mirroring ``_apply_guarantee_status``: a failure logs
+    and is retried on the next tick.
+    """
+    for p in snapshot:
+        if p.reservation_id is None:
+            continue
+        res = facts_plan.get(p.reservation_id)
+        if res is None:
+            continue
+        facts = _reservation_facts(res)
+        current = (
+            p.reservation_kind,
+            p.reservation_start,
+            p.reservation_end,
+            p.reservation_gpu_count,
+            p.gpu_class_name,
+        )
+        desired = (
+            facts.kind,
+            utc_iso(facts.start_utc),
+            utc_iso(facts.end_utc),
+            str(facts.gpu_count),
+            facts.gpu_class_name,
+        )
+        if current == desired:
+            continue  # unchanged — do not re-patch
+        try:
+            await annotate_reservation_facts(p.name, p.namespace, facts)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s", kv(
+                event="pod.facts_refresh_failed", ns=p.namespace, pod=p.name,
+                rid=p.reservation_id, err=exc,
             ))
 
 

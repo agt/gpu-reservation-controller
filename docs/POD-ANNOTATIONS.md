@@ -112,10 +112,10 @@ def parse_downward_annotations(path="/etc/podinfo/annotations") -> dict[str, str
 | `galends/guarantee-status` | at admission, refreshed | `guaranteed` \| `overstay` | `guaranteed` at admission; flips to `overstay` once the guarantee lapses. Never removed while the pod lives. |
 | `galends/guaranteed-until` | at admission, refreshed | absolute UTC instant, `YYYY-MM-DDTHH:MM:SSZ` | Kept *live* while `guaranteed` — it can move **later** if the user books an abutting follow-on window. Once `overstay` it is frozen at its now-past value. |
 | `galends/pod-runtime-limit-seconds` | at admission | integer seconds, e.g. `10800` | The guaranteed *duration* at the moment it was recorded. **Not** refreshed as the guarantee grows — for a countdown, use `guaranteed-until`, not this. |
-| `galends/reservation-kind` | at admission, on re-link | `booking` \| `on_demand` | Describes the reservation the pod is *currently* linked to, so it changes if the pod is re-linked. |
-| `galends/reservation-start` / `galends/reservation-end` | at admission, on re-link | absolute UTC instant, same format | The reservation's **own** window. Same lifecycle. |
-| `galends/reservation-gpu-count` | at admission, on re-link | integer, e.g. `4` | GPUs the *reservation* holds, not what the pod requested. Same lifecycle. |
-| `galends/gpu-class-name` | at admission, on re-link | display name, e.g. `H100` | Same lifecycle. |
+| `galends/reservation-kind` | at admission, refreshed | `booking` \| `on_demand` | Describes the reservation the pod is *currently* linked to. Changes when the pod is re-linked to a **different** reservation, and is re-stamped when its **current** one is altered in place (a lease window extended). |
+| `galends/reservation-start` / `galends/reservation-end` | at admission, refreshed | absolute UTC instant, same format | The reservation's **own** window — not the guarantee end. `-end` moves later when the reservation is extended in place. Same lifecycle otherwise. |
+| `galends/reservation-gpu-count` | at admission, refreshed | integer, e.g. `4` | GPUs the *reservation* holds, not what the pod requested. Same lifecycle. |
+| `galends/gpu-class-name` | at admission, refreshed | display name, e.g. `H100` | Same lifecycle. |
 | `galends/admitted-at` | at first admission only | absolute UTC instant, same format | Written once and never rewritten — a re-link is not a new admission. Never removed while the pod lives. |
 | `galends/termination-warning-at` | while at risk | absolute UTC instant, same format | **Appears and disappears.** Present only while the pod is in the at-risk pool; all three warning keys are removed together when the risk clears. |
 | `galends/termination-warning-risk` | while at risk | decimal string in `(0, 1]`, 2 dp, e.g. `0.33` | Same lifecycle. |
@@ -148,9 +148,10 @@ under one booking sees the same count on each.
 
 **`galends/admitted-at` — when this pod got its GPU.** Written once, on the pod's
 first admission, and never rewritten — including when the pod is re-linked to a
-different reservation. That makes it the right anchor for a session-elapsed
-clock; `reservation-start` is not (it moves on a re-link, and can predate the pod
-by hours when the pod started mid-window).
+different reservation, and including when its reservation is extended in place.
+That makes it the right anchor for a session-elapsed clock; `reservation-start`
+is not (it moves on a re-link, and can predate the pod by hours when the pod
+started mid-window).
 
 **`galends/guaranteed-until` — the runtime guarantee.** The instant until which
 this pod's GPU access is protected. It is the end of the pod's current
@@ -553,6 +554,7 @@ kubelet. Worst-case in-pod visibility, with default settings:
 |--------|--------------------|-----------|------------|
 | Admission (`booking-reference`, `guaranteed-until`, `guarantee-status`, `admitted-at`, all `reservation-*`, `gpu-class-name`) | immediate, on admission | ~60 s | ~1 min |
 | Re-link (`booking-reference` and every `reservation-*` key change together) | every queue-processor tick, `QUEUE_PROCESSOR_INTERVAL` = 300 s, or immediately during a preemption sweep | ~60 s | ~6 min |
+| Reservation altered in place (`reservation-*` change, `booking-reference` does **not**) | every queue-processor tick, `QUEUE_PROCESSOR_INTERVAL` = 300 s | ~60 s | ~6 min |
 | Termination warning appears / changes / clears | every preemption sweep, `PREEMPTION_CHECK_INTERVAL` = 60 s | ~60 s | ~2 min |
 | `guarantee-status` flips to `overstay`; `guaranteed-until` extended by a follow-on booking | every queue-processor tick, `QUEUE_PROCESSOR_INTERVAL` = 300 s | ~60 s | ~6 min |
 
