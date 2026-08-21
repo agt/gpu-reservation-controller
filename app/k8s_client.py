@@ -997,7 +997,7 @@ async def clear_termination_warning(pod_name: str, namespace: str) -> None:
 
 
 async def _emit_pod_event(
-    pod,
+    pod_uid: str,
     pod_name: str,
     namespace: str,
     *,
@@ -1005,13 +1005,20 @@ async def _emit_pod_event(
     reason: str,
     action: str,
     message: str,
+    event_type: str = "Normal",
 ) -> None:
-    """Create a ``Normal`` Kubernetes Event linked to *pod*.
+    """Create a Kubernetes Event linked to the pod identified by *pod_uid*.
 
     Shared body for the runtime-guarantee, preemption, and cancellation
     emitters (CODE-REVIEW D3c), which differ only in *name_prefix* / *reason*
-    / *action* / *message*.  Uses ``generate_name`` so re-emitting for the
-    same pod never 409s (B10).
+    / *action* / *message* / *event_type*.  Uses ``generate_name`` so
+    re-emitting for the same pod never 409s (B10).
+
+    Takes the pod **uid** rather than the pod object because that is the only
+    field of it this needs (the ``involvedObject`` reference), and the
+    lease-denial emitter has a uid in hand without a pod: its candidate was
+    never admitted, so re-reading the pod purely to fill in an event would be a
+    second API call for a field the caller already knows.
     """
     now = datetime.now(timezone.utc)
     event = k8s_client.CoreV1Event(
@@ -1024,11 +1031,11 @@ async def _emit_pod_event(
             kind="Pod",
             name=pod_name,
             namespace=namespace,
-            uid=pod.metadata.uid,
+            uid=pod_uid,
         ),
         reason=reason,
         message=message,
-        type="Normal",
+        type=event_type,
         first_timestamp=now,
         last_timestamp=now,
         count=1,
@@ -1058,7 +1065,7 @@ async def emit_runtime_guaranteed_event(
     )
     until_str = utc_iso(guaranteed_until)
     await _emit_pod_event(
-        pod,
+        pod.metadata.uid,
         pod_name,
         namespace,
         name_prefix="gpu-guarantee-",
@@ -1073,6 +1080,51 @@ async def emit_runtime_guaranteed_event(
     log.info("%s", kv(
         event="k8s.event_emitted", ns=namespace, pod=pod_name,
         reason="RuntimeGuaranteed", guarantee_s=seconds, until=until_str,
+    ))
+
+
+async def emit_lease_denied_event(
+    pod_uid: str,
+    pod_name: str,
+    namespace: str,
+    detail: str,
+    *,
+    gpu_class: str,
+    gpu_count: int,
+) -> None:
+    """Create a ``Warning`` Event linked to a pod whose JIT lease was refused.
+
+    The app answers an infeasible on-demand ask with a 409 whose ``detail``
+    states *why* — "Only 2 GPU(s) available for this group at 2026-08-21 14:00
+    (group ceiling: 4)", an exhausted SU budget, a group the user is not in.
+    Until this existed that reason reached the controller's log and stopped
+    there, so the pod's owner saw only an indefinitely Pending pod with no
+    account of what was blocking it.  Surfacing it as an Event puts it where a
+    user already looks (``kubectl describe pod``) without granting the pod
+    itself any API access.
+
+    ``Warning`` rather than ``Normal`` — the pod is not running and will not
+    until something changes — which also matches how kube-scheduler reports the
+    neighbouring condition, ``FailedScheduling``.  Informational only: the
+    controller keeps retrying on its own cadence either way.
+    """
+    await _emit_pod_event(
+        pod_uid,
+        pod_name,
+        namespace,
+        name_prefix="gpu-lease-denied-",
+        reason="OnDemandLeaseDenied",
+        action="RequestOnDemandLease",
+        event_type="Warning",
+        message=(
+            f"On-demand GPU lease for {gpu_count} x {gpu_class} was denied by the "
+            f"reservation service: {detail}. The pod stays Pending; the controller "
+            f"will keep retrying."
+        ),
+    )
+    log.info("%s", kv(
+        event="k8s.event_emitted", ns=namespace, pod=pod_name,
+        reason="OnDemandLeaseDenied", clabel=gpu_class, gpus=gpu_count,
     ))
 
 
@@ -1106,7 +1158,7 @@ async def emit_preempted_event(
     long the pod overstayed).
     """
     await _emit_pod_event(
-        pod,
+        pod.metadata.uid,
         pod_name,
         namespace,
         name_prefix="gpu-preempt-",
@@ -1127,7 +1179,7 @@ async def emit_reservation_cancelled_event(
 ) -> None:
     """Create a Kubernetes Event linked to *pod* with reason='ReservationCancelled'."""
     await _emit_pod_event(
-        pod,
+        pod.metadata.uid,
         pod_name,
         namespace,
         name_prefix="gpu-rescancel-",
@@ -1152,7 +1204,7 @@ async def emit_reservation_reassigned_event(
     prior owner's admitted pod is evicted so the new owner can claim the window.
     """
     await _emit_pod_event(
-        pod,
+        pod.metadata.uid,
         pod_name,
         namespace,
         name_prefix="gpu-resadopt-",
@@ -1181,7 +1233,7 @@ async def emit_overstay_relinked_event(
     """
     until_str = utc_iso(guaranteed_until)
     await _emit_pod_event(
-        pod,
+        pod.metadata.uid,
         pod_name,
         namespace,
         name_prefix="gpu-relink-",

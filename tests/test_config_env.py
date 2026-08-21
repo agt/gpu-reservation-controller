@@ -156,6 +156,14 @@ NUMERIC_SETTINGS = [
     ("HEADROOM_CHECK_INTERVAL", "headroom_check_interval", 600, False),
     # 0 is this one's "off": no stand-in for a missing minimum-runtime annotation.
     ("DEFAULT_MINIMUM_RUNTIME_SECONDS", "default_min_runtime_seconds", 0, True),
+    # 0 legitimately means "restate the denial reason on every retry" -- noisy,
+    # but a coherent choice; ONDEMAND_DENIAL_EVENT_ENABLED is the off switch.
+    (
+        "ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES",
+        "ondemand_denial_event_repeat_minutes",
+        30,
+        True,
+    ),
 ]
 
 

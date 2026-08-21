@@ -106,6 +106,10 @@ spec:
               value: {{ .Values.config.podAdoptionEnabled | quote }}
             - name: ONDEMAND_MERGE_ENABLED
               value: {{ .Values.config.ondemandMergeEnabled | quote }}
+            - name: ONDEMAND_DENIAL_EVENT_ENABLED
+              value: {{ .Values.config.ondemandDenialEventEnabled | quote }}
+            - name: ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES
+              value: {{ .Values.config.ondemandDenialEventRepeatMinutes | quote }}
             - name: TERMINATION_WARNING_ENABLED
               value: {{ .Values.config.terminationWarningEnabled | quote }}
             - name: TERMINATION_WARNING_LEAD_MINUTES

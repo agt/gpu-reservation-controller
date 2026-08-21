@@ -102,6 +102,13 @@ class Config:
     ondemand_merge_enabled: bool = True  # merge a JIT lease's pod into a now-open matching booking
     termination_warning_enabled: bool = True  # annotate pods at risk of demand-driven preemption
     termination_warning_lead_minutes: int = 30  # warning look-ahead, decoupled from PREEMPTION_LEAD_MINUTES
+    # Surface the app's 409 denial reason on a JIT lease as a Warning Event on
+    # the waiting pod, so its owner can see why it is still Pending.  The repeat
+    # interval throttles an *unchanged* reason (the retry cadence is 2-5 min, far
+    # faster than anyone needs to be told the same thing); a reason that changes
+    # is emitted at once regardless, and 0 means emit on every denial.
+    ondemand_denial_event_enabled: bool = True
+    ondemand_denial_event_repeat_minutes: int = 30
     preemption_delegate_selection: bool = True  # ask the app to choose victims; local random fallback
     ondemand_delegate_admission: bool = False  # ask the app which pending pods to admit; grant-all fallback
     required_group_label: Optional[str] = None  # pod label naming the usage group to match; None = disabled
@@ -167,6 +174,12 @@ class Config:
             termination_warning_enabled=_env_bool("TERMINATION_WARNING_ENABLED", True),
             termination_warning_lead_minutes=_env_int(
                 "TERMINATION_WARNING_LEAD_MINUTES", 30, minimum=0
+            ),
+            ondemand_denial_event_enabled=_env_bool(
+                "ONDEMAND_DENIAL_EVENT_ENABLED", True
+            ),
+            ondemand_denial_event_repeat_minutes=_env_int(
+                "ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES", 30, minimum=0
             ),
             preemption_delegate_selection=_env_bool(
                 "PREEMPTION_DELEGATE_SELECTION", True

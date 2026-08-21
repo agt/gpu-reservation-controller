@@ -854,6 +854,56 @@ independently.
 existing pod-patch path); `ONDEMAND_HORIZON_MINUTES` and
 `ONDEMAND_LEASE_BUFFER_MINUTES` tune the routing horizon and lease sizing.
 
+### Surfacing a lease denial to the pod's owner
+
+Every other reason a JIT candidate does not get a lease is the controller's own
+(the guards above), and is logged as such.  A **409** is the one that is not: it
+is the *app* refusing the ask, and its `detail` states why in terms the pod's
+owner can act on — `Only 1 GPU(s) available for this group at 2026-08-21 14:00
+(group ceiling: 4)`, an exhausted SU budget, a group they are not a member of.
+That reason used to reach the controller's log and stop there.  The owner has
+`kubectl` on their own namespace and no access to those logs, so what they saw
+was a pod sitting Pending with nothing explaining it.
+
+`main._emit_lease_denial_event` mirrors it onto the pod as a **`Warning`
+Kubernetes Event** (`reason=OnDemandLeaseDenied`, via
+`k8s_client.emit_lease_denied_event`), which is what makes it visible where the
+owner already looks — `kubectl describe pod` — **without** the pod needing any
+Kubernetes API access of its own.  `Warning` because the pod is not running and
+will not until something changes; it is the same shape kube-scheduler's
+`FailedScheduling` takes, immediately above it in the same Event list.
+
+Four properties are load-bearing:
+
+- **Only the app's 409 is surfaced.**  A network failure or a 5xx says nothing
+  about the ask (the app never answered), and the non-retryable 4xx — a
+  `read_only` service key, a schema mismatch, an unknown group — is an operator
+  fault the pod's owner can neither read usefully nor fix.  Those keep the
+  `lease.error` WARNING and reach no pod.
+- **The detail is carried, not re-derived.**  `LeaseAttempt.detail` (already
+  truncated to 200 chars by `_response_detail`, so a proxy's HTML error page
+  cannot become a 5 KB Event message) is the single value both the `lease.denied`
+  log line and the Event render.
+- **Throttled by content first, clock second.**  A *changed* reason is new
+  information and emits immediately; an *unchanged* one waits out
+  `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` (default 30).  The retry cadence is
+  2–5 min, so emitting every denial would bury the pod's other Events — but
+  reporting once and going quiet is equally wrong, because Events expire and a
+  pod still blocked an hour later would `kubectl describe` clean.  The repeat is
+  what keeps the two failure modes apart.
+- **Best-effort, and the stamp follows the emit.**  `denial_event_detail` /
+  `denial_event_at` on the `OnDemandCandidate` are written **only** after a
+  successful emit, so a failed one is retried on the next denial rather than
+  suppressed for the whole interval.  A failure logs `k8s.event_failed` and never
+  disturbs the retry cadence, which is the thing that actually gets the pod
+  running.  The state is in-memory like the rest of the candidate: after a
+  restart the pod is re-warned once, which is the right side to err on.
+
+**RBAC / config**: none new — Event creation reuses the `events: create`
+permission the guarantee and preemption emitters already need.
+`ONDEMAND_DENIAL_EVENT_ENABLED=false` disables the feature.  User-facing
+documentation is `docs/POD-ANNOTATIONS.md` §5.1.
+
 ### Guard 1: what the scheduler can and cannot tell us
 
 Guard 1 vets a JIT candidate's `PodScheduled` condition before a lease is
@@ -1307,6 +1357,8 @@ the claimed set and the grace re-arm path above applies.
 | `ONDEMAND_HORIZON_MINUTES` | `30` | JIT routing horizon: a pod is queued for a reservation that opens within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | `10` | Minutes added to a pod's `galends/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
 | `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch (`POST /api/reservations/ondemand-admission`) for LAS prioritization; `false` (or any app-call failure) grants every eligible candidate — the prior greedy per-pod behaviour. The app endpoint **is shipped**, but its selection is currently grant-all, so turning this on changes nothing yet; enable it once the app carries real admission policy |
+| `ONDEMAND_DENIAL_EVENT_ENABLED` | `true` | Mirror the app's **409** denial reason for a JIT lease onto the waiting pod as a `Warning` Event (`reason=OnDemandLeaseDenied`), so its owner can see why it is still Pending without the controller's logs (see **Surfacing a lease denial to the pod's owner**). Informational only; `false` disables |
+| `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** denial reason is suppressed before being restated on the pod — the retry cadence is 2–5 min, and Events expire, so neither "every denial" nor "once only" is right. A **changed** reason emits immediately regardless; `0` emits on every denial |
 | `NOSHOW_TIMEOUT_MINUTES` | `15` | Minutes after window opens before a reservation is declared a no-show |
 | `NOSHOW_GRACE_MINUTES` | `30` | Grace period after controller startup before mid-window no-shows are declared |
 | `QUEUE_PROCESSOR_INTERVAL` | `300` | Seconds between queue-processor ticks — the whole work-queue loop (pod LIST, JIT lease retries, no-show cancels, overstay adoption), not just a pod LIST |
