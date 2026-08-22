@@ -52,7 +52,7 @@ app/
 ├── reservation_client.py httpx async client — fetches reservations + GPU classes; creates/cancels JIT on-demand reservations
 ├── log_fields.py         kv() — renders log message bodies as key=value fields (see docs/LOG-FIELDS.md)
 ├── trace.py              Per-unit-of-work trace ids + X-Client-Trace propagation (see **Trace ids**)
-├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, annotate_runtime_guarantee, emit_preempted_event, snapshot_tolerated_pods / snapshot_node_gpu_inventory (per-node) / snapshot_node_gpu_capacity (per-class collapse of it)
+├── k8s_client.py         Kubernetes wrapper — PodWatcher, apply_toleration, annotate_runtime_guarantee, emit_preempted_event, snapshot_tolerated_pods / snapshot_node_gpu_inventory (per-node, honouring the galends/force-node-capacity node annotation) / snapshot_node_gpu_capacity (per-class collapse of it)
 └── controller.py         ControllerState, QueueEntry, matching, window arithmetic, preemption planning, preemption-risk forecast
 ```
 
@@ -254,9 +254,10 @@ in `main.py`), which on every tick:
    `PREEMPTION_LEAD_MINUTES` (default 15) of now.
 2. Snapshots **physical capacity** per GPU class (`snapshot_node_gpu_capacity`
    — one node LIST summing allocatable `nvidia.com/gpu` grouped by the
-   `gpu-class-reservation` taint value on each node).  This is the
-   controller's only notion of how many GPUs physically exist; nothing else
-   in the codebase tracks it.
+   `gpu-class-reservation` taint value on each node, or a node's
+   `galends/force-node-capacity` override — see **Forcing a node's GPU
+   capacity**).  This is the controller's only notion of how many GPUs
+   physically exist; nothing else in the codebase tracks it.
 3. For each boundary/phase not yet evaluated, computes **demand**
    (`ControllerState.boundary_demand`): per class, the sum over bookings
    starting exactly there of their remaining budget (`available`) minus GPUs
@@ -1032,7 +1033,9 @@ applied" log event: `ondemand.candidate_added` already prints the effective
 
 The controller derives physical GPU capacity solely from Kubernetes node taints
 (`snapshot_node_gpu_capacity` — total allocatable `nvidia.com/gpu` per
-`gpu-class-reservation` taint value).  The reservation app has its **own**
+`gpu-class-reservation` taint value, or whatever a node's
+`galends/force-node-capacity` annotation forces it to; see **Forcing a node's
+GPU capacity**).  The reservation app has its **own**
 per-class GPU count, modelled on `schemas.GpuClassDetail` and cached per label in
 `ControllerState.gpu_class_capacity` — refreshed on every reconcile from the
 same `GET /api/gpu-classes` fetch that builds the label maps.
@@ -1128,6 +1131,58 @@ preemption-risk forecast's shortfall (still per-class).  Guard 5 is a per-candid
 feasibility check against a snapshot, not batch-level bin-packing: two ≥2-GPU
 candidates can both pass against the same single-node opening in one batch, with
 guard 3 backstopping the loser.
+
+### Forcing a node's GPU capacity
+
+`status.allocatable["nvidia.com/gpu"]` is the controller's only evidence of how
+many GPUs physically exist, and it is not always the number the reservation
+system should account against — some of a node's GPUs are failing, or are held
+back for non-reservation work, or the device plugin reports nonsense.  The
+**node** annotation `galends/force-node-capacity` (`k8s_client.FORCE_NODE_CAPACITY`)
+replaces that reading for one node.
+
+- **Read by `k8s_client.get_node_forced_gpu_capacity`** (pure) and applied in
+  `snapshot_node_gpu_inventory` — the *single* place allocatable is read, which
+  is what makes the override total without touching anything downstream.  Every
+  notion of physical capacity in the controller (per-class totals, headroom,
+  `free_capacity_by_class`, the capacity audit, guards 1b and 5) derives from
+  that one map, so all of them inherit it for free.
+- **`0` is a valid override**, deliberately unlike the `> 0` floor
+  `get_pod_min_runtime_seconds` applies: masking a node's GPUs *from the
+  reservation system* while leaving its pods (and every non-GPU pod) running is
+  the main thing the annotation is for, and it is precisely what cordoning is
+  not — a cordoned node leaves the snapshot entirely.  The node stays in the
+  inventory at `0`, the same shape a node with no GPUs already produces, which
+  matters because `node_counts_by_class` counts nodes: dropping the entry would
+  read to guard 1b as "this class has no nodes at all".
+- **Negative or unparseable is rejected** with a `k8s.node_capacity_forced_invalid`
+  WARNING naming the node and the value, and the node keeps its allocatable
+  count — the same tolerant-parse-and-say-so posture `config.py` takes, for the
+  same reason (an operator who set something and saw no effect can find out why).
+  A negative value is not merely useless: summed into its class's total it would
+  silently eat another node's real GPUs.
+- **It is a replacement, not a cap.**  A value above allocatable is honoured; the
+  controller then plans against GPUs kube-scheduler cannot place, so leases it
+  grants can leave their pods Pending.  That is the operator's call, and the
+  reason the applied override is logged (`k8s.node_capacity_forced`, DEBUG, per
+  node per snapshot — INFO would be per-60 s spam, and the *invalid* case is
+  already WARNING).
+- **The annotation does not enrol a node.**  The taint is still what puts a node
+  in a class, and cordoned/terminating nodes are still excluded, so the override
+  only ever sets a number for a node already in the snapshot.  A node tainted for
+  several classes contributes the forced count to each — the annotation is per
+  node, not per class.
+
+There is deliberately **no config flag**: the annotation is itself the opt-in, an
+unannotated cluster behaves exactly as before, and anyone able to annotate a node
+can already retaint it.  **RBAC**: none new — annotations arrive with the node
+LIST the sweep and queue tick already issue.
+
+The interaction worth knowing is with **App-side vs physical capacity
+reconciliation**: forcing a class below the app's `effective_gpus_today` makes it
+read over-committed, which pauses JIT admission for it (guard 4) and logs the
+hourly mismatch WARNING — usually the point of forcing capacity down.  Forcing it
+*up* to silence that audit conceals a real shortage instead of fixing it.
 
 ### Inbound push API
 

@@ -347,7 +347,8 @@ applied is not revoked.
 diagram above. In short: for each upcoming reservation start ("boundary")
 within `PREEMPTION_LEAD_MINUTES` (default 15) of now, the controller computes
 demand (incoming bookings' unclaimed GPUs) against free physical capacity
-(from a node LIST); if demand exceeds free capacity, it deletes **random**
+(from a node LIST — see [step 5](#5--overriding-a-nodes-gpu-capacity-optional)
+to override what a node contributes); if demand exceeds free capacity, it deletes **random**
 past-guarantee pods of the same GPU class until the shortfall is covered. A
 pod still within its guarantee is never selected, however severe the
 shortfall — that's logged as an unmet-demand warning instead. Victim
@@ -463,7 +464,7 @@ All settings are supplied via environment variables.
 | `PREEMPTION_LEAD_MINUTES` | no | `15` | Minutes before a reservation slot boundary that phase-A preemption runs, proactively freeing capacity from overstaying pods |
 | `PREEMPTION_CHECK_INTERVAL` | no | `60` | Seconds between preemption sweeps |
 | `PREEMPTION_DELEGATE_SELECTION` | no | `true` | Delegate preemption victim selection to the app (`POST /api/reservations/preemption-victims`) so prioritisation policy lives there; `false` (or any app-call failure) falls back to local uniform-random selection |
-| `CAPACITY_CHECK_INTERVAL` | no | `3600` | Seconds between app-side vs physical GPU capacity audits (default hourly). Each audit compares the reservation app's per-class `effective_gpus_today` (its `total_gpus` after any date-span capacity override covering today — the count the app actually admits against) with the GPUs physically present in the cluster, logs any difference as a **WARNING**, and pauses new on-demand admissions for any class the app over-counts until the deficiency clears |
+| `CAPACITY_CHECK_INTERVAL` | no | `3600` | Seconds between app-side vs physical GPU capacity audits (default hourly). Each audit compares the reservation app's per-class `effective_gpus_today` (its `total_gpus` after any date-span capacity override covering today — the count the app actually admits against) with the GPUs physically present in the cluster (per-node allocatable, or a node's `galends/force-node-capacity` override), logs any difference as a **WARNING**, and pauses new on-demand admissions for any class the app over-counts until the deficiency clears |
 | `POD_ADOPTION_ENABLED` | no | `true` | Re-link an overstay pod to a reservation its user has since booked. Set to `false` to disable |
 | `ONDEMAND_MERGE_ENABLED` | no | `true` | Merge a JIT on-demand lease's pod into the user's matching booking the moment that booking's window opens — re-link the pod and retire the lease penalty-exempt (`reason="superseded"`), without waiting for the lease guarantee to lapse. Set to `false` to disable (the pod converges lazily via adoption once past its lease guarantee) |
 | `TERMINATION_WARNING_ENABLED` | no | `true` | After each preemption sweep, stamp pods still at risk of preemption at an upcoming boundary with informational `galends/termination-warning-*` annotations (projected kill instant, risk score, message). Purely informational — nothing is enforced. Set to `false` to disable |
@@ -779,6 +780,62 @@ kubectl taint node <gpu-node> \
 
 `<label-value>` must match the `label_value` field in the reservation API's
 GPU class record (e.g. `h100`, `a100-80gb`).
+
+### 5 — Overriding a node's GPU capacity (optional)
+
+The controller's only notion of how many GPUs physically exist is
+`status.allocatable["nvidia.com/gpu"]`, summed per class over the tainted,
+schedulable nodes.  A **node** annotation overrides that reading for one node:
+
+```bash
+# This node contributes 2 GPUs to its class, whatever allocatable says
+kubectl annotate node <gpu-node> galends/force-node-capacity=2
+
+# Mask the node's GPUs entirely without cordoning it
+kubectl annotate node <gpu-node> galends/force-node-capacity=0 --overwrite
+
+# Back to the allocatable count
+kubectl annotate node <gpu-node> galends/force-node-capacity-
+```
+
+It exists for the cases where allocatable is not the number the reservation
+system should account against:
+
+- Some of a node's GPUs are failing or held back for non-reservation work, and
+  the device plugin still advertises them all.
+- A node's advertised count is wrong or unparseable.
+- You want to drain a node *from the reservation system* while leaving the pods
+  already on it — and every non-GPU pod — running.  Cordoning removes the node
+  from the snapshot entirely and stops everything; `0` only stops the
+  controller counting its GPUs.
+
+**Semantics.** The value is a whole number ≥ 0 and replaces the allocatable
+count for that node in every capacity calculation the controller makes: per-class
+totals, free capacity, headroom, the app-vs-physical audit, and the per-node
+feasibility guards all read the same snapshot.  A node tainted for more than one
+class contributes the forced number to each of them — the annotation is per node,
+not per class.  A negative or unparseable value is ignored, with a
+`k8s.node_capacity_forced_invalid` **WARNING** naming the node; the node keeps
+its allocatable count.  The annotation does **not** enrol a node: an untainted,
+cordoned, or terminating node is still excluded.
+
+**It is a replacement, not a cap** — a value above allocatable is honoured, which
+is the operator's call and worth being deliberate about.  The controller will
+then plan against GPUs the Kubernetes scheduler cannot place, so on-demand leases
+it grants can leave their pods Pending.
+
+**Interaction with the capacity audit.** Forcing a class *below* the reservation
+app's `effective_gpus_today` makes that class read as over-committed, which is
+what pauses new JIT on-demand admissions for it (guard 4) and logs the hourly
+`capacity_audit.mismatch` WARNING — usually the point of forcing capacity down.
+Forcing it *up* to match the app conceals a real shortage instead of fixing it;
+adjust the app-side class capacity for that.
+
+No extra RBAC is needed — annotations arrive with the node LIST the controller
+already performs.  Changes take effect on the next snapshot: within
+`PREEMPTION_CHECK_INTERVAL` (60 s) for preemption and headroom, one
+`QUEUE_PROCESSOR_INTERVAL` (300 s) for the admission guards, and one
+`CAPACITY_CHECK_INTERVAL` (3600 s) for the audit.
 
 ---
 

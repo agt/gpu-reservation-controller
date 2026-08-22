@@ -14,6 +14,7 @@ pod_has_toleration(pod, ...)                 — check for a specific toleration
 is_gpu_gated_pending(pod, taint_key)         — guard 1: is Pending fixable by a lease?
 read_pod(name, namespace)                    — fetch current pod object
 snapshot_tolerated_pods(tol_key)             — one LIST → occupancy + claims + guard 3
+get_node_forced_gpu_capacity(node)           — read galends/force-node-capacity annotation
 snapshot_node_gpu_inventory(taint_key)       — one LIST → allocatable GPUs per class, per node
 snapshot_node_gpu_capacity(taint_key)        — per-class collapse of the inventory (preemption planning)
 apply_toleration(...)                        — PATCH a pod to add toleration + booking annotation
@@ -703,6 +704,55 @@ async def snapshot_tolerated_pods(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Node capacity
+# ---------------------------------------------------------------------------
+
+# Node annotation overriding the GPU capacity the controller reads off a node.
+# Unlike every other ``galends/*`` key in this module it is *read* rather than
+# written, and it lives on a **node** rather than a pod: it is an operator's
+# statement about how many GPUs of that node the reservation system may account
+# for, which need not be what the device plugin advertises (a node whose GPUs
+# are failing, held back for non-reservation work, or misreported).
+FORCE_NODE_CAPACITY = "galends/force-node-capacity"
+
+
+def get_node_forced_gpu_capacity(node) -> Optional[int]:
+    """Read the ``galends/force-node-capacity`` annotation from *node*.
+
+    Returns the GPU count an operator has forced this node to contribute, or
+    ``None`` when the annotation is absent, empty, or unusable — in which case
+    the caller keeps whatever ``status.allocatable`` reported.
+
+    ``0`` is a **valid** override, and deliberately not rejected the way
+    ``get_pod_min_runtime_seconds`` rejects it: masking a node's GPUs from the
+    reservation system without cordoning it is the main thing this annotation is
+    for, and cordoning is not the same act — it also stops every non-GPU pod and
+    is what ``snapshot_node_gpu_inventory`` already treats as "gone entirely".
+    A **negative** value is rejected, because a node cannot contribute negative
+    capacity and summing one into its class's total would silently eat another
+    node's real GPUs.  Junk is rejected for the same tolerant-parsing reason
+    ``config.py`` rejects a junk interval — with a WARNING naming the annotation,
+    so an operator who set something and saw no effect can find out why.
+    """
+    annotations: dict = getattr(node.metadata, "annotations", None) or {}
+    raw = annotations.get(FORCE_NODE_CAPACITY)
+    if raw is None or str(raw).strip() == "":
+        return None
+    value: Optional[int]
+    try:
+        value = int(str(raw).strip())
+    except (ValueError, TypeError):
+        value = None
+    if value is None or value < 0:
+        log.warning("%s", kv(
+            event="k8s.node_capacity_forced_invalid", node=node.metadata.name,
+            annotation=FORCE_NODE_CAPACITY, value=raw,
+        ))
+        return None
+    return value
+
+
 async def snapshot_node_gpu_inventory(
     taint_key: str, gpu_resource: str = "nvidia.com/gpu"
 ) -> dict[str, dict[str, int]]:
@@ -713,6 +763,13 @@ async def snapshot_node_gpu_inventory(
     (the GPU-class label mirrors the toleration the controller applies to pods).
     Nodes that are cordoned (``spec.unschedulable``) or being deleted are
     excluded — their GPUs are not placeable.
+
+    A node carrying the ``galends/force-node-capacity`` annotation contributes
+    that number instead of its allocatable count (see
+    ``get_node_forced_gpu_capacity``).  This is the **only** place the override
+    is applied, which is what makes it total: every notion of physical capacity
+    in the controller — per-class totals, free capacity, headroom, the capacity
+    audit, and the per-node feasibility guards — is derived from this one map.
 
     This is the per-node primitive: ``snapshot_node_gpu_capacity`` collapses it
     to per-class totals for consumers that only need the aggregate, while
@@ -741,6 +798,17 @@ async def snapshot_node_gpu_inventory(
                 resource=gpu_resource, value=raw,
             ))
             gpus = 0
+        forced = get_node_forced_gpu_capacity(node)
+        if forced is not None:
+            # The override replaces the *result* of the allocatable read rather
+            # than short-circuiting it, so a node whose allocatable is also
+            # unparseable still reports that separately — being overridden is
+            # not a reason to stop saying the underlying reading is broken.
+            log.debug("%s", kv(
+                event="k8s.node_capacity_forced", node=node.metadata.name,
+                total=forced,
+            ))
+            gpus = forced
         for gpu_class in classes:
             inventory.setdefault(gpu_class, {})[node.metadata.name] = gpus
     # The inventory is a nested map, so it is fanned out to one line per class

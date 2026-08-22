@@ -333,10 +333,12 @@ DEBUG only, unless noted.
 | DEBUG | `k8s.list_pods` / `k8s.list_pods_done` | `selector purpose` (+ `reason`) / `purpose count` (+ `rv`) — `reason` (watch seed only) is why a full re-LIST ran: `start`, `error`, `expired`, or `resync` |
 | DEBUG | `k8s.list_nodes` | `purpose` |
 | DEBUG | `k8s.node_inventory` | `clabel nodes total` — one line per class |
+| DEBUG | `k8s.node_capacity_forced` | `node total` — the node's `galends/force-node-capacity` annotation replaced its allocatable count |
 | DEBUG | `k8s.patch_pod` | `ns pod patch` + the patch's own fields |
 | DEBUG | `k8s.create_event` / `k8s.delete_pod` | `ns pod` (+ `reason`) |
 | DEBUG | `pod.already_gone` | `ns pod status` (404 on delete) |
 | WARNING | `k8s.node_allocatable_invalid` | `node resource value` — treated as 0 |
+| WARNING | `k8s.node_capacity_forced_invalid` | `node annotation value` — unparseable or negative `galends/force-node-capacity`; the node keeps its allocatable count |
 | WARNING | `pod.annotation_invalid` | `ns pod annotation value` — malformed `galends/minimum-runtime-seconds` |
 | DEBUG | `k8s.watch_open` / `k8s.watch_event` | `selector rv timeout_s mode` / `watch_event ns pod` — `mode=seed` after a LIST, `mode=resume` when continuing from the last resourceVersion (no LIST, no replay) |
 | DEBUG | `k8s.watch_bookmark` | `rv` — server bookmark advanced the resourceVersion; never forwarded as a pod event |
