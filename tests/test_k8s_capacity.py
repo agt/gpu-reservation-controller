@@ -1,7 +1,8 @@
 """Tests for the k8s_client node/pod capacity snapshots.
 
 Covers ``snapshot_node_gpu_capacity`` (per-class totals), its per-node primitive
-``snapshot_node_gpu_inventory``, and the ``node_name`` capture added to
+``snapshot_node_gpu_inventory``, the ``galends/force-node-capacity`` operator
+override those read, and the ``node_name`` capture added to
 ``snapshot_tolerated_pods``.  Uses SimpleNamespace stubs and a fake ``_core_v1``
 (no real Kubernetes client), matching the ``monkeypatch`` / ``asyncio.run``
 convention used for the other async k8s_client wrappers.
@@ -10,6 +11,7 @@ convention used for the other async k8s_client wrappers.
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 
 import app.k8s_client as k8s_client
@@ -28,11 +30,13 @@ def _node(
     allocatable: dict | None = None,
     unschedulable: bool = False,
     deleting: bool = False,
+    annotations: dict | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         metadata=SimpleNamespace(
             name=name,
             deletion_timestamp="2024-01-01T00:00:00Z" if deleting else None,
+            annotations=annotations,
         ),
         spec=SimpleNamespace(taints=taints, unschedulable=unschedulable),
         status=SimpleNamespace(allocatable=allocatable),
@@ -227,6 +231,195 @@ class TestSnapshotNodeGpuInventory:
             for gpu_class, per_node in inventory.items()
         }
         assert capacity == {"h100": 12, "a100": 2}
+
+
+# ---------------------------------------------------------------------------
+# galends/force-node-capacity — the operator override
+# ---------------------------------------------------------------------------
+
+FORCE = k8s_client.FORCE_NODE_CAPACITY
+
+
+class TestGetNodeForcedGpuCapacity:
+    """The pure annotation reader, exercised without a snapshot around it."""
+
+    def test_absent_annotation_is_none(self):
+        assert k8s_client.get_node_forced_gpu_capacity(_node("n1")) is None
+        assert k8s_client.get_node_forced_gpu_capacity(
+            _node("n1", annotations={})
+        ) is None
+        assert k8s_client.get_node_forced_gpu_capacity(
+            _node("n1", annotations={"galends/other": "4"})
+        ) is None
+
+    def test_positive_value_parsed(self):
+        node = _node("n1", annotations={FORCE: "6"})
+        assert k8s_client.get_node_forced_gpu_capacity(node) == 6
+
+    def test_zero_is_a_valid_override(self):
+        """0 masks a node's GPUs without cordoning it — not a rejection."""
+        node = _node("n1", annotations={FORCE: "0"})
+        assert k8s_client.get_node_forced_gpu_capacity(node) == 0
+
+    def test_surrounding_whitespace_tolerated(self):
+        node = _node("n1", annotations={FORCE: " 3\n"})
+        assert k8s_client.get_node_forced_gpu_capacity(node) == 3
+
+    def test_empty_value_is_none(self):
+        assert k8s_client.get_node_forced_gpu_capacity(
+            _node("n1", annotations={FORCE: ""})
+        ) is None
+        assert k8s_client.get_node_forced_gpu_capacity(
+            _node("n1", annotations={FORCE: "   "})
+        ) is None
+
+    def test_negative_rejected_with_warning(self, caplog):
+        node = _node("n1", annotations={FORCE: "-2"})
+        with caplog.at_level(logging.WARNING, logger="app.k8s_client"):
+            assert k8s_client.get_node_forced_gpu_capacity(node) is None
+        assert any(
+            "event=k8s.node_capacity_forced_invalid" in r.getMessage()
+            and "node=n1" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_garbage_rejected_with_warning(self, caplog):
+        node = _node("n1", annotations={FORCE: "four"})
+        with caplog.at_level(logging.WARNING, logger="app.k8s_client"):
+            assert k8s_client.get_node_forced_gpu_capacity(node) is None
+        assert any(
+            "event=k8s.node_capacity_forced_invalid" in r.getMessage()
+            and "value=four" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_fractional_rejected(self):
+        """A GPU count is whole; "2.5" is a typo, not a request for 2."""
+        assert k8s_client.get_node_forced_gpu_capacity(
+            _node("n1", annotations={FORCE: "2.5"})
+        ) is None
+
+
+class TestForcedCapacityInInventory:
+    def test_forced_value_replaces_allocatable(self, monkeypatch):
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}, annotations={FORCE: "2"}),
+            _node("n2", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}),
+        ]
+        assert _run_inventory(monkeypatch, nodes) == {"h100": {"n1": 2, "n2": 8}}
+        assert _run_snapshot(monkeypatch, nodes) == {"h100": 10}
+
+    def test_forced_value_may_exceed_allocatable(self, monkeypatch):
+        """The override is a replacement, not a cap — raising is the operator's call."""
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "4"}, annotations={FORCE: "16"}),
+        ]
+        assert _run_inventory(monkeypatch, nodes) == {"h100": {"n1": 16}}
+
+    def test_forced_zero_keeps_the_node_at_zero(self, monkeypatch):
+        """Same shape as a node reporting no GPUs — present, contributing none.
+
+        Keeping the entry matters: ``node_counts_by_class`` (guard 1b) counts
+        nodes, so dropping it would read as "this class has no nodes at all".
+        """
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}, annotations={FORCE: "0"}),
+        ]
+        assert _run_inventory(monkeypatch, nodes) == {"h100": {"n1": 0}}
+        assert _run_snapshot(monkeypatch, nodes) == {"h100": 0}
+
+    def test_invalid_forced_value_falls_back_to_allocatable(self, monkeypatch):
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}, annotations={FORCE: "-1"}),
+            _node("n2", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "4"}, annotations={FORCE: "lots"}),
+        ]
+        assert _run_inventory(monkeypatch, nodes) == {"h100": {"n1": 8, "n2": 4}}
+
+    def test_forced_value_overrides_unparseable_allocatable(self, monkeypatch):
+        """The main repair case: a device plugin reporting nonsense."""
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "not-a-number"},
+                  annotations={FORCE: "4"}),
+            _node("n2", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable=None, annotations={FORCE: "4"}),
+        ]
+        assert _run_inventory(monkeypatch, nodes) == {"h100": {"n1": 4, "n2": 4}}
+
+    def test_forced_value_applies_to_every_class_the_node_serves(self, monkeypatch):
+        """The annotation is per node, so a multi-taint node forces both buckets."""
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100"), _taint(TAINT_KEY, "a100")],
+                  allocatable={"nvidia.com/gpu": "8"}, annotations={FORCE: "3"}),
+        ]
+        assert _run_inventory(monkeypatch, nodes) == {
+            "h100": {"n1": 3},
+            "a100": {"n1": 3},
+        }
+
+    def test_forced_node_still_excluded_when_cordoned_or_deleting(self, monkeypatch):
+        """The override sets a node's capacity; it does not resurrect the node."""
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}, annotations={FORCE: "4"},
+                  unschedulable=True),
+            _node("n2", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}, annotations={FORCE: "4"},
+                  deleting=True),
+        ]
+        assert _run_inventory(monkeypatch, nodes) == {}
+
+    def test_forced_node_without_the_taint_still_ignored(self, monkeypatch):
+        """The taint is what enrols a node; an annotation alone enrols nothing."""
+        nodes = [_node("n1", taints=[], allocatable={"nvidia.com/gpu": "8"},
+                       annotations={FORCE: "4"})]
+        assert _run_inventory(monkeypatch, nodes) == {}
+
+    def test_applied_override_is_logged(self, monkeypatch, caplog):
+        """At DEBUG, so an operator can confirm the annotation took effect.
+
+        The per-class ``k8s.node_inventory`` line shows the total but not which
+        node was overridden, and nothing else in the controller reports it.
+        """
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}, annotations={FORCE: "2"}),
+            _node("n2", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}),
+        ]
+        with caplog.at_level(logging.DEBUG, logger="app.k8s_client"):
+            _run_inventory(monkeypatch, nodes)
+        forced_lines = [
+            r.getMessage() for r in caplog.records
+            if "event=k8s.node_capacity_forced " in r.getMessage() + " "
+        ]
+        assert len(forced_lines) == 1, forced_lines
+        assert "node=n1" in forced_lines[0]
+        assert "total=2" in forced_lines[0]
+
+    def test_capacity_remains_the_collapse_of_the_forced_inventory(self, monkeypatch):
+        """``snapshot_node_gpu_capacity``'s contract survives the override."""
+        nodes = [
+            _node("n1", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}, annotations={FORCE: "2"}),
+            _node("n2", taints=[_taint(TAINT_KEY, "h100")],
+                  allocatable={"nvidia.com/gpu": "8"}),
+            _node("n3", taints=[_taint(TAINT_KEY, "a100")],
+                  allocatable={"nvidia.com/gpu": "2"}, annotations={FORCE: "0"}),
+        ]
+        inventory = _run_inventory(monkeypatch, nodes)
+        capacity = _run_snapshot(monkeypatch, nodes)
+        assert capacity == {
+            gpu_class: sum(per_node.values())
+            for gpu_class, per_node in inventory.items()
+        }
+        assert capacity == {"h100": 10, "a100": 0}
 
 
 # ---------------------------------------------------------------------------
