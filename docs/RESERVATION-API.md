@@ -109,7 +109,7 @@ Endpoints that return lists accept:
 
 ### Errors
 
-All errors return a JSON body with a single `detail` field:
+All errors return a JSON body with a `detail` field:
 
 ```json
 { "detail": "User not found" }
@@ -123,7 +123,49 @@ Common status codes:
 | 401 | Missing or invalid credential |
 | 403 | Valid credential but insufficient permission |
 | 404 | Resource not found |
-| 409 | Conflict (duplicate unique field) |
+| 409 | Conflict (duplicate unique field), or a refused reservation admission |
+
+### Admission-denial envelope
+
+A denial from one of the reservation **admission gates** carries three more
+fields beside `detail`. The gates are the checks that judge whether the
+*requested* reservation may be admitted — membership, class access, duration,
+group validity, SU budget and capacity — on `POST /api/reservations` (both
+shapes), `POST /api/reservations/preflight` and
+`POST /api/reservations/{id}/continue`:
+
+```json
+{
+  "detail": "This lease costs 96 SU but user 'jsmith' has only 20 of 200 SU remaining.",
+  "code": "su_budget_member",
+  "retryable": true,
+  "not_before": "2026-08-24T00:00:00Z"
+}
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `detail` | string | Unchanged human-readable explanation. Free text — never parse it. |
+| `code` | string | Which gate refused, from the closed vocabulary in §4. Names the *gate*, not the verdict: the same code appears whether the denial is momentary or permanent. |
+| `retryable` | boolean | Whether waiting can ever admit **this same request**. `false` means only an administrator — or a different request — resolves it. |
+| `not_before` | string (ISO 8601, `Z`) | Optional. The instant a denial is known to clear (a budget window's end, a group's `valid_from`). Advisory: the condition may clear earlier if somebody cancels. Absent when there is no such instant. |
+
+A denial carrying a `not_before` also sets a `Retry-After` header with the same
+delay in seconds, as a convenience for generic HTTP tooling. The body is the
+authoritative channel; a denial with no `not_before` sends no header.
+
+**Reading it safely.** Both directions of version skew are handled by one rule:
+
+- **Treat an absent `code`/`retryable` as retryable.** Some admission failures
+  are still plain `{"detail": ...}` — an unknown group, user or GPU class (404),
+  and any error outside the admission gates. An older server omits the fields
+  entirely.
+- **Treat an unrecognised `code` as retryable.** The vocabulary can grow; a new
+  value must not strand a client.
+
+Retryable is the safe default in both cases because it is exactly the behaviour
+every client had before these fields existed. A wrong "retryable" costs one
+wasted attempt; a wrong "permanent" strands a job that would have run.
 
 ---
 
@@ -399,13 +441,66 @@ Semantics:
 | 200 | `idempotency_key` matched an existing reservation — that original reservation is returned unchanged (idempotent retry) |
 | 403 | Missing/`read_only` key, or a human session sent `on_demand: true` |
 | 404 | Unknown `group_name` / `gpu_class_id` (or inactive), or an unknown/inactive `username`. On a group with `on_demand_auto_join` an unknown `username` is provisioned rather than refused — but the account is still reported as unknown when it exists and is **inactive**, when the username cannot form a valid mailbox address or is shorter than an account name may be, or when another account already claims that identity |
-| 409 | Denied — insufficient capacity **or** a policy gate (membership, class access, SU budget, GPU cap, validity dates, `max_reservation_hours`). Human-readable JSON `detail` explains which. Membership does not appear here on a group with `on_demand_auto_join` set |
+| 409 | Denied — insufficient capacity **or** a policy gate (membership, class access, SU budget, GPU cap, validity dates, `max_reservation_hours`). The [admission-denial envelope](#admission-denial-envelope) says which, and whether retrying can ever help. Membership does not appear here on a group with `on_demand_auto_join` set |
 | 422 | Malformed body (e.g. `duration_seconds` out of bounds) |
 
 Send a fresh `idempotency_key` per lease attempt (e.g. derived from the pod
 UID); replaying the same key returns the original reservation even after it was
-cancelled. A `409` means "not feasible right now" — the controller may retry
-later as demand/capacity changes.
+cancelled.
+
+#### Which denials are worth retrying
+
+A `409` does **not** mean "not feasible right now" — that is true of capacity and
+of most budget denials, and false of the rest. A pod asking for more GPUs than
+its class holds, under a group the class is not attached to, or for longer than
+`max_reservation_hours` is refused identically on every future tick. Read
+`retryable` rather than the status:
+
+| `retryable` | `not_before` | What it means | What a controller should do |
+|---|---|---|---|
+| `true` | absent | **Contended** — load-dependent; it clears as reservations end | Retry on the next tick |
+| `true` | present | **Scheduled** — clears no sooner than that instant | Sleep until then, rather than polling toward it |
+| `false` | absent | **Structural** — the same request can never be admitted | Stop retrying; surface the reason to a human |
+
+`retryable: false` does not mean "never": an administrator can attach the class,
+raise a ceiling, or add the user to the group. It means the answer will not
+change on its own, so polling is the wrong response and reporting is the right
+one — e.g. as a pod event or annotation naming the `code` and `detail`.
+
+The codes, and what each gate is:
+
+| `code` | Gate | Notes |
+|--------|------|-------|
+| `not_a_member` | The user is not in the named group | Always `retryable: false`. Not raised on a group with `on_demand_auto_join` |
+| `gpu_class_not_attached` | The GPU class is not bookable under the group | Always `retryable: false` |
+| `gpu_count_over_class_cap` | `gpu_count` exceeds the class's `max_gpus_per_reservation` | Always `retryable: false` |
+| `duration_over_group_ceiling` | The span exceeds the group's `max_reservation_hours` | Always `retryable: false`. No caller is exempt |
+| `group_not_yet_valid` | The start date precedes the group's `valid_from` | `retryable: true` with `not_before` = that date |
+| `group_validity_ended` | The start date is past the group's `valid_until` | Always `retryable: false` |
+| `su_budget_member` | The per-member (or per-team) SU budget for the window | See below |
+| `su_budget_pool` | The group's shared SU pool for the window | See below |
+| `capacity_physical` | The GPU class's own capacity | `retryable: false` when `gpu_count` exceeds the class outright |
+| `capacity_cohort` | The binding cohort's ceiling | `retryable: false` when the ask exceeds that ceiling plus any borrowable headroom |
+| `capacity_group` | The group's own ceiling | Same rule as the cohort tier |
+
+The two SU codes are `retryable: false` when the request's cost alone exceeds
+the whole budget (no amount of freeing makes room), or under
+`su_anchor_mode: "since_creation"`, whose single window never resets — a
+cancellation or an administrator's boost is then the only way through. Under a
+calendar window they are `retryable: true`, carrying `not_before` = the window's
+end when the denial is against the *current* window. A denial against a
+**future** window carries no `not_before`: that window's allowance is spent by
+reservations already charged to it, which do not expire until the window itself
+has passed.
+
+Three codes never reach a lease and appear only on the web-booking and
+`preflight` paths, whose timing policy a lease does not have:
+`start_too_soon`, `booking_window_too_soon` (both always `retryable: false` —
+the horizons roll forward with the clock, so a start that is too close only gets
+closer) and `booking_window_too_far` (`retryable: true`, with `not_before` = when
+the rolling horizon reaches the requested end). `duration_over_member_cap` (the
+48-hour cap) and `group_on_demand_only` are likewise web-only and always
+`retryable: false`.
 
 ### `POST /api/reservations/{id}/cancel`
 
@@ -516,6 +611,15 @@ Semantics:
 | 404 | Reservation, group, or GPU class not found / inactive |
 | 409 | Capacity would be exceeded |
 
+The admission gates on this path carry the
+[admission-denial envelope](#admission-denial-envelope) — that is, the 409 and
+the *"can't be admitted"* half of the 400. The other half of the 400 (the source
+reservation is not active, not an eligible kind, or in the wrong phase) is a
+precondition on the row being continued rather than an admission gate, and
+returns a bare `detail` like the 404s. Note also that this path signals a budget
+denial as **400** where the on-demand create signals it as 409 — another reason
+to branch on `code`/`retryable` rather than on the status.
+
 ### `POST /api/reservations/ondemand-admission`
 
 Choose which pending pods the controller should admit on-demand this round.
@@ -575,7 +679,9 @@ prioritisation policy can live in the app (`_prioritize_ondemand_candidates` in
 granted pod the controller then issues an idempotent `POST /api/reservations`
 (keyed by `pod_uid`); a `409` there still applies — a grant this endpoint returns
 is an admission *decision*, and the subsequent create remains the authoritative
-feasibility check.
+feasibility check. A candidate the create refuses with `retryable: false` will be
+refused again on every later round, so it is worth dropping from the offered set
+rather than re-offering it each tick.
 
 **Responses**
 

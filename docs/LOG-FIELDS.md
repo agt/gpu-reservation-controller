@@ -97,8 +97,15 @@ app id), `class` (display name), `clabel` (Kubernetes node-label value, which is
 all the controller could resolve before). Emitting them separately is what makes
 an app line and a controller line joinable on class.
 
-**`reason=` is scoped by `event=`.** Three unrelated enums share the key; the
+**`reason=` is scoped by `event=`.** Several unrelated enums share the key; the
 event name says which. A bare `grep reason=` mixes them — scope to the event.
+On the admission denials (`reservation.denied`, `lease.denied`,
+`preflight.denied`, `continue.denied`) the enum is the **published denial
+code** — the same closed vocabulary the client receives as `code` in the
+response body — so an app line and a controller line join on the exact
+string. It is `reason=` rather than a new key because the code *is* the
+"why" this line already had a field for, and two keys for one concept is
+what this dictionary exists to prevent.
 
 ---
 
@@ -168,6 +175,7 @@ follow this grammar and are not expected to.
 | `status` | int | HTTP status code |
 | `reason` | enum, scoped by `event=` | why — see §2 |
 | `detail` | quoted string | free-text denial detail (`HTTPException.detail`) |
+| `retryable` | bool | on an admission denial, whether waiting can ever admit the *same* request — `false` means only an administrator, or a different ask, resolves it. Pairs with the `reason=` denial code; both are the response envelope's fields verbatim (RESERVATION-API.md §4) |
 | `err` | quoted string | exception text |
 | `kind` | `booking` \| `on_demand` | reservation flavour |
 | `provider` | `local` \| `jupyterhub` \| `google` \| `oidc` \| `saml` | auth path |
