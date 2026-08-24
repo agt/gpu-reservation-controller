@@ -382,6 +382,7 @@ def _grant_and_admit(m, monkeypatch, status, detail, config=None):
     candidate = _candidate()
     ask = OnDemandAdmissionCandidate(
         pod_uid="uid-1",
+        pod_created_at=datetime.now(timezone.utc),
         username=USERNAME,
         group_name=GROUP_NAME,
         gpu_class_id=GPU_CLASS_ID,

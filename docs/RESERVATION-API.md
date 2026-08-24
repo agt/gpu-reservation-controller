@@ -635,16 +635,25 @@ pending pods are eligible for a JIT lease this round (GPU-only-pending, not
 matched by an open reservation, past their retry cooldown, of a class that is
 not under the stuck-holder safety interlock). This endpoint decides *which* of
 those eligible pods to admit now, so prioritisation policy lives in the app
-rather than the controller. Each candidate is the exact "ask" a
-`POST /api/reservations` create would carry, so the app can weigh it against
-priority **and** the same feasibility analysis a create performs.
+rather than the controller. Each candidate carries the exact "ask" a
+`POST /api/reservations` create would make, so the app can weigh it against
+priority **and** the same feasibility analysis a create performs — plus two
+fields that are **evidence about the waiting pod** rather than part of that ask
+(`pod_created_at`, `pod_annotations`). Nothing in the create carries those two;
+they exist so admission policy can price a candidate on how long it has been
+waiting and on what its owner declared about the job.
 
 ```json
 {
   "candidates": [
-    { "pod_uid": "abc-123", "username": "alice", "group_name": "cse142",
+    { "pod_uid": "abc-123", "pod_created_at": "2026-08-21T17:00:00Z",
+      "pod_annotations": { "galends/minimum-runtime-seconds": "1800",
+                           "galends/usage-group": "cse142" },
+      "username": "alice", "group_name": "cse142",
       "gpu_class_id": 10, "gpu_count": 1, "duration_seconds": 1800 },
-    { "pod_uid": "def-456", "username": "bob", "group_name": null,
+    { "pod_uid": "def-456", "pod_created_at": "2026-08-21T17:05:00Z",
+      "pod_annotations": {},
+      "username": "bob", "group_name": null,
       "gpu_class_id": 10, "gpu_count": 2, "duration_seconds": 1200 }
   ]
 }
@@ -653,11 +662,28 @@ priority **and** the same feasibility analysis a create performs.
 | Field | Meaning |
 |-------|---------|
 | `candidates[].pod_uid` | Opaque pod identifier; echoed back verbatim in the response (equals the create's `idempotency_key`) |
+| `candidates[].pod_created_at` | The pod's Kubernetes `metadata.creationTimestamp`, **UTC** — the same key the controller FIFO-orders its own batch by, so an age computed from it is real queueing delay rather than time since this batch was assembled |
+| `candidates[].pod_annotations` | Every `galends/`-prefixed annotation on the pod, as a string map. `{}` is legitimate — a pod covered by the controller's `DEFAULT_MINIMUM_RUNTIME_SECONDS` / `DEFAULT_USAGE_GROUP` declares nothing itself |
 | `candidates[].username` | Reservation owner the lease would be created for (the pod's namespace) |
 | `candidates[].group_name` | Usage group the lease would be created under, or `null` when group matching is disabled |
 | `candidates[].gpu_class_id` | Numeric GPU-class id the lease would target |
 | `candidates[].gpu_count` | GPUs the pod requests |
 | `candidates[].duration_seconds` | Lease duration the controller would request (pod minimum-runtime + buffer) |
+
+`pod_annotations` values are whatever the pod's creator wrote, and Kubernetes
+lets one object carry 256 KiB of annotations — which a batch would otherwise
+ship per candidate, every 2–5 minutes, for as long as the pod stayed Pending. The
+**controller** therefore bounds them before sending: at most **32 keys** (taken
+in sorted order, so the same pod presents the same subset on every attempt) and
+**1024 characters per value**. The bound lives on the sending side on purpose,
+because this endpoint's schema is deliberately lenient: one candidate the app
+refuses 422s the *whole* batch, and none of the pods in it get admitted that
+round. For the same reason both fields are **optional app-side** — a controller
+predating them offers neither, and must not have its batch rejected for it.
+
+The app is free to ignore both. They are advisory inputs to selection, never
+inputs to the lease that follows: the subsequent `POST /api/reservations` carries
+the ask alone.
 
 The app returns the subset of `pod_uid`s it grants admission this round:
 
