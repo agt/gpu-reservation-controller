@@ -9,6 +9,7 @@ init_k8s(kubeconfig_path, strict_tls_verify)  — load credentials once at start
 get_pod_gpu_count(pod)                       — sum nvidia.com/gpu requests
 get_pod_booking_reference(pod)               — read galends/booking-reference annotation
 get_pod_usage_group(pod)                     — read galends/usage-group annotation (JIT lease group)
+get_pod_galends_annotations(pod)             — every galends/* annotation, bounded (JIT admission ask)
 parse_booking_reference(ref)                 — reservation id from a booking-reference
 pod_has_toleration(pod, ...)                 — check for a specific toleration
 is_gpu_gated_pending(pod, taint_key)         — guard 1: is Pending fixable by a lease?
@@ -280,6 +281,68 @@ def get_pod_booking_reference(pod) -> Optional[str]:
     """Return the ``galends/booking-reference`` annotation value, or ``None``."""
     annotations: dict = getattr(pod.metadata, "annotations", None) or {}
     return annotations.get("galends/booking-reference")
+
+
+# The annotation namespace this system owns.  Every key the controller writes,
+# and every key it reads off a pod, carries it -- so the prefix is also what marks
+# a pod annotation as *about* the reservation system, and therefore worth
+# forwarding to the app with a JIT admission ask (see
+# ``get_pod_galends_annotations``).  Matched with the trailing slash, which is
+# what keeps an unrelated ``galends.example.com/...`` key out.
+GALENDS_PREFIX = "galends/"
+
+# Bounds applied when forwarding those annotations off-cluster.  Their values are
+# whatever the pod's creator wrote, and Kubernetes caps *all* annotations on an
+# object at 256 KiB -- which an admission batch would otherwise carry per
+# candidate, every 2-5 minutes, for as long as the pod stays Pending.  Capping
+# here rather than in the app is deliberate: the app's schema is lenient on
+# purpose, because a rejected candidate 422s the whole batch (RESERVATION-API.md
+# "POST /api/reservations/ondemand-admission"), so the controller must never send
+# something the far end would refuse.
+GALENDS_ANNOTATION_MAX_KEYS = 32
+GALENDS_ANNOTATION_MAX_VALUE = 1024
+
+
+def get_pod_galends_annotations(pod) -> dict[str, str]:
+    """Return the pod's ``galends/``-prefixed annotations, bounded for the wire.
+
+    Unlike the single-key readers above this makes no judgement about *which*
+    keys matter: the app is the consumer, and the whole point of forwarding them
+    is that a future admission policy can weigh a signal the controller does not
+    itself understand.  So every key in the namespace goes, including the ones
+    the controller wrote itself (``booking-reference``, the guarantee and
+    termination-warning keys) -- a candidate awaiting admission generally has
+    none of those, but a re-queued pod may.
+
+    Two bounds apply, both silent-by-design on the value side and logged on the
+    key side.  Keys are taken in sorted order and capped at
+    ``GALENDS_ANNOTATION_MAX_KEYS`` -- sorted, so the same pod always yields the
+    same subset rather than flapping between attempts -- and each value is
+    truncated to ``GALENDS_ANNOTATION_MAX_VALUE`` characters.  A truncated value
+    is still recognisably itself; a dropped key is not, which is why only the
+    latter says so.
+    """
+    annotations: dict = getattr(pod.metadata, "annotations", None) or {}
+    selected = {
+        key: value for key, value in annotations.items()
+        if key.startswith(GALENDS_PREFIX)
+    }
+    kept = sorted(selected)[:GALENDS_ANNOTATION_MAX_KEYS]
+
+    dropped = len(selected) - len(kept)
+    if dropped:
+        # DEBUG, not WARNING: this repeats on every admission attempt for as long
+        # as the pod waits, and the same reasoning that puts
+        # ``k8s.node_capacity_forced`` at DEBUG applies.  It exists at all so an
+        # operator whose annotation never reached the app can find out why.
+        log.debug("%s", kv(
+            event="pod.annotations_truncated",
+            ns=pod.metadata.namespace, pod=pod.metadata.name, count=dropped,
+        ))
+
+    return {
+        key: str(selected[key])[:GALENDS_ANNOTATION_MAX_VALUE] for key in kept
+    }
 
 
 def utc_iso(dt: datetime) -> str:

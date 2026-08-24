@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class UserBrief(BaseModel):
@@ -243,14 +243,35 @@ class PreemptionSelectionResponse(BaseModel):
 class OnDemandAdmissionCandidate(BaseModel):
     """One pending pod seeking JIT on-demand admission, offered to the app.
 
-    Each candidate is the exact "ask" the controller would otherwise send to
-    ``POST /api/reservations`` — so the app can weigh it against LAS priority and
-    the same feasibility analysis a create would perform.  ``pod_uid`` is opaque
-    to the app (it equals the create's ``idempotency_key``): it is echoed back in
-    the response so the controller can map the choice to a pod to admit.
+    Two blocks of fields, and the distinction matters to what the app may do
+    with them.  ``username`` / ``group_name`` / ``gpu_class_id`` / ``gpu_count``
+    / ``duration_seconds`` are the exact "ask" the controller would otherwise
+    send to ``POST /api/reservations`` — so the app can weigh it against LAS
+    priority and the same feasibility analysis a create would perform.
+    ``pod_created_at`` and ``pod_annotations`` are **evidence about the waiting
+    pod** rather than part of the ask: nothing in the create carries them, and
+    they exist so admission policy can price a candidate on how long it has been
+    waiting and on what its owner declared about the job.
+
+    ``pod_uid`` is opaque to the app (it equals the create's
+    ``idempotency_key``): it is echoed back in the response so the controller can
+    map the choice to a pod to admit.
+
+    ``pod_created_at`` is the pod's ``metadata.creationTimestamp`` as a UTC
+    instant — the same value the controller FIFO-orders its own batch by, so the
+    app sees the queue position the controller sees, and an age computed from it
+    is real queueing delay rather than time since this batch was assembled.
+
+    ``pod_annotations`` is every ``galends/``-prefixed annotation on the pod,
+    bounded by ``k8s_client.get_pod_galends_annotations`` (32 keys, 1024 chars
+    per value) because the values are whatever the pod's creator wrote.  Empty is
+    legitimate: a pod admitted under ``DEFAULT_MINIMUM_RUNTIME_SECONDS`` and
+    ``DEFAULT_USAGE_GROUP`` declares nothing at all.
     """
 
     pod_uid: str
+    pod_created_at: datetime
+    pod_annotations: dict[str, str] = Field(default_factory=dict)
     username: str
     group_name: Optional[str] = None
     gpu_class_id: int

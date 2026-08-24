@@ -307,6 +307,8 @@ def test_lease_error_detail_truncates_a_large_body():
 def _admission_request(**overrides) -> OnDemandAdmissionRequest:
     base = dict(
         pod_uid="pod-uid-1",
+        pod_created_at=datetime(2026, 8, 21, 17, 0, tzinfo=timezone.utc),
+        pod_annotations={"galends/minimum-runtime-seconds": "1200"},
         username="alice",
         group_name=None,
         gpu_class_id=10,
@@ -318,7 +320,9 @@ def _admission_request(**overrides) -> OnDemandAdmissionRequest:
         candidates=[
             OnDemandAdmissionCandidate(**base),
             OnDemandAdmissionCandidate(
-                pod_uid="pod-uid-2", username="bob", gpu_class_id=10,
+                pod_uid="pod-uid-2",
+                pod_created_at=datetime(2026, 8, 21, 17, 5, tzinfo=timezone.utc),
+                username="bob", gpu_class_id=10,
                 gpu_count=2, duration_seconds=600,
             ),
         ]
@@ -330,6 +334,14 @@ def test_select_ondemand_admissions_200_returns_granted_uids():
         assert request.url.path == "/api/reservations/ondemand-admission"
         body = json.loads(request.content)
         assert [c["pod_uid"] for c in body["candidates"]] == ["pod-uid-1", "pod-uid-2"]
+        # The pod evidence rides on the wire alongside the ask: a creation time
+        # the app can age a candidate by, and the pod's galends annotations.
+        first, second = body["candidates"]
+        assert first["pod_created_at"] == "2026-08-21T17:00:00Z"
+        assert first["pod_annotations"] == {"galends/minimum-runtime-seconds": "1200"}
+        assert second["pod_created_at"] == "2026-08-21T17:05:00Z"
+        # A pod declaring no galends annotation serialises an empty map, never null.
+        assert second["pod_annotations"] == {}
         return httpx.Response(200, json={"granted_pod_uids": ["pod-uid-2"]})
 
     client = _client_with_handler(_config(), handler)

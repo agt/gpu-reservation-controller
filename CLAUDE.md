@@ -809,7 +809,32 @@ two-step **preflight → delegate → grant** pipeline.
   label to a numeric id via `ControllerState.gpu_class_ids`.  Survivors become an
   `OnDemandAdmissionCandidate` — the exact "ask" (username, group, class id, gpu
   count, and `duration_seconds = minimum-runtime + ONDEMAND_LEASE_BUFFER_MINUTES
-  * 60`, default buffer 10 min).
+  * 60`, default buffer 10 min), plus the **pod evidence** described next.
+- **Pod evidence on the ask** (`pod_created_at`, `pod_annotations`).  The ask
+  alone says what a lease would cost, not which waiting pod most deserves one, so
+  the candidate also carries two things the create never sees.  `pod_created_at`
+  is the pod's `metadata.creationTimestamp` — deliberately the candidate's *own*
+  FIFO key rather than a freshly read one, so the app orders by exactly what the
+  controller orders by and an age computed from it is real queueing delay rather
+  than time since the batch was assembled.  `pod_annotations` is every
+  `galends/`-prefixed annotation, read from the **freshly re-read** pod (so a pod
+  re-annotated while it waited is offered as it is now) via
+  `k8s_client.get_pod_galends_annotations`.  No judgement is made about which
+  keys matter — the whole point is that app-side policy can weigh a signal the
+  controller does not itself understand — so the controller's own keys
+  (`booking-reference`, the guarantee and warning keys) go too when a re-queued
+  pod carries them.  Both are advisory: neither reaches
+  `OnDemandReservationRequest`.
+
+  The values are whatever the pod's creator wrote and Kubernetes allows 256 KiB
+  of annotations per object, so they are **bounded before sending**: 32 keys
+  (sorted, so the subset does not flap between attempts) and 1024 chars per
+  value.  The bound lives on the *sending* side because the app's schema is
+  lenient by design — one candidate it refuses 422s the whole batch, admitting
+  none of them that round — and for the same reason both fields are optional
+  app-side, so a controller predating them is not rejected.  A dropped key logs
+  `pod.annotations_truncated` at DEBUG (it repeats per attempt for as long as the
+  pod waits); a truncated *value* is silent, being still recognisably itself.
 - **Delegate** (only when `ONDEMAND_DELEGATE_ADMISSION` is on): the whole
   survivor set is offered to the app in one call
   (`POST /api/reservations/ondemand-admission`,

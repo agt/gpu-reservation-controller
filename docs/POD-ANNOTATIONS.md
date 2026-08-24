@@ -264,6 +264,32 @@ rather than *"overstaying"*. The admission Event is `BestEffortAdmitted`, not
 This is an opt-in the **deployment** must also enable (`BEST_EFFORT_ENABLED`);
 where it is off, the annotation is ignored and the pod is handled as before.
 
+### The whole `galends/` namespace leaves the cluster
+
+The two keys above are the ones the controller itself acts on, but they are not
+the only ones it *sends*. When a pod is waiting for a just-in-time lease and the
+deployment delegates that decision to the reservation app
+(`ONDEMAND_DELEGATE_ADMISSION`), the controller offers the pod to the app along
+with **every** annotation it carries under the `galends/` prefix — its own keys
+from §2 included — plus the pod's creation time. The app may weigh any of them
+when deciding which waiting pods to admit; a key it does not recognise is simply
+ignored.
+
+Two consequences worth knowing:
+
+- **Treat `galends/` as a shared namespace, not scratch space.** An annotation
+  you park there on a Pending pod is sent off-cluster to the reservation app.
+  Anything private to your own tooling belongs under a prefix of your own, which
+  the controller neither reads nor forwards.
+- **Only a large one is clipped.** The controller sends at most 32 `galends/`
+  keys (lowest-sorting first) and 1024 characters per value, so a pod with an
+  unusual number of them, or a very long value, is offered a bounded view of
+  itself. Nothing about admission changes as a result — the ask is unaffected —
+  but a policy reading a truncated value sees the truncation.
+
+Nothing here applies to an admitted pod: the annotations are read when a lease is
+being sought, not while a job runs.
+
 ---
 
 ## 4. Deriving a display state

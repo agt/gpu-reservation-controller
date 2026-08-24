@@ -90,6 +90,7 @@ from .k8s_client import (
     emit_runtime_guaranteed_event,
     get_pod_booking_reference,
     get_pod_creation_timestamp,
+    get_pod_galends_annotations,
     get_pod_gpu_count,
     get_pod_guarantee_status,
     get_pod_min_runtime_seconds,
@@ -1152,6 +1153,13 @@ async def _preflight_ondemand_candidate(
     )
     ask = OnDemandAdmissionCandidate(
         pod_uid=uid,
+        # Evidence about the pod, alongside the ask itself.  The creation time is
+        # the candidate's own FIFO key, so the app orders by exactly what the
+        # controller orders by; the annotations come off *fresh_pod* rather than
+        # the candidate, so a pod re-annotated while it waited is offered as it
+        # is now, not as it was when first seen.
+        pod_created_at=candidate.pod_created_at,
+        pod_annotations=get_pod_galends_annotations(fresh_pod),
         username=candidate.pod_namespace,
         group_name=candidate.usage_group,
         gpu_class_id=gpu_class_id,

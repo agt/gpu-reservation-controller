@@ -417,6 +417,31 @@ class TestGuardFiveAtEveryGpuCount:
         assert status == m._PREFLIGHT_READY
 
 
+class TestTheAskCarriesTheAnnotation:
+    """The posture reaches app-side admission policy with no new field.
+
+    ``get_pod_galends_annotations`` forwards the whole ``galends/`` namespace
+    with the admission ask, so a policy deciding *which* waiting pods to admit
+    can see that a candidate asked for no guarantee -- and price that however it
+    likes -- without the ask needing a best-effort flag of its own.
+    """
+
+    def test_runtime_guarantee_none_is_forwarded(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        state = _state_ready()
+        state.node_free_by_class = {GPU_CLASS_LABEL: 4}
+        _, ask = _run_preflight(monkeypatch, m, state, _be_candidate())
+        assert ask.pod_annotations["galends/runtime-guarantee"] == "none"
+
+    def test_the_candidates_own_fifo_key_is_carried(self, monkeypatch):
+        m = _main_module(monkeypatch)
+        state = _state_ready()
+        state.node_free_by_class = {GPU_CLASS_LABEL: 4}
+        candidate = _be_candidate()
+        _, ask = _run_preflight(monkeypatch, m, state, candidate)
+        assert ask.pod_created_at == candidate.pod_created_at
+
+
 class TestTheAskCarriesNoDuration:
     def test_duration_is_zero(self, monkeypatch):
         m = _main_module(monkeypatch)
@@ -473,6 +498,10 @@ def _ask(duration_seconds=0):
     return OnDemandAdmissionCandidate(
         pod_uid="uid-1", username=USERNAME, group_name=GROUP_NAME,
         gpu_class_id=GPU_CLASS_ID, gpu_count=1, duration_seconds=duration_seconds,
+        # Evidence the app weighs alongside the ask; carried here so the shape
+        # matches what _preflight_ondemand_candidate really builds.
+        pod_created_at=datetime.now(timezone.utc),
+        pod_annotations={"galends/runtime-guarantee": "none"},
     )
 
 
