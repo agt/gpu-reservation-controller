@@ -154,6 +154,16 @@ class Config:
     ondemand_denial_event_repeat_minutes: int = 30
     preemption_delegate_selection: bool = True  # ask the app to choose victims; local random fallback
     ondemand_delegate_admission: bool = False  # ask the app which pending pods to admit; grant-all fallback
+    # Honour galends/runtime-guarantee=none by admitting the pod under a
+    # zero-length, zero-SU kind="best_effort" reservation.  Ships **off**, like
+    # ondemand_delegate_admission above: the app must be running a build that
+    # serves the best-effort create shape, and against one that is not, every
+    # such candidate would take a non-retryable 4xx into lease.error backoff.
+    # Unlike the node-level galends/force-node-capacity, whose annotation is its
+    # own opt-in because only a cluster admin can set it, this one is a *pod*
+    # annotation any user can write — so enabling the path is the operator's
+    # decision, not the pod author's.
+    best_effort_enabled: bool = False
     required_group_label: Optional[str] = None  # pod label naming the usage group to match; None = disabled
     # Fallbacks for the two things a pod must name itself before the controller
     # can mint a JIT lease on its behalf.  Both ship disabled, so an unconfigured
@@ -201,6 +211,7 @@ class Config:
             kubeconfig_path=os.environ.get("KUBECONFIG") or None,
             http_port=_env_int("HTTP_PORT", 8000, maximum=65535),
             ondemand_lease_enabled=_env_bool("ONDEMAND_LEASE_ENABLED", True),
+            best_effort_enabled=_env_bool("BEST_EFFORT_ENABLED", False),
             noshow_timeout_minutes=_env_int("NOSHOW_TIMEOUT_MINUTES", 15, minimum=0),
             noshow_grace_minutes=_env_int("NOSHOW_GRACE_MINUTES", 30, minimum=0),
             queue_processor_interval=_env_int("QUEUE_PROCESSOR_INTERVAL", 300),

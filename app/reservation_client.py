@@ -26,6 +26,7 @@ from .schemas import (
     GpuClassDetail,
     OnDemandAdmissionRequest,
     OnDemandAdmissionResponse,
+    BestEffortReservationRequest,
     OnDemandReservationRequest,
     OverstayReportRequest,
     PreemptionSelectionRequest,
@@ -248,11 +249,37 @@ class ReservationClient:
     async def create_ondemand_reservation(
         self, req: OnDemandReservationRequest
     ) -> LeaseAttempt:
-        """Request a JIT on-demand booking.
+        """Request a JIT on-demand booking — a *guaranteed*, SU-charged lease.
 
         Idempotent by ``req.idempotency_key`` (the admitting pod's UID): the
         app returns the original reservation for a repeated key rather than a
         duplicate, so the caller can safely retry with the same request.
+        """
+        return await self._post_reservation_create(req)
+
+    async def create_best_effort_reservation(
+        self, req: BestEffortReservationRequest
+    ) -> LeaseAttempt:
+        """Request a best-effort admission — a zero-length, zero-SU stub.
+
+        For a pod that declared ``galends/runtime-guarantee: none``.  The
+        returned reservation's window is already over, which is exactly what
+        makes the pod preemptible from its first tick.
+
+        Idempotent by ``req.idempotency_key`` (the pod's UID), as for a lease.
+
+        Shares :meth:`_post_reservation_create` with the lease path verbatim, so
+        the two get identical status classification, backoff and denial-event
+        plumbing — a best-effort 409 reaches the pod's owner as a Kubernetes
+        Event by the same route, with no second implementation to keep in step.
+        """
+        return await self._post_reservation_create(req)
+
+    async def _post_reservation_create(self, req) -> LeaseAttempt:
+        """POST a reservation-create body and classify the outcome.
+
+        Shared by the on-demand lease and best-effort admission paths; *req* is
+        any request model carrying an ``idempotency_key``.
 
         Returns a :class:`LeaseAttempt` rather than a bare reservation, because
         the caller must distinguish a 409 — the app's routine "infeasible right

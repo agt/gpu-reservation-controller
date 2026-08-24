@@ -86,6 +86,7 @@ from .k8s_client import (
     emit_preempted_event,
     emit_reservation_cancelled_event,
     emit_reservation_reassigned_event,
+    emit_best_effort_admitted_event,
     emit_runtime_guaranteed_event,
     get_pod_booking_reference,
     get_pod_creation_timestamp,
@@ -93,6 +94,7 @@ from .k8s_client import (
     get_pod_gpu_count,
     get_pod_guarantee_status,
     get_pod_min_runtime_seconds,
+    get_pod_runtime_guarantee_request,
     get_pod_phase,
     get_pod_usage_group,
     get_unschedulable_message,
@@ -118,6 +120,7 @@ from .schemas import (
     ForecastClassSummary,
     ForecastPod,
     ForecastPodBucket,
+    BestEffortReservationRequest,
     OnDemandAdmissionCandidate,
     OnDemandAdmissionRequest,
     OnDemandReservationRequest,
@@ -771,7 +774,12 @@ async def _record_guarantee(
     record the guarantee never rolls back an already-applied toleration.
     """
     try:
-        seconds = max(1, int((guaranteed_until - now).total_seconds()))
+        # A best-effort stub's window is already over, so its guarantee is
+        # genuinely zero -- the max(1, ...) floor exists to keep a real
+        # guarantee's countdown from rendering as 0, and applying it here would
+        # advertise a one-second guarantee nobody promised.
+        best_effort = reservation.kind == "best_effort"
+        seconds = 0 if best_effort else max(1, int((guaranteed_until - now).total_seconds()))
         await annotate_runtime_guarantee(
             pod_name,
             namespace,
@@ -780,9 +788,14 @@ async def _record_guarantee(
             _reservation_facts(reservation),
             admitted_at=now if first_admission else None,
         )
-        await emit_runtime_guaranteed_event(
-            fresh_pod, pod_name, namespace, seconds, guaranteed_until
-        )
+        if best_effort:
+            # Not RuntimeGuaranteed: that message would read "guaranteed for
+            # 0m00s, until <now>", which is nonsense to the pod's owner.
+            await emit_best_effort_admitted_event(fresh_pod, pod_name, namespace)
+        else:
+            await emit_runtime_guaranteed_event(
+                fresh_pod, pod_name, namespace, seconds, guaranteed_until
+            )
     except Exception as exc:  # noqa: BLE001
         log.warning("%s", kv(
             event="pod.guarantee_record_failed", ns=namespace, pod=pod_name, err=exc,
@@ -921,6 +934,7 @@ async def _preflight_ondemand_candidate(
     config: Config,
     uid: str,
     candidate: OnDemandCandidate,
+    claimed_by_class: Optional[dict[str, int]] = None,
 ) -> tuple[str, Optional[OnDemandAdmissionCandidate]]:
     """Vet a JIT candidate before it is offered to the app for admission.
 
@@ -933,9 +947,16 @@ async def _preflight_ondemand_candidate(
        passing into the horizon) — route there instead of requesting a lease.
     3. Guard 1 (Pending for a reason a lease can fix, and the class has nodes).
     4. Guard 3 (stuck reservation-holder safety interlock).
-    5. Guard 4 (over-committed gpu-class admission pause).
-    6. Guard 5 (per-node feasibility: no single node can host a multi-GPU ask).
-    7. Resolve the pod's gpu-class label to a numeric id and size the lease.
+    5. Guard 4 (over-committed gpu-class admission pause) — not applied to a
+       best-effort candidate, which consumes no app-side capacity to overcommit.
+    6. Guard 5 (per-node feasibility: no single node can host the ask) — applied
+       to a multi-GPU ask, and to **every** best-effort ask regardless of count,
+       since nothing app-side bounds how many of those are admitted.
+    7. Resolve the pod's gpu-class label to a numeric id and size the ask.
+
+    *claimed_by_class* is the GPUs already granted earlier in the current
+    admission batch, so guard 5 measures each candidate against what is left
+    rather than each against the same opening.
 
     Returns one of:
     - ``(_PREFLIGHT_REMOVE, None)`` — drop the candidate (gone/terminal, routed
@@ -1057,7 +1078,15 @@ async def _preflight_ondemand_candidate(
     # capacity audit; recomputed each tick so it clears when the deficiency is
     # resolved).  Admitting on-demand jobs onto a class the app believes is
     # larger than it physically is would mint leases that can never schedule.
-    if candidate.gpu_class_label in state.overcommitted_gpu_classes:
+    # A best-effort candidate is exempt: overcommit means the *app's* per-class
+    # count exceeds physical capacity, and a best-effort stub consumes no
+    # app-side count at all, so the mismatch says nothing about whether one can
+    # be admitted.  Guard 5 below checks the physical question directly, and for
+    # a best-effort candidate it checks it at every GPU count.
+    if (
+        not candidate.best_effort
+        and candidate.gpu_class_label in state.overcommitted_gpu_classes
+    ):
         log.info("%s", kv(
             event="ondemand.candidate_held", guard=4, reason="class_overcommitted",
             ns=candidate.pod_namespace, pod=candidate.pod_name,
@@ -1074,17 +1103,36 @@ async def _preflight_ondemand_candidate(
     # until a single-node opening appears.  Only a *known* per-class value blocks
     # (fail-open on unknown, so a stale/absent map never wedges admission); the
     # 1-GPU path is unaffected.  See ControllerState.node_free_by_class.
-    if candidate.gpu_requested >= 2:
+    #
+    # A **best-effort** candidate is checked at every GPU count, not just >=2.
+    # A guaranteed lease is bounded app-side -- it holds calendar capacity, so
+    # the app refuses to sell the same GPU-hour twice.  A best-effort stub is
+    # zero-length and therefore invisible to that arithmetic, so the app would
+    # admit an unbounded number of them onto the same idle GPU and every one
+    # after the first would sit Pending under a reservation it could never run
+    # under.  Nothing else closes that; this is the only physical bound on
+    # best-effort admission.
+    #
+    # *claimed_by_class* is the running tally of GPUs already granted earlier in
+    # this same batch, so a burst of candidates cannot each be measured against
+    # the same single-node opening.  It does not close the window between queue
+    # ticks (the snapshot refreshes on QUEUE_PROCESSOR_INTERVAL), which is
+    # acceptable precisely because a best-effort over-admission is cheap: no SU
+    # is charged, no capacity is held, and the pod simply waits.
+    if candidate.gpu_requested >= 2 or candidate.best_effort:
         largest_free = state.node_free_by_class.get(candidate.gpu_class_label)
-        if largest_free is not None and largest_free < candidate.gpu_requested:
-            log.info("%s", kv(
-                event="ondemand.candidate_held", guard=5, reason="no_single_node_fit",
-                ns=candidate.pod_namespace, pod=candidate.pod_name,
-                clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
-                node_free=largest_free,
-            ))
-            candidate.next_attempt_at = _short_retry_at(now)
-            return _PREFLIGHT_RETRY, None
+        if largest_free is not None:
+            claimed = (claimed_by_class or {}).get(candidate.gpu_class_label, 0)
+            if largest_free - claimed < candidate.gpu_requested:
+                log.info("%s", kv(
+                    event="ondemand.candidate_held", guard=5,
+                    reason="no_single_node_fit",
+                    ns=candidate.pod_namespace, pod=candidate.pod_name,
+                    clabel=candidate.gpu_class_label, gpus=candidate.gpu_requested,
+                    node_free=largest_free, claimed=claimed or None,
+                ))
+                candidate.next_attempt_at = _short_retry_at(now)
+                return _PREFLIGHT_RETRY, None
 
     gpu_class_id = state.gpu_class_ids.get(candidate.gpu_class_label)
     if gpu_class_id is None:
@@ -1096,7 +1144,13 @@ async def _preflight_ondemand_candidate(
         candidate.next_attempt_at = _jittered_retry_at(now)
         return _PREFLIGHT_RETRY, None
 
-    duration_seconds = candidate.min_runtime_seconds + config.ondemand_lease_buffer_minutes * 60
+    # A best-effort admission reserves no window, so there is nothing to size.
+    # The field is required by the delegation schema (shared with the lease
+    # path), so it carries 0 -- which is also what the app would price it at.
+    duration_seconds = (
+        0 if candidate.best_effort
+        else candidate.min_runtime_seconds + config.ondemand_lease_buffer_minutes * 60
+    )
     ask = OnDemandAdmissionCandidate(
         pod_uid=uid,
         # Evidence about the pod, alongside the ask itself.  The creation time is
@@ -1180,28 +1234,50 @@ async def _grant_and_admit(
     candidate: OnDemandCandidate,
     ask: OnDemandAdmissionCandidate,
 ) -> bool:
-    """Create a JIT lease for a preflight-approved candidate and admit its pod.
+    """Create the reservation for a preflight-approved candidate and admit its pod.
 
-    (Formerly steps 6-7 of ``_try_request_lease``.)  Requests the lease
-    (``create_ondemand_reservation``, idempotent by pod UID); on grant, admits
-    the pod under it and, if admission does not land, issues a compensating
-    cancel (``reason="controller-revoked"``) so the lease is not left dangling.
+    (Formerly steps 6-7 of ``_try_request_lease``.)  Requests either a
+    guaranteed JIT lease or — for a candidate that declared
+    ``galends/runtime-guarantee: none`` — a zero-length, zero-SU best-effort
+    stub.  Both are idempotent by pod UID; on grant, the pod is admitted under
+    the reservation and, if admission does not land, a compensating cancel
+    (``reason="controller-revoked"``) keeps it from dangling.
+
+    The two differ **only** in the request built here.  Everything downstream —
+    denial classification, the 2-5 min vs exponential backoff, the
+    ``OnDemandLeaseDenied`` Event, the upsert, the admission, the compensating
+    cancel — is shared, which is what keeps a best-effort 409 reaching the pod's
+    owner by the same route as a lease's with no second implementation.
 
     Returns ``True`` if the candidate is done (admitted, or the pod went terminal
-    while granting and the compensating cancel released the lease); ``False`` to
-    retry — ``candidate.next_attempt_at`` has been pushed forward.
+    while granting and the compensating cancel released the reservation);
+    ``False`` to retry — ``candidate.next_attempt_at`` has been pushed forward.
     """
     now = datetime.now(timezone.utc)
-    request = OnDemandReservationRequest(
-        username=ask.username,
-        group_name=ask.group_name,
-        gpu_class_id=ask.gpu_class_id,
-        gpu_count=ask.gpu_count,
-        duration_seconds=ask.duration_seconds,
-        idempotency_key=uid,
-        notes=f"on-demand lease for pod {candidate.pod_namespace}/{candidate.pod_name}",
-    )
-    attempt = await client.create_ondemand_reservation(request)
+    pod_ref = f"{candidate.pod_namespace}/{candidate.pod_name}"
+    if candidate.best_effort:
+        attempt = await client.create_best_effort_reservation(
+            BestEffortReservationRequest(
+                username=ask.username,
+                group_name=ask.group_name,
+                gpu_class_id=ask.gpu_class_id,
+                gpu_count=ask.gpu_count,
+                idempotency_key=uid,
+                notes=f"best-effort admission for pod {pod_ref}",
+            )
+        )
+    else:
+        attempt = await client.create_ondemand_reservation(
+            OnDemandReservationRequest(
+                username=ask.username,
+                group_name=ask.group_name,
+                gpu_class_id=ask.gpu_class_id,
+                gpu_count=ask.gpu_count,
+                duration_seconds=ask.duration_seconds,
+                idempotency_key=uid,
+                notes=f"on-demand lease for pod {pod_ref}",
+            )
+        )
     if not attempt.granted:
         if attempt.retryable:
             # The app's routine "infeasible right now" (409), or a transient
@@ -1239,7 +1315,11 @@ async def _grant_and_admit(
     log.info("%s", kv(
         event="lease.granted", rid=lease.id, ns=candidate.pod_namespace,
         pod=candidate.pod_name, clabel=candidate.gpu_class_label,
-        gpus=candidate.gpu_requested, lease_dur_s=ask.duration_seconds,
+        gpus=candidate.gpu_requested,
+        # A best-effort stub has no duration to report; omitted rather than
+        # printed as a 0 that would read like a zero-length *lease*.
+        lease_dur_s=None if candidate.best_effort else ask.duration_seconds,
+        best_effort=candidate.best_effort or None,
     ))
 
     async with state.reservation_lock:
@@ -1335,8 +1415,18 @@ async def _run_ondemand_admission_once(
 
     Preflights every due candidate (FIFO by creation time), offers the survivors
     to the app for LAS prioritisation when delegation is enabled, and creates +
-    admits a lease for each granted candidate.  A non-granted survivor cools down
-    for a normal-clock retry (same backoff as a denial).
+    admits a reservation for each granted candidate.  A non-granted survivor
+    cools down for a normal-clock retry (same backoff as a denial).
+
+    ``claimed`` tallies the GPUs each survivor would take, per class, so guard 5
+    measures a candidate against what is left of the class's largest single-node
+    opening rather than against the same snapshot every time.  Without it a
+    burst of best-effort pods would all clear a one-GPU opening in the same
+    batch — the app cannot catch that, since a best-effort stub holds no
+    capacity for it to count.  It is deliberately optimistic: it accrues at
+    preflight, before the app has granted anything, because a candidate the app
+    later defers costs only a slightly conservative guard for the rest of *this*
+    batch, whereas accruing after the grant would not bound the batch at all.
     """
     now = datetime.now(timezone.utc)
     ordered = sorted(
@@ -1344,15 +1434,21 @@ async def _run_ondemand_admission_once(
         state.ondemand_candidates.items(), key=lambda item: item[1].pod_created_at
     )
     ready: list[tuple[str, OnDemandCandidate, OnDemandAdmissionCandidate]] = []
+    claimed: dict[str, int] = {}
     for uid, candidate in ordered:
         if now < candidate.next_attempt_at:
             continue
-        status, ask = await _preflight_ondemand_candidate(state, config, uid, candidate)
+        status, ask = await _preflight_ondemand_candidate(
+            state, config, uid, candidate, claimed
+        )
         if status == _PREFLIGHT_REMOVE:
             state.remove_ondemand_candidate(uid)
         elif status == _PREFLIGHT_READY:
             assert ask is not None
             ready.append((uid, candidate, ask))
+            claimed[candidate.gpu_class_label] = (
+                claimed.get(candidate.gpu_class_label, 0) + candidate.gpu_requested
+            )
         # _PREFLIGHT_RETRY: leave in place; next_attempt_at already stamped.
 
     if not ready:
@@ -1736,6 +1832,17 @@ async def pod_watch_loop(
                                         state.dequeue_pod(uid)
                         continue
 
+                    # A pod may declare that it wants no runtime guarantee at
+                    # all.  It is then admitted under a zero-length, zero-SU
+                    # best-effort stub rather than a guaranteed lease, so it
+                    # needs no minimum runtime to size one -- which is the point:
+                    # a job with no runtime to promise had no way to say so, and
+                    # a 0 in the minimum-runtime annotation cannot mean it (that
+                    # is the floor for "at least this long").
+                    best_effort = (
+                        config.best_effort_enabled
+                        and get_pod_runtime_guarantee_request(pod) == "none"
+                    )
                     # DEFAULT_MINIMUM_RUNTIME_SECONDS stands in for a pod that never
                     # declared one (or declared junk).  0 means "no default", which
                     # leaves the historical behaviour: no annotation, no JIT.
@@ -1755,10 +1862,13 @@ async def pod_watch_loop(
                         if config.required_group_label
                         else (get_pod_usage_group(pod) or config.default_usage_group)
                     )
+                    # A best-effort pod needs no minimum runtime -- it sizes
+                    # nothing -- but still needs a usage group, because
+                    # group_name is a required natural key on the app's create.
                     jit_eligible = (
                         config.ondemand_lease_enabled
                         and phase == "Pending"
-                        and min_rt is not None
+                        and (min_rt is not None or best_effort)
                         and usage_group is not None
                     )
 
@@ -1772,8 +1882,10 @@ async def pod_watch_loop(
                                 clabel=gpu_class_label, reason="no_admittable_reservation",
                             ))
                             state.add_ondemand_candidate(
-                                uid, name, namespace, gpu_class_label, gpu_count, min_rt,
+                                uid, name, namespace, gpu_class_label, gpu_count,
+                                min_rt or 0,
                                 pod_created_at, group_label, usage_group,
+                                best_effort=best_effort,
                             )
                             # Responsive path: a newly-discovered candidate kicks an
                             # immediate admission batch covering it plus every other due
