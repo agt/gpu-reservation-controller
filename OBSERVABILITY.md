@@ -337,6 +337,7 @@ DEBUG only, unless noted.
 | DEBUG | `k8s.patch_pod` | `ns pod patch` + the patch's own fields |
 | DEBUG | `k8s.create_event` / `k8s.delete_pod` | `ns pod` (+ `reason`) |
 | DEBUG | `pod.already_gone` | `ns pod status` (404 on delete) |
+| DEBUG | `pod.annotations_truncated` | `ns pod count` — the pod carries more `galends/*` annotations than a JIT admission ask forwards; `count` is how many keys were dropped (sorted order, so the same subset every attempt) |
 | WARNING | `k8s.node_allocatable_invalid` | `node resource value` — treated as 0 |
 | WARNING | `k8s.node_capacity_forced_invalid` | `node annotation value` — unparseable or negative `galends/force-node-capacity`; the node keeps its allocatable count |
 | WARNING | `pod.annotation_invalid` | `ns pod annotation value` — malformed `galends/minimum-runtime-seconds` |
