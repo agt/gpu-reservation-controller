@@ -326,7 +326,10 @@ class OnDemandCandidate:
     pod_namespace: str
     gpu_class_label: str   # value of pod label "gpu-class" (e.g. "h100")
     gpu_requested: int     # nvidia.com/gpu units requested by this pod
-    min_runtime_seconds: int  # galends/minimum-runtime-seconds annotation value
+    # galends/minimum-runtime-seconds annotation value (or the configured
+    # default).  0 for a best-effort candidate, which asks for no runtime and
+    # therefore sizes nothing -- see best_effort below.
+    min_runtime_seconds: int
     pod_created_at: datetime  # metadata.creationTimestamp; used for FIFO ordering
     next_attempt_at: datetime  # earliest time to try requesting a lease
     group_label: Optional[str] = None  # value of REQUIRED_GROUP_LABEL pod label; None when disabled
@@ -341,6 +344,17 @@ class OnDemandCandidate:
     # of waiting for a periodic scan; other cooldowns (denial, guard-3/4) leave
     # this False so they are never short-circuited.  See main.pod_watch_loop.
     awaiting_schedule_signal: bool = False
+    # The pod declared galends/runtime-guarantee: none -- it wants no runtime
+    # guarantee at all, and is admitted under a zero-length, zero-SU
+    # kind="best_effort" reservation rather than a guaranteed lease.  It is
+    # therefore preemptible from its first tick, through the ordinary
+    # guarantee_end path (the stub's window is already over), with no
+    # best-effort branch anywhere in the preemption planner.  What it *does*
+    # change is admission: guard 4 does not apply (an app-side overcommit says
+    # nothing about a row that consumes no app-side capacity) and guard 5 is
+    # tightened to every GPU count, because nothing app-side bounds how many
+    # best-effort pods are admitted -- see main._preflight_ondemand_candidate.
+    best_effort: bool = False
     # Consecutive non-retryable lease failures (a 4xx that is not 409: a
     # read-only service key, a schema mismatch, an unknown group).  Waiting does
     # not fix these, so the backoff grows with the count instead of retrying at
@@ -1457,13 +1471,18 @@ class ControllerState:
         pod_created_at: datetime,
         group_label: Optional[str] = None,
         usage_group: Optional[str] = None,
+        best_effort: bool = False,
     ) -> None:
-        """Register a pod as a JIT on-demand lease candidate (idempotent).
+        """Register a pod as a JIT on-demand candidate (idempotent).
 
         If the pod is already registered with the same parameters this is a
         no-op.  A pod already tracked in ``occupancy`` (already placed) is also
-        left untouched.  *usage_group* is the group name the lease ask will
-        carry (see ``OnDemandCandidate.usage_group``).
+        left untouched.  *usage_group* is the group name the ask will carry
+        (see ``OnDemandCandidate.usage_group``).
+
+        *best_effort* marks a pod that declared ``galends/runtime-guarantee:
+        none``: it is admitted under a zero-length, zero-SU stub rather than a
+        guaranteed lease (see ``OnDemandCandidate.best_effort``).
         """
         # Already placed — don't re-add as a candidate.
         for occupants in self.occupancy.values():
@@ -1484,12 +1503,17 @@ class ControllerState:
             next_attempt_at=datetime.now(timezone.utc),
             group_label=group_label,
             usage_group=usage_group,
+            best_effort=best_effort,
         )
         self.ondemand_candidates[pod_uid] = candidate
         log.info("%s", kv(
             event="ondemand.candidate_added", ns=pod_namespace, pod=pod_name,
             poduid=pod_uid, clabel=gpu_class_label, gpus=gpu_requested,
-            min_runtime_s=min_runtime_seconds, group=usage_group,
+            # min_runtime_s is meaningless for a best-effort candidate (it sizes
+            # nothing), so it is omitted rather than printed as a misleading 0.
+            min_runtime_s=None if best_effort else min_runtime_seconds,
+            group=usage_group,
+            best_effort=best_effort or None,
         ))
 
     def remove_ondemand_candidate(self, pod_uid: str) -> None:
@@ -1719,6 +1743,14 @@ class ControllerState:
           Only a lease the app has simply not surfaced yet (replication lag between
           grant and snapshot) is bridged.
 
+        A ``kind="best_effort"`` stub is deliberately **not** preserved, and fails
+        on two counts (kind, and a window that closed the instant it opened).
+        Nothing needs protecting: its pod has no guarantee to lose, so resolving
+        to ``None`` after the fetch drops it reaches exactly the same conclusion
+        the stub itself does — past guarantee, preemptible.  The app also omits
+        these rows from the poll by default, so the common case is that they were
+        never in *fetched* to begin with.
+
         Must be called *before* ``state.reservations`` is replaced (it reads the
         current local set), mirroring the other fetch-time detectors.  Pure — no
         I/O, no state mutation.
@@ -1876,6 +1908,14 @@ class ControllerState:
         reservation is already a booking, or that has no open booking to merge
         into, is left untouched (it stays on its lease — correctly — until the
         booking opens).
+
+        A ``kind="best_effort"`` pod is likewise left to adoption rather than
+        merged, and correctly so: merge exists to re-link a pod *before* its
+        guarantee lapses, and a best-effort pod's already has — so
+        ``plan_pod_adoptions`` picks it up on the same tick and re-links it onto
+        the booking anyway (the free upgrade from unguaranteed to guaranteed).
+        Merge's other half would also be a no-op: there is no lease to retire
+        penalty-exempt, because a stub holds nothing and cost nothing.
 
         Budget is respected across the pass with a running per-reservation tally
         (mirrors ``plan_pod_adoptions``).  Pure — no I/O, no state mutation; the

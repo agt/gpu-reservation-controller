@@ -205,7 +205,8 @@ them. Worth surfacing read-only in a UI, since they explain admission behaviour:
 
 | Key | Purpose |
 |-----|---------|
-| `galends/minimum-runtime-seconds` | Positive integer. Required for a pod to be eligible for a just-in-time on-demand lease when no reservation is open; also sizes that lease. A pod without it simply waits for a matching reservation. |
+| `galends/minimum-runtime-seconds` | **Positive** integer. Required for a pod to be eligible for a just-in-time on-demand lease when no reservation is open; also sizes that lease. A pod without it simply waits for a matching reservation. `0` is **not** a way to ask for no guarantee — it is rejected with a `pod.annotation_invalid` warning; use `galends/runtime-guarantee` below. |
+| `galends/runtime-guarantee` | `none` — "admit me with no runtime guarantee at all". See §3.1. Any other value is ignored with a warning. |
 | `galends/usage-group` | The usage group a JIT lease is created under. Required for JIT eligibility unless the deployment identifies the group through a pod *label* instead (`REQUIRED_GROUP_LABEL`). |
 
 The pod's `gpu-class` **label** (not an annotation, so it is not in this file
@@ -217,6 +218,51 @@ carrying neither annotation is still JIT-eligible. Neither default is written
 back to the pod, so a UI cannot tell from the annotations alone whether a value
 came from the pod or from the deployment — read the absence of an annotation as
 "whatever the cluster defaults to", not as "unset".
+
+### 3.1 Running without a guarantee: `galends/runtime-guarantee: none`
+
+Ordinarily a pod with no open reservation gets a **lease** requested on its
+behalf: real reserved time, protected by a runtime guarantee, charged in Service
+Units. That is the right trade for most work, and the wrong one for a job that
+would rather start now and pay nothing — a short experiment, a notebook someone
+is watching, anything that checkpoints.
+
+```yaml
+metadata:
+  annotations:
+    galends/runtime-guarantee: "none"
+    galends/usage-group: "cse151b"        # still required
+```
+
+What that buys, and what it costs:
+
+- **No Service Units are charged.** The reservation minted for the pod is a
+  zero-length stub whose only job is to record that the pod was admitted.
+- **No guarantee, from the first second.** The pod is a preemption candidate
+  immediately. It is not preempted *arbitrarily* — the controller still only
+  reclaims capacity that something else actually needs, and it sacrifices
+  best-effort pods before leases and leases before bookings — but nothing
+  protects it, and no minimum runtime applies.
+- **It still has to fit.** Group membership, GPU-class access, per-reservation
+  GPU caps and group validity dates all apply exactly as for a lease, and the
+  controller will not admit the pod unless a node physically has the GPUs free.
+  A refusal arrives as an `OnDemandLeaseDenied` Event (§5.1), same as any other.
+
+`galends/minimum-runtime-seconds` is not required, and is ignored for sizing if
+present — there is nothing to size. The two compose without conflict: a pod may
+declare a runtime it *hopes* for and still waive the guarantee.
+
+**How it reads once admitted.** Two annotations look alarming and are not:
+`galends/guarantee-status` is `overstay` for the pod's whole life, and
+`galends/guaranteed-until` is the instant it started. Both are literally true —
+the guarantee ended when it began. `galends/reservation-kind: best_effort` is
+what distinguishes this from a job that really did outstay a guarantee, so a UI
+should check that first and show something like *"best-effort — no guarantee"*
+rather than *"overstaying"*. The admission Event is `BestEffortAdmitted`, not
+`RuntimeGuaranteed`.
+
+This is an opt-in the **deployment** must also enable (`BEST_EFFORT_ENABLED`);
+where it is off, the annotation is ignored and the pod is handled as before.
 
 ---
 

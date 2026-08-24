@@ -889,6 +889,76 @@ independently.
 existing pod-patch path); `ONDEMAND_HORIZON_MINUTES` and
 `ONDEMAND_LEASE_BUFFER_MINUTES` tune the routing horizon and lease sizing.
 
+### Best-effort admission
+
+A pod annotated `galends/runtime-guarantee: none` is asking for the one thing the
+system could not previously express: **no runtime guarantee at all** — idle GPUs
+now, yielded the moment anything else wants them, charged nothing.  Before this,
+a job with no runtime to promise either bought a guarantee it did not want or sat
+Pending; a `0` in `galends/minimum-runtime-seconds` looked like the way to say so
+and silently disqualified the pod instead (that `0` now logs
+`pod.annotation_invalid reason=not_positive` naming this annotation).
+
+Such a pod is admitted under a **zero-length, zero-SU `kind="best_effort"`
+reservation** (`POST /api/reservations` with `best_effort: true`;
+`ReservationClient.create_best_effort_reservation`, sharing
+`_post_reservation_create` with the lease path so denial classification, backoff
+and the `OnDemandLeaseDenied` Event are identical).
+
+**Almost nothing downstream needed a branch**, and that is the whole reason the
+representation is a stub rather than a "preemptible" flag on the pod.  The stub's
+window is already over, so `guarantee_end` resolves to an instant in the past and
+`_past_guarantee` — the single predicate victim eligibility, headroom and adoption
+all share — is true from the pod's first tick.  Boundary preemption, headroom and
+adoption therefore handle it correctly with no best-effort code in any of them.
+A flag would have had to be threaded through all four plus the status annotations.
+
+Three consequences worth knowing, each pinned by a test:
+
+- **The stub is not preserved across a fetch** (`preserve_local_ondemand_leases`
+  covers `kind="on_demand"` inside its window), and the app omits `best_effort`
+  rows from the poll by default, so it simply vanishes.  `guarantee_end` then
+  returns `None`, which reaches the *same* conclusion — past guarantee — so
+  nothing flaps.  Nothing is torn down when the pod ends either: a stub is
+  already over, holds nothing, and cost nothing.
+- **Merge skips it** (`plan_ondemand_merges` requires `kind="on_demand"`).  Merge
+  exists to re-link a pod *before* its guarantee lapses; a best-effort pod's
+  already has, so `plan_pod_adoptions` picks it up on the same tick and re-links
+  it onto a booking its user has since made — the free upgrade from unguaranteed
+  to guaranteed.
+- **`guarantee-status` reads `overstay` for the pod's whole life**, which is
+  literally true and deliberately not given a third literal (that would risk the
+  diff-and-skip drift `plan_guarantee_status` warns about).
+  `galends/reservation-kind: best_effort` is what disambiguates it for a consumer.
+  Admission emits **`BestEffortAdmitted`**, not `RuntimeGuaranteed` — whose
+  message would read "guaranteed for 0m00s, until *the instant the pod started*".
+
+**Admission is where the real work is**, because the app cannot bound this path:
+
+- **Guard 4 does not apply.**  Over-commit means the app's per-class count
+  exceeds physical capacity, and a best-effort stub consumes no app-side count,
+  so the mismatch says nothing about whether one can be admitted.
+- **Guard 5 applies at *every* GPU count**, not just ≥2, and is the **only**
+  physical bound on best-effort admission.  A guaranteed lease is bounded
+  app-side — it holds calendar capacity, so the app will not sell the same
+  GPU-hour twice — but a zero-length stub is invisible to that arithmetic, so the
+  app would admit an unbounded number onto the same idle GPU and every one after
+  the first would sit Pending.  The app's own 10-minute capacity probe is an
+  anti-thrash heuristic ("is this class about to be booked solid?"), **not**
+  admission control, for exactly this reason.
+- **An in-batch tally** (`claimed_by_class`, accrued at preflight in
+  `_run_ondemand_admission`) nets GPUs already taken by earlier candidates off
+  `node_free_by_class`, so a burst is not all measured against the same opening.
+  It does not close the window between queue ticks, which is acceptable because
+  an over-admitted best-effort pod costs nothing: no SU, no capacity, it just
+  waits.
+
+**App side**: `_prioritize_candidates` now sacrifices by what the reservation
+promised — `best_effort`, then `on_demand`, then `booking` — replacing the
+uniform-random placeholder.  **RBAC / config**: none new;
+`BEST_EFFORT_ENABLED=false` (the default) ignores the annotation entirely.
+User-facing documentation is `docs/POD-ANNOTATIONS.md` §3.1.
+
 ### Surfacing a lease denial to the pod's owner
 
 Every other reason a JIT candidate does not get a lease is the controller's own
@@ -1446,6 +1516,7 @@ the claimed set and the grace re-arm path above applies.
 | `ONDEMAND_LEASE_ENABLED` | `true` | Set to `false` to disable the JIT on-demand lease path entirely (a non-JIT-eligible pod still waits for a matching reservation; an ineligible one is left Pending) |
 | `ONDEMAND_HORIZON_MINUTES` | `30` | JIT routing horizon: a pod is queued for a reservation that opens within this many minutes (with budget) instead of requesting a lease |
 | `ONDEMAND_LEASE_BUFFER_MINUTES` | `10` | Minutes added to a pod's `galends/minimum-runtime-seconds` when sizing a requested JIT lease's duration |
+| `BEST_EFFORT_ENABLED` | `false` | Honour a pod's `galends/runtime-guarantee: none` by admitting it under a zero-length, zero-SU `kind="best_effort"` reservation instead of a guaranteed lease (see **Best-effort admission**). Ships dark: the app must serve the best-effort create shape, and against one that does not, every such candidate takes a non-retryable 4xx into `lease.error` backoff. The pod annotation alone is deliberately *not* the opt-in — unlike `galends/force-node-capacity`, any pod author can set it |
 | `ONDEMAND_DELEGATE_ADMISSION` | `false` | Ask the app which pending pods to admit on-demand from the eligible batch (`POST /api/reservations/ondemand-admission`) for LAS prioritization; `false` (or any app-call failure) grants every eligible candidate — the prior greedy per-pod behaviour. The app endpoint **is shipped**, but its selection is currently grant-all, so turning this on changes nothing yet; enable it once the app carries real admission policy |
 | `ONDEMAND_DENIAL_EVENT_ENABLED` | `true` | Mirror the app's **409** denial reason for a JIT lease onto the waiting pod as a `Warning` Event (`reason=OnDemandLeaseDenied`), so its owner can see why it is still Pending without the controller's logs (see **Surfacing a lease denial to the pod's owner**). Informational only; `false` disables |
 | `ONDEMAND_DENIAL_EVENT_REPEAT_MINUTES` | `30` | How long an **unchanged** denial reason is suppressed before being restated on the pod — the retry cadence is 2–5 min, and Events expire, so neither "every denial" nor "once only" is right. A **changed** reason emits immediately regardless; `0` emits on every denial |

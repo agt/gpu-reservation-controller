@@ -46,7 +46,10 @@ class ReservationResponse(BaseModel):
     su_cost_group: float = 0.0     # SU charged against the group pool
     su_cost_original: float = 0.0  # SU charged at creation; never rewritten
     status: str              # "active" | "cancelled"
-    kind: str                # "booking" | "on_demand"  (JIT lease)
+    # "booking" | "on_demand" (JIT lease) | "best_effort" (zero-length, zero-SU
+    # stub for a pod that asked for no runtime guarantee -- its window is already
+    # over, which is what makes the pod preemptible from its first tick).
+    kind: str
     notes: Optional[str] = None
     submitted_by_id: Optional[int] = None
     submitted_by: Optional[UserBrief] = None
@@ -159,6 +162,32 @@ class OnDemandReservationRequest(BaseModel):
     gpu_count: int
     duration_seconds: int
     on_demand: bool = True
+    idempotency_key: str
+    notes: Optional[str] = None
+
+
+class BestEffortReservationRequest(BaseModel):
+    """Body of a best-effort admission request, sent on behalf of a pending pod.
+
+    For a pod that declared ``galends/runtime-guarantee: none``.  The app records
+    a **stub** -- ``start_utc == end_utc == its own now``, ``su_cost = 0``,
+    ``kind="best_effort"`` -- which exists to give the pod a reservation to be
+    admitted under and its eventual overstay report a parent, not to hold
+    capacity.  Read back, the stub's window is already over, which is how
+    ``guarantee_end`` concludes the pod has no live guarantee and the preemption
+    planner treats it as a candidate from its first tick.
+
+    Deliberately carries **no** ``duration_seconds``: that is what separates this
+    from ``OnDemandReservationRequest``, whose lease is guaranteed and charged.
+    ``username`` / ``group_name`` are required natural keys app-side exactly as
+    for a lease, and ``idempotency_key`` is likewise the admitting pod's UID.
+    """
+
+    username: str
+    group_name: str
+    gpu_class_id: int
+    gpu_count: int
+    best_effort: bool = True
     idempotency_key: str
     notes: Optional[str] = None
 

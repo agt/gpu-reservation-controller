@@ -184,6 +184,7 @@ follow this grammar and are not expected to.
 | `bootstrap` | bool | whether `BOOTSTRAP_ADMIN_USERNAME` granted the new account admin (emitted only when it did) |
 | `direction` | `offer` \| `request` | which side proposed a GPU loan, and therefore which side approves it |
 | `forced` | bool | whether an administrator overrode a GPU-loan accommodation check, leaving a group over its resulting limit (emitted only when they did) |
+| `best_effort` | bool | whether an admission is best-effort — no runtime guarantee, zero SU (emitted only when it is) |
 | `banner` | bool | whether an effective-date shift announces itself on screen; `false` means this line is the only record of it |
 
 `reason` enums by event: `auth.login_failed` → `no_such_user`, `inactive`,
@@ -217,6 +218,7 @@ follow this grammar and are not expected to.
 | `dur_s` | int seconds | duration, where a line carries only one |
 | `min_runtime_s` | int seconds | a pod's `galends/minimum-runtime-seconds` ask |
 | `lease_dur_s` | int seconds | granted JIT lease length (`min_runtime_s` + buffer) |
+| `probe_min` | int minutes | best-effort admission probe window checked for capacity |
 | `waited_s` | int seconds | how long a JIT candidate waited before being deleted unplaced |
 | `guarantee_s` | int seconds | runtime-guarantee duration |
 
@@ -231,6 +233,7 @@ follow this grammar and are not expected to.
 | `total` | int | physical GPUs allocatable |
 | `app_gpus` / `phys_gpus` | int | capacity-audit counts |
 | `node_free` | int | largest single-node free GPUs for a class |
+| `claimed` | int | GPUs already claimed earlier in the same admission batch, netted off `node_free` (emitted only when non-zero) |
 | `demand` | int | GPUs demanded at a boundary, per class |
 | `kills` | int | victims selected at a boundary |
 | `short` | int | GPUs still short after preempting every eligible overstayer |

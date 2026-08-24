@@ -163,11 +163,26 @@ def get_unschedulable_message(pod) -> str:
     return (scheduled.message or "")[:120]
 
 
+# Recognised values of the galends/runtime-guarantee pod annotation. A set
+# rather than a bare literal so an added posture (say a future "soft") is one
+# entry plus its handling, not a new parse path.
+RUNTIME_GUARANTEE_VALUES = frozenset({"none"})
+
+
 def get_pod_min_runtime_seconds(pod) -> Optional[int]:
     """Read the ``galends/minimum-runtime-seconds`` annotation from *pod*.
 
     Returns the integer value if the annotation is present and parseable as a
     positive integer, or ``None`` otherwise.
+
+    A non-positive value is rejected like junk, and says so: the floor is what
+    makes the annotation mean "run me for at least this long", and ``0`` cannot
+    express that.  It reads as a request for no runtime guarantee, which is a
+    real thing to want and has its own annotation
+    (``galends/runtime-guarantee: none`` -- see
+    :func:`get_pod_runtime_guarantee_request`), so the warning names it.  Before
+    that annotation existed a ``0`` here silently disqualified the pod from JIT
+    admission with nothing logged at any level, and it sat Pending forever.
     """
     annotations: dict = pod.metadata.annotations or {}
     raw = annotations.get("galends/minimum-runtime-seconds")
@@ -175,14 +190,61 @@ def get_pod_min_runtime_seconds(pod) -> Optional[int]:
         return None
     try:
         value = int(raw)
-        return value if value > 0 else None
     except (ValueError, TypeError):
         log.warning("%s", kv(
             event="pod.annotation_invalid",
             ns=pod.metadata.namespace, pod=pod.metadata.name,
             annotation="galends/minimum-runtime-seconds", value=raw,
+            reason="not_an_integer",
         ))
         return None
+    if value <= 0:
+        log.warning("%s", kv(
+            event="pod.annotation_invalid",
+            ns=pod.metadata.namespace, pod=pod.metadata.name,
+            annotation="galends/minimum-runtime-seconds", value=raw,
+            reason="not_positive",
+            detail="use galends/runtime-guarantee=none to request no guarantee",
+        ))
+        return None
+    return value
+
+
+def get_pod_runtime_guarantee_request(pod) -> Optional[str]:
+    """Read the ``galends/runtime-guarantee`` annotation from *pod*.
+
+    The pod's own statement of what runtime protection it wants.  Exactly one
+    value is defined: ``"none"`` -- admit me with no runtime guarantee at all,
+    on idle capacity I will give back the moment anything else needs it.  Such a
+    pod is admitted under a zero-length, zero-SU ``kind="best_effort"``
+    reservation, so it is preemptible from its first tick.
+
+    Returns the recognised value, or ``None`` when the annotation is absent or
+    unrecognised.  An unrecognised value logs ``pod.annotation_invalid`` and
+    falls through to ordinary handling rather than failing the pod: the same
+    tolerant-parse-and-say-so posture ``config.py`` takes, for the same reason
+    (an operator who set something and saw no effect can find out why).
+
+    Deliberately separate from ``galends/minimum-runtime-seconds``, which sizes
+    a *lease*.  The two compose -- a pod may name a runtime and still waive the
+    guarantee -- and keeping the posture out of the duration means neither has
+    to carry a sentinel value for the other's sake.
+    """
+    annotations: dict = getattr(pod.metadata, "annotations", None) or {}
+    raw = annotations.get("galends/runtime-guarantee")
+    if raw is None:
+        return None
+    value = raw.strip().lower() if isinstance(raw, str) else raw
+    if value in RUNTIME_GUARANTEE_VALUES:
+        return value
+    log.warning("%s", kv(
+        event="pod.annotation_invalid",
+        ns=pod.metadata.namespace, pod=pod.metadata.name,
+        annotation="galends/runtime-guarantee", value=raw,
+        reason="unrecognised_value",
+        detail="expected: " + ", ".join(sorted(RUNTIME_GUARANTEE_VALUES)),
+    ))
+    return None
 
 
 def get_pod_usage_group(pod) -> Optional[str]:
@@ -328,7 +390,9 @@ class ReservationFacts:
     that ``galends/guaranteed-until`` carries.
     """
 
-    kind: str            # "booking" | "on_demand" (a just-in-time lease)
+    # "booking" | "on_demand" (a just-in-time lease) | "best_effort" (a
+    # zero-length stub for a pod that asked for no runtime guarantee)
+    kind: str
     start_utc: datetime
     end_utc: datetime
     gpu_count: int
@@ -1204,6 +1268,43 @@ async def emit_runtime_guaranteed_event(
     log.info("%s", kv(
         event="k8s.event_emitted", ns=namespace, pod=pod_name,
         reason="RuntimeGuaranteed", guarantee_s=seconds, until=until_str,
+    ))
+
+
+async def emit_best_effort_admitted_event(
+    pod,
+    pod_name: str,
+    namespace: str,
+) -> None:
+    """Create a Kubernetes Event linked to *pod* with reason='BestEffortAdmitted'.
+
+    The counterpart to ``RuntimeGuaranteed`` for a pod that asked for no
+    guarantee.  It gets its own Event rather than a degenerate guarantee one:
+    that message would read "GPU access guaranteed for 0m00s, until <the instant
+    the pod started>", which is both nonsense and alarming to the one person who
+    reads it — the pod's owner, running ``kubectl describe``.
+
+    ``Normal``, not ``Warning``: nothing has gone wrong.  The pod got exactly
+    what it asked for, and the message says what that means in practice.
+    """
+    await _emit_pod_event(
+        pod.metadata.uid,
+        pod_name,
+        namespace,
+        name_prefix="gpu-best-effort-",
+        reason="BestEffortAdmitted",
+        action="AdmitBestEffort",
+        message=(
+            "Admitted on a best-effort basis at this pod's own request "
+            "(galends/runtime-guarantee=none). GPU access is not guaranteed for "
+            "any length of time and no Service Units are charged: the pod may be "
+            "preempted as soon as any other job needs the capacity. Remove the "
+            "annotation, or book a reservation, to get a guaranteed runtime."
+        ),
+    )
+    log.info("%s", kv(
+        event="k8s.event_emitted", ns=namespace, pod=pod_name,
+        reason="BestEffortAdmitted",
     ))
 
 

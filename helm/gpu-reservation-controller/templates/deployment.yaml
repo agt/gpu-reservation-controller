@@ -76,6 +76,8 @@ spec:
               value: {{ .Values.config.ondemandLeaseBufferMinutes | quote }}
             - name: ONDEMAND_DELEGATE_ADMISSION
               value: {{ .Values.config.ondemandDelegateAdmission | quote }}
+            - name: BEST_EFFORT_ENABLED
+              value: {{ .Values.config.bestEffortEnabled | quote }}
             - name: NOSHOW_TIMEOUT_MINUTES
               value: {{ .Values.config.noshowTimeoutMinutes | quote }}
             - name: NOSHOW_GRACE_MINUTES

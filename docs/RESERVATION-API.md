@@ -280,6 +280,7 @@ and `continue` are unchanged, so an observer may cancel only their own booking.
 | `group_id` | integer | — | Filter by usage group ID |
 | `include_teammates` | boolean | `false` | Switch to the personal *"me + my team"* scope — own reservations **plus** teammates' reservations in team-enabled groups (Team Mode). Replaces the default own+managed scope (and is **not** widened by `researcher_mode` — the personal pages stay personal), and applies to **any** user token including admins and auditors. Ignored for service keys, which have no user identity to scope to. |
 | `include_consumed_cancellations` | boolean | `false` | Widen `status=active` to also return cancellations that consumed something: the reservation had already started, **or** it retained a late-cancellation SU charge (`su_cost_user > 0`). A cancellation that neither ran nor was charged is still excluded. No-op for `status=all`; ignored for `status=cancelled` (which it could only narrow) and for `status=recent` (which already returns every status inside its window). |
+| `include_best_effort` | boolean | `false` | Include `kind="best_effort"` rows, which are omitted by default under **every** `status` (including `all`). These are zero-length stubs, one per admitted best-effort pod, holding no capacity; their empty window satisfies every `date_start`/`date_end` overlap filter, so returning them by default would flood a routine poll. |
 | `created_after` | datetime | — | Include reservations created at or after this time |
 | `created_before` | datetime | — | Include reservations created at or before this time |
 | `limit` | integer | 200 | Max records (1–1000) |
@@ -358,12 +359,19 @@ Every reservation has a `kind` field:
 |--------|-----------|-----------|-------------|
 | `"booking"` | A user through the web UI (or an admin/manager on a user's behalf) | Whole hours — **except** a booking minted by `POST /api/reservations/{id}/continue`, which is anchored at "now" with an arbitrary second-granularity window (`continued_from_id` set) | `user_id` + `group_id` always set |
 | `"on_demand"` | The Kubernetes controller via §"Creating on-demand reservations" | Arbitrary timestamps, anchored at creation time | `user_id` + `group_id` always set |
+| `"best_effort"` | The Kubernetes controller via §"Creating best-effort reservations" | **Zero-length** — `start_dt == end_dt`, anchored at creation time | `user_id` + `group_id` always set |
 
-Both kinds are returned by `GET /api/reservations` under every `status` filter —
-there is no kind-based filtering. (Historical note: a third kind, `"reclaim"`,
-existed before the lease model; those rows carried no user/group and are deleted
-by migration, but `user_id`/`group_id` remain nullable in the schema for
-pre-migration data.)
+`"booking"` and `"on_demand"` are returned by `GET /api/reservations` under every
+`status` filter. `"best_effort"` is **omitted by default** and returned only when
+`include_best_effort=true` is passed: one such row exists per admitted
+best-effort pod, they hold no capacity, and their zero-length window satisfies
+every overlap filter, so returning them by default would flood the controller's
+routine poll with rows it does not need. `status="all"` does not override this —
+pass the parameter.
+
+(Historical note: a fourth kind, `"reclaim"`, existed before the lease model;
+those rows carried no user/group and are deleted by migration, but
+`user_id`/`group_id` remain nullable in the schema for pre-migration data.)
 
 ### Creating on-demand reservations
 
@@ -502,6 +510,82 @@ the rolling horizon reaches the requested end). `duration_over_member_cap` (the
 48-hour cap) and `group_on_demand_only` are likewise web-only and always
 `retryable: false`.
 
+### Creating best-effort reservations
+
+```
+POST /api/reservations
+X-API-Key: gpures_...            (read_write scope required)
+Content-Type: application/json
+```
+
+```json
+{
+  "best_effort": true,
+  "username": "alice",
+  "group_name": "cse151b",
+  "gpu_class_id": 3,
+  "gpu_count": 1,
+  "idempotency_key": "8f14e45f-ceea-4e07-8c2f-pod-uid",
+  "notes": "best-effort admission for pod train-7c9"
+}
+```
+
+For a pod whose owner has declared that it needs **no runtime guarantee** — it
+will take idle GPUs and yield them the moment anything else needs them. There is
+no window to reserve for such a job, so the app records a **stub**: a
+`kind="best_effort"` reservation with `start_dt == end_dt == now` and
+`su_cost = 0`.
+
+The stub exists so the pod has a reservation to be admitted under and so its
+eventual overstay report (§`POST /api/reservations/{id}/overstay`) has a parent.
+It is **not** a capacity claim. Being zero-length is what makes it free in both
+senses: it costs no SU, and it is excluded from every overlap/peak computation,
+so it can never deny a real booking. Read back, its `end_utc` is already in the
+past, which is how the controller concludes the pod has no live guarantee and
+may be preempted at any time.
+
+Deliberately carries **no `duration_seconds`**: a caller with a runtime in mind
+wants an on-demand lease, which is guaranteed and charged. `idempotency_key` is
+the pod's UID, exactly as for a lease — a repeat returns the original row with
+**200** and creates nothing.
+
+Semantics:
+
+- **Every non-capacity gate a lease faces applies**, identically and through
+  shared code: the group must exist, be active, and be valid today (with the
+  same ±90-day privileged grace); the named user must exist — or be provisioned,
+  when the group sets `on_demand_auto_join` — and be a member; the GPU class must
+  be active and reachable from the group; `max_gpus_per_reservation` binds.
+
+- **The gates that price or bound a span do not apply**, because a zero-length
+  row has no span: `max_reservation_hours`, the per-member SU budget, and the
+  group SU pool are all skipped. `su_cost`, `su_cost_user`, `su_cost_group` and
+  `su_cost_original` are all `0`.
+
+- **A capacity probe runs over `[now, now + best_effort_probe_minutes)`** — the
+  ordinary three-tier physical/cohort/group analysis, over a window borrowed
+  from `site_settings.best_effort_probe_minutes` (default 10, admin-editable;
+  `0` disables the probe). Its borrowing verdict is discarded: a reservation
+  holding no hours cannot have borrowed any.
+
+  > **The probe is an anti-thrash heuristic, not admission control.** It answers
+  > "is this class about to be booked solid?", so free work is not started into a
+  > window that will immediately reclaim it. It cannot answer "is there a free
+  > GPU right now": best-effort rows are zero-length and therefore invisible to
+  > the peak computation, so the probe reports the same headroom to the first
+  > best-effort pod and the fiftieth. **Physical feasibility is the controller's
+  > responsibility**, checked against live Kubernetes node state before it calls
+  > this endpoint at all. An app-side caller must not treat a 201 here as a
+  > promise that a GPU is free.
+
+- **Status codes** follow the same contract as a lease: unknown user/group/class
+  → **404**; every policy or capacity denial → **409** with a human-readable
+  `detail` and the admission-denial envelope of §2. The controller mirrors a 409
+  `detail` onto the waiting pod as a Kubernetes Event, so the pod's owner reads
+  the reason without needing cluster-log access.
+
+- **Human callers get 403**, as with a lease; this path is service-key only.
+
 ### `POST /api/reservations/{id}/cancel`
 
 Cancel a reservation on the controller's behalf, recording a machine-readable
@@ -635,16 +719,25 @@ pending pods are eligible for a JIT lease this round (GPU-only-pending, not
 matched by an open reservation, past their retry cooldown, of a class that is
 not under the stuck-holder safety interlock). This endpoint decides *which* of
 those eligible pods to admit now, so prioritisation policy lives in the app
-rather than the controller. Each candidate is the exact "ask" a
-`POST /api/reservations` create would carry, so the app can weigh it against
-priority **and** the same feasibility analysis a create performs.
+rather than the controller. Each candidate carries the exact "ask" a
+`POST /api/reservations` create would make, so the app can weigh it against
+priority **and** the same feasibility analysis a create performs — plus two
+fields that are **evidence about the waiting pod** rather than part of that ask
+(`pod_created_at`, `pod_annotations`). Nothing in the create carries those two;
+they exist so admission policy can price a candidate on how long it has been
+waiting and on what its owner declared about the job.
 
 ```json
 {
   "candidates": [
-    { "pod_uid": "abc-123", "username": "alice", "group_name": "cse142",
+    { "pod_uid": "abc-123", "pod_created_at": "2026-08-21T17:00:00Z",
+      "pod_annotations": { "galends/minimum-runtime-seconds": "1800",
+                           "galends/usage-group": "cse142" },
+      "username": "alice", "group_name": "cse142",
       "gpu_class_id": 10, "gpu_count": 1, "duration_seconds": 1800 },
-    { "pod_uid": "def-456", "username": "bob", "group_name": null,
+    { "pod_uid": "def-456", "pod_created_at": "2026-08-21T17:05:00Z",
+      "pod_annotations": {},
+      "username": "bob", "group_name": null,
       "gpu_class_id": 10, "gpu_count": 2, "duration_seconds": 1200 }
   ]
 }
@@ -653,11 +746,28 @@ priority **and** the same feasibility analysis a create performs.
 | Field | Meaning |
 |-------|---------|
 | `candidates[].pod_uid` | Opaque pod identifier; echoed back verbatim in the response (equals the create's `idempotency_key`) |
+| `candidates[].pod_created_at` | The pod's Kubernetes `metadata.creationTimestamp`, **UTC** — the same key the controller FIFO-orders its own batch by, so an age computed from it is real queueing delay rather than time since this batch was assembled |
+| `candidates[].pod_annotations` | Every `galends/`-prefixed annotation on the pod, as a string map. `{}` is legitimate — a pod covered by the controller's `DEFAULT_MINIMUM_RUNTIME_SECONDS` / `DEFAULT_USAGE_GROUP` declares nothing itself |
 | `candidates[].username` | Reservation owner the lease would be created for (the pod's namespace) |
 | `candidates[].group_name` | Usage group the lease would be created under, or `null` when group matching is disabled |
 | `candidates[].gpu_class_id` | Numeric GPU-class id the lease would target |
 | `candidates[].gpu_count` | GPUs the pod requests |
 | `candidates[].duration_seconds` | Lease duration the controller would request (pod minimum-runtime + buffer) |
+
+`pod_annotations` values are whatever the pod's creator wrote, and Kubernetes
+lets one object carry 256 KiB of annotations — which a batch would otherwise
+ship per candidate, every 2–5 minutes, for as long as the pod stayed Pending. The
+**controller** therefore bounds them before sending: at most **32 keys** (taken
+in sorted order, so the same pod presents the same subset on every attempt) and
+**1024 characters per value**. The bound lives on the sending side on purpose,
+because this endpoint's schema is deliberately lenient: one candidate the app
+refuses 422s the *whole* batch, and none of the pods in it get admitted that
+round. For the same reason both fields are **optional app-side** — a controller
+predating them offers neither, and must not have its batch rejected for it.
+
+The app is free to ignore both. They are advisory inputs to selection, never
+inputs to the lease that follows: the subsequent `POST /api/reservations` carries
+the ask alone.
 
 The app returns the subset of `pod_uid`s it grants admission this round:
 
@@ -724,10 +834,23 @@ that prioritisation policy lives in the app rather than the controller.
 | `candidates[].gpu_count` | GPUs the candidate holds (used for greedy coverage) |
 | `candidates[].reservation_id` | The candidate's booking-reference — the app's handle to the reservation (owner/group/kind) for prioritisation |
 
-Per class, the app orders that class's candidates by its selection policy
-(**uniform-random for now**) and greedily accepts them until the class's
-`needed` GPU shortfall is covered — which may overshoot when a chosen pod holds
-more GPUs than the residual need. A class whose candidate pool cannot cover its
+Per class, the app orders that class's candidates by its selection policy and
+greedily accepts them until the class's `needed` GPU shortfall is covered —
+which may overshoot when a chosen pod holds more GPUs than the residual need.
+
+The policy is **by reservation kind, then uniform-random within a kind**. A pod
+is sacrificed in the order its reservation promised it least: `best_effort`
+first (its owner asked for no guarantee, and it was free), then `on_demand` (a
+lease the controller minted, already past its guarantee, but charged), then
+`booking` (a window its owner chose and paid for in advance). A candidate whose
+reservation cannot be loaded sorts with `booking`, the most-protected tier, so
+missing data never makes a pod *more* likely to die. Ordering within a tier is
+uniform-random — owner, group and SU are reachable through `reservation_id` and
+are **not** yet consulted.
+
+This decides only *order* within a pool the controller has already declared
+eligible; it never spares a pod the controller would not have killed, and never
+widens the pool. A class whose candidate pool cannot cover its
 shortfall contributes every candidate it has (the controller records the
 remainder as unmet). The response lists the chosen `pod_uid`s:
 

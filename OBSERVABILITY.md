@@ -135,7 +135,7 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 | INFO | `pod.toleration_applied` | `ns pod tol_key tol_value booking_ref` | The patch landed. |
 | INFO | `pod.admitted` | `ns pod rid clabel gpus free reserved until` | The one line to grep for a successful admission. |
 | INFO | `pod.guarantee_recorded` | `ns pod guarantee_s until` | Informational annotations; Kubernetes enforces nothing. |
-| INFO | `k8s.event_emitted` | `ns pod reason` (+ `guarantee_s until` \| `rid until` \| `clabel gpus`) | `reason=RuntimeGuaranteed` \| `Preempted` \| `ReservationCancelled` \| `ReservationReassigned` \| `OverstayRelinked` \| `OnDemandLeaseDenied`. The last is the only `Warning`-type Event, and the only one addressed to the pod's *owner* rather than to an operator. |
+| INFO | `k8s.event_emitted` | `ns pod reason` (+ `guarantee_s until` \| `rid until` \| `clabel gpus`) | `reason=RuntimeGuaranteed` \| `BestEffortAdmitted` \| `Preempted` \| `ReservationCancelled` \| `ReservationReassigned` \| `OverstayRelinked` \| `OnDemandLeaseDenied`. `BestEffortAdmitted` replaces `RuntimeGuaranteed` for a pod admitted with no runtime guarantee (a `RuntimeGuaranteed` message would read "guaranteed for 0m00s, until \<the instant the pod started\>"). `OnDemandLeaseDenied` is the only `Warning`-type Event; it and `BestEffortAdmitted` are the two addressed to the pod's *owner* rather than to an operator. |
 | INFO | `pod.dequeued` | `ns pod reason` | e.g. `toleration_already_present`. |
 | INFO | `pod.queue_dropped` | `ns pod` + `rid reason` \| `phase reason` | Window expired, reservation cancelled with no replacement, or the pod went terminal. |
 | INFO | `pod.requeued` | `ns pod reason old.rid new.rid` | Re-matched after its reservation was cancelled. |
@@ -164,14 +164,14 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 
 | Level | `event=` | Fields | Notes |
 |---|---|---|---|
-| INFO | `ondemand.candidate_added` | `ns pod poduid clabel gpus min_runtime_s group` | |
+| INFO | `ondemand.candidate_added` | `ns pod poduid clabel gpus group` (+ `min_runtime_s` \| `best_effort`) | `min_runtime_s` is absent for a **best-effort** candidate, which sizes nothing; `best_effort` is emitted only when true. |
 | DEBUG | `ondemand.candidate_removed` | `ns pod poduid` | |
 | INFO | `ondemand.candidate_dropped` | `ns pod reason` (+ `phase` \| `detail`) | Terminal phase, or Pending for something no lease can fix (`detail` carries the scheduler's verdict). |
-| DEBUG/INFO/WARNING | `ondemand.candidate_held` | `guard reason ns pod` (+ `clabel gpus node_free nodes`) | **The guard number is the field** — see below. |
+| DEBUG/INFO/WARNING | `ondemand.candidate_held` | `guard reason ns pod` (+ `clabel gpus node_free claimed nodes`) | **The guard number is the field** — see below. `claimed` (guard 5) is the GPUs already taken by earlier candidates in the same batch. |
 | DEBUG | `ondemand.schedule_verdict` | `ns pod` | Scheduler verdict arrived; re-attempting immediately. |
 | INFO | `lease.denied` | `ns pod clabel gpus status detail` | App refused the ask as infeasible (409), or a transient network/5xx failure; cooldown 2–5 min. `detail` is the app's reason — absent when the app never answered. On a 409 it is also mirrored to the pod as an `OnDemandLeaseDenied` Event. |
 | WARNING | `lease.error` | `ns pod clabel gpus status fails retry_s` | **A fault waiting cannot fix** — a 4xx that is not 409 (read-only service key, schema mismatch, unknown group). Exponential backoff to 30 min; `grep 'event=lease.error'` is how a misconfigured deployment announces itself. |
-| INFO | `lease.granted` | `rid ns pod clabel gpus lease_dur_s` | |
+| INFO | `lease.granted` | `rid ns pod clabel gpus` (+ `lease_dur_s` \| `best_effort`) | `lease_dur_s` is absent for a **best-effort** admission, which reserves no window; `best_effort` is emitted only when true. |
 | WARNING | `lease.admission_failed` | `rid ns pod detail` | Grant landed but admission did not — a compensating cancel follows. |
 | INFO | `lease.teardown` | `rid class reason` | The lease's pod went away; the lease is cancelled. |
 | INFO | `ondemand.unmet_demand` | `ns pod clabel gpus min_runtime_s submitted deleted waited_s` | **Demand the controller never satisfied** — the pod was deleted before any lease. |
@@ -189,8 +189,8 @@ Not leader election: the lease exists so a *second* controller refuses to run, b
 | 1 | `schedule_verdict_pending` | No `PodScheduled` verdict yet, so there is nothing to classify. Transient — the MODIFIED fast path shortens it to ~1 s. |
 | 1 | `no_class_nodes` | The class is *known* to have no schedulable node carrying its reservation taint (fully drained/cordoned). Fail-open when unknown. |
 | 3 | `stuck_holder_interlock` | A reservation holder is stuck Pending on this class. |
-| 4 | `class_overcommitted` | App-side capacity exceeds physical (see §8). |
-| 5 | `no_single_node_fit` | No single node has enough free GPUs for a ≥2-GPU ask. Fail-open when unknown. |
+| 4 | `class_overcommitted` | App-side capacity exceeds physical (see §8). **Not applied to a best-effort candidate**, which consumes no app-side capacity to overcommit. |
+| 5 | `no_single_node_fit` | No single node has enough free GPUs for the ask, net of `claimed` (GPUs taken by earlier candidates this batch). Applies to a ≥2-GPU ask, and to **every** best-effort ask — see below. Fail-open when unknown. |
 | — | `class_id_unknown` | The `gpu-class` label has no numeric id yet. |
 
 Guard 1 is the only one that also **drops** rather than holds: a candidate the
@@ -206,6 +206,14 @@ population; a candidate that stays there across ticks is worth a look.
 
 `grep 'event=ondemand.candidate_held guard=4'` answers "how often is the capacity
 audit blocking admission" without matching on message text.
+
+Guard 5 is the **only** physical bound on best-effort admission, which is why it
+applies there at every GPU count rather than only at ≥2.  A guaranteed lease is
+bounded app-side — it holds calendar capacity, so the app will not sell the same
+GPU-hour twice — but a best-effort reservation is zero-length and therefore
+invisible to that arithmetic, so the app would admit an unbounded number of them
+onto the same idle GPU.  `grep 'event=ondemand.candidate_held guard=5'` rising on
+1-GPU asks is the cluster being physically full, not a misconfiguration.
 
 ---
 

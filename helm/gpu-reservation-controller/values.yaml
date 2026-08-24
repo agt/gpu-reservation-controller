@@ -94,6 +94,15 @@ config:
   # (greedy per-pod).
   ondemandDelegateAdmission: false
 
+  # Honour a pod's galends/runtime-guarantee: "none" annotation by admitting it
+  # under a zero-length, zero-SU kind="best_effort" reservation instead of a
+  # guaranteed lease: no runtime guarantee, no Service Units, and preemptible
+  # from the first second (sacrificed ahead of leases and bookings when capacity
+  # is reclaimed). Requires a reservation app serving the best-effort create
+  # shape -- against one that does not, every such pod backs off on a
+  # non-retryable 4xx. false ignores the annotation entirely.
+  bestEffortEnabled: false
+
   # Minutes after a reservation window opens before the holder is declared a
   # no-show and the controller durably cancels it app-side, freeing the
   # window for re-booking.
