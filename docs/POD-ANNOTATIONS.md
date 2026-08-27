@@ -21,9 +21,12 @@ account, no network call to the reservation app.
 
 ## 1. Wiring: exposing annotations to the container
 
-Project **all** of `metadata.annotations` into a single file. Add to the pod
-spec (this is the workload's own spec — JupyterHub `singleuser.storage.extraVolumes`,
-a VS Code dev-container pod template, etc. — the controller does not add it):
+Project **all** of `metadata.annotations` into a single file, and each of the
+three `termination-warning-*` keys into a file of its own — those are the ones a
+consumer polls, and a file per key is readable without the parser below. Add to
+the pod spec (this is the workload's own spec — JupyterHub
+`singleuser.storage.extraVolumes`, a VS Code dev-container pod template, etc. —
+the controller does not add it):
 
 ```yaml
 spec:
@@ -34,6 +37,15 @@ spec:
           - path: annotations
             fieldRef:
               fieldPath: metadata.annotations
+          - path: termination-warning-at
+            fieldRef:
+              fieldPath: metadata.annotations['galends/termination-warning-at']
+          - path: termination-warning-risk
+            fieldRef:
+              fieldPath: metadata.annotations['galends/termination-warning-risk']
+          - path: termination-warning-message
+            fieldRef:
+              fieldPath: metadata.annotations['galends/termination-warning-message']
   containers:
     - name: notebook
       volumeMounts:
@@ -41,6 +53,10 @@ spec:
           mountPath: /etc/podinfo
           readOnly: true
 ```
+
+That yields four files under `/etc/podinfo`: `annotations` (the whole map) plus
+`termination-warning-at`, `termination-warning-risk` and
+`termination-warning-message`.
 
 **Use a volume, not `env:`.** Downward-API *environment variables* are resolved
 once at container start and never change; every annotation here is written
@@ -88,19 +104,115 @@ def parse_downward_annotations(path="/etc/podinfo/annotations") -> dict[str, str
     return out
 ```
 
+### The three single-key files
+
+A subscripted `fieldPath` projects one annotation's value on its own, and those
+files are deliberately *not* in the format above:
+
+```console
+$ cat /etc/podinfo/termination-warning-at; echo
+2026-08-21T17:30:16Z
+$ cat /etc/podinfo/termination-warning-risk; echo
+0.33
+```
+
+- **The value is raw** — no surrounding quotes, no backslash escaping, and no
+  trailing newline. `$(cat …)` *is* the value; nothing has to unquote it.
+- **An absent annotation is an empty file, not a missing one.** The kubelet
+  creates all four files when the pod starts and writes an empty value for a key
+  the pod does not carry — which is the normal state for these three, since they
+  are present only while the pod is at risk (§2). Test with `-s` ("exists and is
+  non-empty"), never `-f` or `-e`: those are true from the pod's first second.
+- **All four files change together.** They are one volume, so the kubelet swaps
+  the whole payload atomically — the single-key files can never disagree with
+  each other or with the map.
+- **Only these three earn a file.** Everything else in §2 is read as a set, when
+  something renders — that is what the map is for. The warning keys are the ones
+  that appear and vanish on their own while a job runs, and the thing most likely
+  to be watching them is a shell script with no parser in it.
+
 ### Update semantics
 
 - The kubelet refreshes the file on its sync loop — **up to ~60 s** (the
   kubelet's `syncFrequency`, default `1m`) after an annotation changes. Budget
   for this on top of the controller's own cadence (§7).
-- The mount is the usual `..data` symlink swap: `/etc/podinfo/annotations` is a
-  symlink, replaced atomically on each update. An `inotify` watcher must watch
-  the **directory** (`IN_MOVED_TO` / `IN_CREATE` on `..data`), not the file
-  inode, or it will only ever fire once. Polling the file every 15–30 s is
-  simpler and perfectly adequate for these fields.
+- The mount is the usual `..data` symlink swap: every file in `/etc/podinfo` is
+  a symlink, and the whole set is replaced atomically on each update. An
+  `inotify` watcher must watch the **directory** (`IN_MOVED_TO` / `IN_CREATE` on
+  `..data`), not a file inode, or it will only ever fire once. Polling every
+  15–30 s is simpler and perfectly adequate for these fields.
 - Reads are atomic — you never see a half-written file — but the set is only
   *eventually* consistent as a group. Re-read the whole file each time and
   recompute state from the snapshot rather than diffing individual keys.
+
+### Bailing out of a shell loop on the warning
+
+A batch job that processes work in units — shards, epochs, images, sweeps —
+usually needs nothing more than "stop starting new units once the controller
+warns me". The single-key files make that a `test` against
+`termination-warning-at`, checked between units:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+PODINFO=${PODINFO:-/etc/podinfo}
+BAIL_AT_RISK=${BAIL_AT_RISK:-50}    # percent; 0 bails on any warning at all
+
+# Has the controller warned this pod?  -s is the operator that matters: the
+# kubelet creates the file when the pod starts and leaves it EMPTY while the
+# annotation is absent, so -f and -e are true from the first second and a loop
+# guarded on either would bail immediately, on every run.
+warned() { [[ -s "$PODINFO/termination-warning-at" ]]; }
+
+# "0.33" -> 33.  The value always has two decimals, so deleting the dot scales
+# by 100; 10# forces base 10, without which bash reads the leading zero of
+# "008" as octal and errors out on a risk of 0.08 or 0.09.  Anything
+# unreadable or unparseable counts as maximum risk (§8 rule 7).
+risk_pct() {
+    local raw
+    raw=$(cat "$PODINFO/termination-warning-risk" 2>/dev/null) || raw=
+    if [[ $raw =~ ^[01]\.[0-9]{2}$ ]]; then echo $(( 10#${raw/./} )); else echo 100; fi
+}
+
+stopped_before=
+for shard in "${SHARDS[@]}"; do
+    if warned && (( $(risk_pct) >= BAIL_AT_RISK )); then
+        stopped_before=$shard
+        break
+    fi
+    process_shard "$shard"          # each shard commits its own output
+done
+
+if [[ -n $stopped_before ]]; then
+    printf '%s\n' "$(cat "$PODINFO/termination-warning-message")" >&2
+    printf 'stopped before %s; rerun to pick up the rest\n' "$stopped_before" >&2
+    exit 75                         # EX_TEMPFAIL — ask the submitter to requeue
+fi
+```
+
+Four things about that loop:
+
+- **Test every iteration; do not latch.** Warnings retract (§8 rule 2) — the
+  user re-books, the incoming reservation no-shows, the pod is re-linked — and
+  the file goes empty again. Re-running `warned` each time round is what lets
+  the job carry on when that happens.
+- **Check between units, never inside one.** This is the shell analogue of §6.5's
+  step boundary: `break` is safe here only because `process_shard` finishes what
+  it started. A unit longer than the notice (§7 — budget ~10 minutes, and there
+  is no floor) needs the check moved inside it, or its own checkpoint.
+- **Bailing is not the only option, and exiting is a legitimate one.** `break`
+  plus `exit 75` hands the remaining work back to whatever submitted the job,
+  frees the capacity the incoming reservation wanted, and skips the 30 s grace
+  period entirely (§5). An interactive session should do the opposite: warn the
+  user and keep going, since the pod may well survive (§8 rule 3).
+- **Show the message, don't parse it.** `termination-warning-message` is a
+  finished English sentence in the deployment's local zone, so echoing it is
+  right and reading a timestamp back out of it is not. If the script needs the
+  instant, use `termination-warning-at`, which is UTC:
+  `secs_left=$(( $(date -u -d "$(cat "$PODINFO/termination-warning-at")" +%s) - $(date -u +%s) ))`
+  — and treat a negative result as "may be stopped at any time" (§8 rule 3),
+  not as "already dead".
 
 ---
 
@@ -621,7 +733,9 @@ often the better one for a batch job: checkpoint, exit 0, and let your submissio
 system resubmit. You free the capacity the incoming reservation wanted, you
 choose your own stopping point, and you skip the 30 s grace-period scramble
 entirely. For an interactive session (a notebook), don't — checkpoint and keep
-working; the pod may well survive (§8 rule 3).
+working; the pod may well survive (§8 rule 3). §1 has the same shape for a job
+with no Python in it: a shell loop that stops starting new units of work once
+`termination-warning-at` is set.
 
 ### 6.6 By scenario
 
